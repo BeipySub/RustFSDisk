@@ -1,0 +1,15 @@
+[Unit]
+Description=RustFS Transfer Center
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/rustfs-transfer/rustfs-transfer-center
+EnvironmentFile=-/etc/rustfs-transfer/center.env
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+

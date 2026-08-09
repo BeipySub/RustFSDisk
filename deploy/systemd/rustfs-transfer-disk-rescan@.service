@@ -1,0 +1,9 @@
+[Unit]
+Description=RustFS Transfer disk rescan notification for %I
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/rustfs-transfer/bin/rustfs-transfer-rescan --device /dev/%I
+User=root
+Group=root

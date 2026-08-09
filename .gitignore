@@ -1,0 +1,54 @@
+# Rust build artifacts
+/target/
+**/target/
+
+# Frontend dependencies and build output
+node_modules/
+web/center-web/node_modules/
+web/edge-web/node_modules/
+web/center-web/dist/
+web/edge-web/dist/
+web/center-web/.vite/
+web/edge-web/.vite/
+
+# Environment and local config
+.env
+.env.*
+!.env.example
+*.local
+*.local.toml
+deploy/config/*.toml
+!deploy/config/*.example.toml
+
+# Runtime data
+data/
+tmp/
+temp/
+logs/
+*.log
+*.pid
+
+# Transport disk runtime payloads
+rustfs-transfer/
+*.partial
+quarantine/
+
+# Database and SQL tooling
+.sqlx/
+*.db
+*.sqlite
+*.sqlite3
+
+# IDE and OS files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Test and coverage output
+coverage/
+lcov.info
+*.profraw
+*.profdata

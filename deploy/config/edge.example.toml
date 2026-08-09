@@ -1,0 +1,17 @@
+[server]
+bind = "0.0.0.0:8081"
+
+[database]
+url = "postgres://user:password@127.0.0.1:5432/rustfs_transfer_edge"
+
+[center]
+base_url = "http://center.example.com:8080"
+
+[rustfs]
+endpoint = "http://127.0.0.1:9000"
+region = "us-east-1"
+
+[paths]
+data_dir = "/var/lib/rustfs-transfer"
+log_dir = "/var/log/rustfs-transfer"
+

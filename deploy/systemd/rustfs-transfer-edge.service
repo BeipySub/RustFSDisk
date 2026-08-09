@@ -1,0 +1,15 @@
+[Unit]
+Description=RustFS Transfer Edge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/rustfs-transfer/rustfs-transfer-edge
+EnvironmentFile=-/etc/rustfs-transfer/edge.env
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+
