@@ -10,18 +10,29 @@ CREATE TABLE IF NOT EXISTS local_object_snapshot (
   size_bytes BIGINT NOT NULL,
   last_modified TIMESTAMP NOT NULL,
   metadata_json JSONB,
-  scan_time TIMESTAMP NOT NULL DEFAULT (NOW() AT TIME ZONE 'UTC')
+  scanned_at TIMESTAMP NOT NULL DEFAULT (NOW() AT TIME ZONE 'UTC'),
+  stable_status VARCHAR(32) NOT NULL DEFAULT 'UNKNOWN',
+  CONSTRAINT ck_local_object_snapshot_stable_status CHECK (stable_status IN ('UNKNOWN', 'STABLE', 'UNSTABLE', 'SOURCE_CHANGED'))
 );
 
-COMMENT ON TABLE local_object_snapshot IS '边缘端 RustFS 对象扫描快照，用于统计、稳定性判断和导出编排。';
-COMMENT ON COLUMN local_object_snapshot.last_modified IS '从 RustFS/S3 获取后归一化为 UTC。';
+COMMENT ON TABLE local_object_snapshot IS '边缘端 RustFS 对象扫描快照表；用于统计、稳定性判断和导出编排。';
+COMMENT ON COLUMN local_object_snapshot.id IS '数据库自增主键。';
+COMMENT ON COLUMN local_object_snapshot.bucket IS '源 RustFS bucket 名称。';
+COMMENT ON COLUMN local_object_snapshot.object_key IS '源 RustFS object key；数据库用 object_key 避免和通用 key 概念混淆。';
+COMMENT ON COLUMN local_object_snapshot.etag IS '源对象 ETag，用于对象身份和稳定性判断。';
+COMMENT ON COLUMN local_object_snapshot.size_bytes IS '源对象字节数。';
+COMMENT ON COLUMN local_object_snapshot.last_modified IS '源对象 last_modified，从 RustFS/S3 获取后归一化为 UTC。';
+COMMENT ON COLUMN local_object_snapshot.metadata_json IS '扫描到的源对象 metadata JSON；写 manifest 时输出为 metadata。';
+COMMENT ON COLUMN local_object_snapshot.scanned_at IS '本次快照扫描入库的 UTC 时间。';
+COMMENT ON COLUMN local_object_snapshot.stable_status IS '稳定性判断状态；UNKNOWN 表示未知，STABLE 表示稳定可进入导出队列，UNSTABLE 表示不稳定暂不导出，SOURCE_CHANGED 表示源对象发生变化且本轮不导出。';
 
-CREATE INDEX IF NOT EXISTS idx_local_object_snapshot_scan_time ON local_object_snapshot(scan_time);
+CREATE INDEX IF NOT EXISTS idx_local_object_snapshot_scanned_at ON local_object_snapshot(scanned_at);
 CREATE INDEX IF NOT EXISTS idx_local_object_snapshot_source ON local_object_snapshot(bucket, object_key);
 
 CREATE TABLE IF NOT EXISTS export_job (
   id BIGSERIAL PRIMARY KEY,
   export_job_id UUID NOT NULL,
+  disk_id UUID,
   edge_code VARCHAR(255) NOT NULL,
   status VARCHAR(32) NOT NULL,
   object_count BIGINT NOT NULL DEFAULT 0,
@@ -31,12 +42,22 @@ CREATE TABLE IF NOT EXISTS export_job (
   start_time TIMESTAMP,
   finish_time TIMESTAMP,
   error_message TEXT,
-  create_time TIMESTAMP NOT NULL DEFAULT (NOW() AT TIME ZONE 'UTC'),
-  CONSTRAINT ck_export_job_status CHECK (status IN ('PENDING', 'SCANNING', 'PLANNING', 'COPYING', 'SEALED', 'FAILED', 'CANCELLED'))
+  CONSTRAINT ck_export_job_status CHECK (status IN ('PENDING', 'SCANNING', 'COPYING', 'SEALED', 'FAILED', 'CANCELLED'))
 );
 
-COMMENT ON TABLE export_job IS '边缘端一次导出任务的阶段状态、低频 checkpoint 和结果。';
-COMMENT ON COLUMN export_job.status IS '导出任务状态；API/WS 序列化为 export_job_status。';
+COMMENT ON TABLE export_job IS '边缘端导出任务表；记录导出阶段状态、低频 checkpoint、统计进度和结果。';
+COMMENT ON COLUMN export_job.id IS '数据库自增主键。';
+COMMENT ON COLUMN export_job.export_job_id IS '导出任务业务 ID；用于 API、日志、manifest 和审计追踪。';
+COMMENT ON COLUMN export_job.disk_id IS '运输盘逻辑 ID；单盘任务可填，多盘任务通过 export_object.disk_id 关联。';
+COMMENT ON COLUMN export_job.edge_code IS '执行该导出任务的边缘站点编码。';
+COMMENT ON COLUMN export_job.status IS '导出任务状态；PENDING 表示待处理，SCANNING 表示扫描中，COPYING 表示拷贝中，SEALED 表示已封盘，FAILED 表示导出失败，CANCELLED 表示已取消；API/WS 序列化为 export_job_status。';
+COMMENT ON COLUMN export_job.object_count IS '本次导出计划对象或分块总数。';
+COMMENT ON COLUMN export_job.copied_count IS '已完成写盘并校验的对象或分块数量。';
+COMMENT ON COLUMN export_job.total_bytes IS '本次导出计划写入的明文总字节数。';
+COMMENT ON COLUMN export_job.copied_bytes IS '已完成写盘并校验的明文字节数。';
+COMMENT ON COLUMN export_job.start_time IS '导出任务开始的 UTC 时间。';
+COMMENT ON COLUMN export_job.finish_time IS '导出任务结束或封盘完成的 UTC 时间。';
+COMMENT ON COLUMN export_job.error_message IS '导出任务失败、取消或异常时的错误说明。';
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_export_job_business_id ON export_job(export_job_id);
 
@@ -71,16 +92,42 @@ CREATE TABLE IF NOT EXISTS export_object (
   status VARCHAR(32) NOT NULL,
   error_code VARCHAR(64),
   error_message TEXT,
-  create_time TIMESTAMP NOT NULL DEFAULT (NOW() AT TIME ZONE 'UTC'),
-  update_time TIMESTAMP,
   CONSTRAINT ck_export_object_status CHECK (status IN ('PENDING', 'ASSIGNED', 'COPYING', 'EXPORTED', 'FAILED', 'SOURCE_CHANGED', 'SKIPPED')),
   CONSTRAINT ck_export_object_chunk_total CHECK (chunk_total >= 1 AND chunk_total <= 1000000),
   CONSTRAINT ck_export_object_chunk_index CHECK (chunk_index >= 0 AND chunk_index < chunk_total)
 );
 
-COMMENT ON TABLE export_object IS '边缘端导出对象任务表；多盘并行对象分配锁和断点恢复核心表。';
-COMMENT ON COLUMN export_object.status IS '对象任务状态；不包含 IMPORTED，序列化为 object_status。';
+COMMENT ON TABLE export_object IS '边缘端导出对象任务表；多盘并行对象分配锁、对象状态和断点恢复核心表。';
+COMMENT ON COLUMN export_object.id IS '数据库自增主键。';
+COMMENT ON COLUMN export_object.export_job_id IS '所属导出任务业务 ID。';
+COMMENT ON COLUMN export_object.disk_id IS '当前分配写入的运输盘逻辑 ID；PENDING 阶段可为空。';
+COMMENT ON COLUMN export_object.bucket IS '源 RustFS bucket 名称。';
+COMMENT ON COLUMN export_object.object_key IS '源 RustFS object key；写 manifest 时映射为 objects[].key。';
+COMMENT ON COLUMN export_object.etag IS '源对象 ETag，用于对象身份和导出前后稳定性校验。';
+COMMENT ON COLUMN export_object.size_bytes IS '源对象明文总字节数。';
+COMMENT ON COLUMN export_object.last_modified IS '源对象 last_modified，归一化为 UTC。';
+COMMENT ON COLUMN export_object.plaintext_sha256 IS '源对象或分块明文 SHA256。';
+COMMENT ON COLUMN export_object.ciphertext_sha256 IS '落盘密文 SHA256。';
+COMMENT ON COLUMN export_object.ciphertext_size_bytes IS '落盘密文字节数。';
+COMMENT ON COLUMN export_object.encrypted IS '对象是否已加密落盘；v1.0 默认 true。';
+COMMENT ON COLUMN export_object.encryption_alg IS '对象加密算法；与 disk_info.json.security.encryption_alg 和 manifest 保持一致。';
+COMMENT ON COLUMN export_object.data_key_id IS '本对象使用的数据密钥编号；运输盘和 manifest 只保存该编号，不保存明文密钥。';
+COMMENT ON COLUMN export_object.nonce IS 'AES-GCM nonce；同一 data_key_id 下必须唯一。';
+COMMENT ON COLUMN export_object.tag IS 'AES-GCM 认证标签。';
+COMMENT ON COLUMN export_object.aad IS 'AES-GCM 附加认证数据。';
+COMMENT ON COLUMN export_object.chunked IS '是否为跨盘分块对象。';
+COMMENT ON COLUMN export_object.chunk_group_id IS '跨盘分块对象聚合组 ID。';
+COMMENT ON COLUMN export_object.chunk_index IS '当前分块序号，从 0 开始。';
+COMMENT ON COLUMN export_object.chunk_total IS '该源对象分块总数，最大 1,000,000。';
+COMMENT ON COLUMN export_object.chunk_offset_bytes IS '当前分块在源对象中的起始偏移字节数。';
+COMMENT ON COLUMN export_object.chunk_size_bytes IS '当前任务行对应的明文字节数；普通对象等于 size_bytes。';
+COMMENT ON COLUMN export_object.chunk_sha256 IS '当前分块密文 SHA256；与 ciphertext_sha256 语义一致，供 manifest 分块字段使用。';
 COMMENT ON COLUMN export_object.partial_path IS '.partial 临时密文路径；不得写入 manifest。';
+COMMENT ON COLUMN export_object.relative_data_path IS '最终密文文件相对 /rustfs-transfer/ 的路径，必须位于 data/ 下。';
+COMMENT ON COLUMN export_object.relative_meta_path IS 'metadata sidecar 相对 /rustfs-transfer/ 的路径，必须位于 meta/ 下。';
+COMMENT ON COLUMN export_object.status IS '对象任务状态；PENDING 表示待分配，ASSIGNED 表示已分配到运输盘，COPYING 表示复制/加密写盘中，EXPORTED 表示已导出且可进入 manifest，FAILED 表示失败，SOURCE_CHANGED 表示源对象导出前后变化，SKIPPED 表示已跳过；不包含 IMPORTED，序列化为 object_status。';
+COMMENT ON COLUMN export_object.error_code IS '对象任务失败、源变化或跳过时的标准错误码。';
+COMMENT ON COLUMN export_object.error_message IS '对象任务失败、源变化或跳过时的错误说明。';
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_export_object_plain_active_source
   ON export_object(export_job_id, bucket, object_key, etag, size_bytes, last_modified)
@@ -122,8 +169,22 @@ CREATE TABLE IF NOT EXISTS disk_runtime (
   CONSTRAINT ck_disk_runtime_status CHECK (status IN ('DETECTED', 'CHECKING', 'READY', 'COPYING', 'CLEANING', 'REINITIALIZING', 'DONE', 'REJECTED', 'REMOVED', 'ERROR'))
 );
 
-COMMENT ON TABLE disk_runtime IS '边缘端运输盘运行状态、容量检测结果和低频 checkpoint。';
-COMMENT ON COLUMN disk_runtime.status IS '运行态；API/WS 序列化为 runtime_status，不表示盘内生命周期。';
+COMMENT ON TABLE disk_runtime IS '边缘端运输盘运行状态表；记录热插拔、容量检测、低频 checkpoint 和恢复判断信息。';
+COMMENT ON COLUMN disk_runtime.id IS '数据库自增主键。';
+COMMENT ON COLUMN disk_runtime.sn IS '运输盘硬件序列号；从 Linux 设备信息读取，仅作辅助识别。';
+COMMENT ON COLUMN disk_runtime.disk_id IS '运输盘逻辑 ID；从 disk_info.json 或中控接口获取。';
+COMMENT ON COLUMN disk_runtime.device_path IS 'Linux 设备路径，例如 /dev/sdb。';
+COMMENT ON COLUMN disk_runtime.mount_path IS '运输盘挂载路径，例如 /mnt/rustfs-transfer/disk-xxx。';
+COMMENT ON COLUMN disk_runtime.capacity_bytes IS '当前识别到的运输盘总容量字节数。';
+COMMENT ON COLUMN disk_runtime.free_bytes IS '当前文件系统剩余容量字节数。';
+COMMENT ON COLUMN disk_runtime.reserve_bytes IS '当前预留容量字节数；按协议公式计算，用于协议文件、元数据、日志和安全余量。';
+COMMENT ON COLUMN disk_runtime.object_budget_bytes IS '当前对象可分配容量字节数；调度对象或分块时只能使用该容量。';
+COMMENT ON COLUMN disk_runtime.status IS '运输盘运行态；DETECTED 表示已检测到，CHECKING 表示校验中，READY 表示可用于任务，COPYING 表示复制中，CLEANING 表示中控清理运行态，REINITIALIZING 表示中控重新初始化运行态，DONE 表示任务完成，REJECTED 表示拒绝使用，REMOVED 表示已拔出，ERROR 表示异常；API/WS 序列化为 runtime_status，不表示盘内生命周期，CLEANING/REINITIALIZING 不得写入盘内 lifecycle status_code。';
+COMMENT ON COLUMN disk_runtime.last_error_code IS '最近一次盘级标准错误码，例如 FILESYSTEM_UNSUPPORTED 或 RECOVERY_REQUIRED。';
+COMMENT ON COLUMN disk_runtime.error_message IS '最近一次盘级错误说明；任务级错误写入 export_job 或 export_object。';
+COMMENT ON COLUMN disk_runtime.partial_residue_count IS '.partial 残留文件数量；恢复扫描时统计。';
+COMMENT ON COLUMN disk_runtime.partial_residue_bytes IS '.partial 残留文件总字节数；用于空间释放判断和前端提示。';
+COMMENT ON COLUMN disk_runtime.last_seen_at IS '最近一次检测到该运输盘的 UTC 时间。';
 
 CREATE INDEX IF NOT EXISTS idx_disk_runtime_disk_id ON disk_runtime(disk_id);
 CREATE INDEX IF NOT EXISTS idx_disk_runtime_status ON disk_runtime(status);

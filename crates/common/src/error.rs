@@ -6,4 +6,3 @@ pub enum TransferErrorCode {
     DecryptFailed,
     NonceReused,
 }
-

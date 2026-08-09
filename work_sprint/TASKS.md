@@ -88,7 +88,7 @@
 | 任务 ID | 任务名称 | 优先级 | Track / 模块 | 状态 | 计划 | 依赖 |
 |---|---|---|---|---|---|---|
 | TASK-S1-COMMON-001 | 协议类型、状态枚举、HTTP/WS payload 和 golden JSON | P0 解阻塞 | Common | [ ] | Day 1 上午 | 无 |
-| TASK-S1-DB-001 | 双端 PostgreSQL 迁移补齐并冻结 DDL | P0 解阻塞 | DB | [ ] | Day 1 上午 | 无 |
+| TASK-S1-DB-001 | 双端 PostgreSQL 迁移补齐并冻结 DDL | P0 解阻塞 | DB | [x] | Day 1 上午 | 无 |
 | TASK-S1-COMMON-002 | HMAC、SHA256、AES-GCM 和 nonce 工具 | P0 解阻塞 | Common | [ ] | Day 1 上午 | TASK-S1-COMMON-001 可并行 |
 | TASK-S1-COMMON-003 | 运输盘协议文件、原子写、fsync、安全路径和 `.partial` 扫描 | P0 解阻塞 | Common | [ ] | Day 1 上午 | TASK-S1-COMMON-001 |
 | TASK-S1-TEST-001 | Fixture、模拟运输盘、manifest 样例和 HMAC 请求样例 | P0 解阻塞 | Tests | [ ] | Day 1 上午 | TASK-S1-COMMON-001 可并行 |
@@ -241,7 +241,7 @@
   - [x] Track 2: Edge (`sql/edge`)
   - [x] Track 3: Center (`sql/center`)
   - [ ] Track 4: Web
-- **任务状态**：[ ] 未开始
+- **任务状态**：[x] 开发完成
 - **负责人 / Role**：Agent B
 - **计划时间**：Day 1 上午
 - **依赖任务**：无
@@ -265,10 +265,10 @@
 
 ### 验收与检查清单
 
-- [ ] 双端迁移可在空库执行。
-- [ ] `import_job(disk_id, seal_id)` 活动/完成唯一约束存在。
-- [ ] `export_object` 活动态普通对象和分块唯一约束存在。
-- [ ] `export_object(data_key_id, nonce)` 唯一约束存在。
+- [x] 双端迁移可在空库执行。
+- [x] `import_job(disk_id, seal_id)` 活动/完成唯一约束存在。
+- [x] `export_object` 活动态普通对象和分块唯一约束存在。
+- [x] `export_object(data_key_id, nonce)` 唯一约束存在。
 
 ---
 

@@ -17,6 +17,7 @@ web/edge-web/.vite/
 !.env.example
 *.local
 *.local.toml
+.local.*
 deploy/config/*.toml
 !deploy/config/*.example.toml
 
