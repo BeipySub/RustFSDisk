@@ -73,14 +73,12 @@ impl FileSystemProbe for FindmntFileSystemProbe {
                 .arg(mount_path)
                 .output()
                 .context("probe transport disk filesystem with findmnt")?;
-            if !output.status.success() {
-                return Err(anyhow!(
-                    "findmnt failed for {}: {}",
-                    mount_path.display(),
-                    String::from_utf8_lossy(&output.stderr).trim()
-                ));
-            }
-            return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
+            return parse_findmnt_fstype_output(
+                output.status.success(),
+                &String::from_utf8_lossy(&output.stdout),
+                &String::from_utf8_lossy(&output.stderr),
+                mount_path,
+            );
         }
         #[cfg(not(unix))]
         {
@@ -88,6 +86,38 @@ impl FileSystemProbe for FindmntFileSystemProbe {
             Ok("unknown".to_string())
         }
     }
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+fn parse_findmnt_fstype_output(
+    command_success: bool,
+    stdout: &str,
+    stderr: &str,
+    mount_path: &Path,
+) -> anyhow::Result<String> {
+    if !command_success {
+        return Err(anyhow!(
+            "findmnt failed for {}: {}",
+            mount_path.display(),
+            stderr.trim()
+        ));
+    }
+
+    let filesystems = stdout.split_whitespace().collect::<Vec<_>>();
+    if filesystems.is_empty() {
+        return Err(anyhow!(
+            "findmnt returned empty filesystem type for {}",
+            mount_path.display()
+        ));
+    }
+    if filesystems.iter().all(|value| *value == "ext4") {
+        return Ok("ext4".to_string());
+    }
+    Err(anyhow!(
+        "findmnt returned non-ext4 filesystem type for {}: {}",
+        mount_path.display(),
+        filesystems.join(",")
+    ))
 }
 
 #[derive(Clone)]
@@ -636,6 +666,68 @@ mod tests {
             guard.retired_key = Some(old_data_key_id);
             Ok(())
         }
+    }
+
+    #[test]
+    fn findmnt_fstype_parser_accepts_single_ext4() {
+        let fs_type =
+            parse_findmnt_fstype_output(true, "ext4\n", "", Path::new("/media/control/disk"))
+                .unwrap();
+
+        assert_eq!(fs_type, "ext4");
+    }
+
+    #[test]
+    fn findmnt_fstype_parser_accepts_repeated_ext4_lines() {
+        let fs_type =
+            parse_findmnt_fstype_output(true, "ext4\next4\n", "", Path::new("/media/control/disk"))
+                .unwrap();
+
+        assert_eq!(fs_type, "ext4");
+    }
+
+    #[test]
+    fn findmnt_fstype_parser_accepts_multiline_whitespace_ext4() {
+        let fs_type = parse_findmnt_fstype_output(
+            true,
+            "\n  ext4  \n\n\t ext4 \r\n",
+            "",
+            Path::new("/media/control/disk"),
+        )
+        .unwrap();
+
+        assert_eq!(fs_type, "ext4");
+    }
+
+    #[test]
+    fn findmnt_fstype_parser_rejects_mixed_filesystems() {
+        let error =
+            parse_findmnt_fstype_output(true, "ext4\nxfs\n", "", Path::new("/media/control/disk"))
+                .unwrap_err();
+
+        assert!(error.to_string().contains("non-ext4"));
+    }
+
+    #[test]
+    fn findmnt_fstype_parser_rejects_empty_output() {
+        let error =
+            parse_findmnt_fstype_output(true, " \n\t\n", "", Path::new("/media/control/disk"))
+                .unwrap_err();
+
+        assert!(error.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn findmnt_fstype_parser_rejects_command_failure() {
+        let error = parse_findmnt_fstype_output(
+            false,
+            "ext4\n",
+            "not mounted",
+            Path::new("/media/control/disk"),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("findmnt failed"));
     }
 
     #[test]

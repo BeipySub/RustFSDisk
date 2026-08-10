@@ -111,6 +111,7 @@
 | TASK-S1-CENTER-004 | 导入 Worker、manifest 校验、解密上传、去重账本和导入 WS | P1 主闭环 | Center | [x] | Day 2 上午 | TASK-S1-CENTER-003, TASK-S1-TEST-001 |
 | TASK-S1-CENTER-005 | 导入后清理、重新初始化、密钥退役和失败恢复 | P1 主闭环 | Center | [x] | Day 2 下午 | TASK-S1-CENTER-004 |
 | TASK-S1-P1-CENTER-REINIT-API-001 | Center 受控清理重初始化生产 API | P1 主闭环 | Center | [x] | Day 2 VM 验收修补 | TASK-S1-CENTER-005 |
+| TASK-S1-P1-CENTER-REINIT-FSTYPE-002 | Center reinitialize findmnt 多行 ext4 解析修补 | P1 主闭环 | Center | [x] | Day 2 VM 热修补 | TASK-S1-P1-CENTER-REINIT-API-001 |
 | TASK-S1-WEB-EDGE-001 | 边缘端 DashboardView、HTTP 汇总和 WS 进度展示 | P2 交付增强 | Web / Edge | [x] | Day 1-2 | TASK-S1-TEST-001 |
 | TASK-S1-WEB-CENTER-001 | 中控端 DashboardView、HTTP 汇总和 WS 进度展示 | P2 交付增强 | Web / Center | [x] | Day 1-2 | TASK-S1-TEST-001 |
 | TASK-S1-DASHBOARD-REALTIME-001 | 双端真实 Dashboard HTTP summary 与本端 WebSocket 推送 | P0 解阻塞 | Center / Edge / Web | [x] | Day 2 联调修补 | TASK-S1-WEB-EDGE-001, TASK-S1-WEB-CENTER-001 |
@@ -1133,6 +1134,43 @@
 - [x] 非 `IMPORTED`、签名缺失/验签失败、manifest sha256 不匹配、`.partial` 残留、非 ext4、其他 disk_id 均拒绝且不清理。
 - [x] 成功路径清理封存 payload，盘内状态变为 `INITIALIZED`，响应使用 `disk_status_code`、`runtime_status`，无裸 `status`。
 - [x] 成功后新 data key 激活，旧 data key 退役；失败时旧 key 和盘内 `IMPORTED` 边界保留。
+- [x] `cargo fmt --all -- --check`、`cargo test -p rustfs-transfer-center`、`cargo test --workspace`、`scripts/check-deploy.ps1` 通过后独立提交。
+
+---
+
+# 开发任务卡片：TASK-S1-P1-CENTER-REINIT-FSTYPE-002
+
+### 任务基本信息
+
+- **任务 ID**：TASK-S1-P1-CENTER-REINIT-FSTYPE-002
+- **任务名称**：Center reinitialize findmnt 多行 ext4 解析修补
+- **所属 Track / 模块**：
+  - [ ] Track 1: Common
+  - [ ] Track 2: Edge
+  - [x] Track 3: Center (`crates/center-backend`)
+  - [ ] Track 4: Web
+- **任务状态**：[x] 开发完成
+- **负责人 / Role**：Codex 串行合入/提交窗口
+- **计划时间**：Day 2 VM 热修补
+- **依赖任务**：TASK-S1-P1-CENTER-REINIT-API-001
+
+### 任务目标与范围
+
+- **核心目标**：修补真实 VM 中 Center 受控 reinitialize API 在服务 mount namespace 内 `findmnt` 返回重复 `ext4` 行时被严格整串比较拒绝的问题。
+- **现场结论**：此前两次真实 API 调用均在写盘前被 HTTP 400 安全拒绝，未写运输盘、未写 DB。
+- **对应代码位置**：`crates/center-backend/src/reinitialize_runtime.rs`
+
+### 协议与状态机约束
+
+- `findmnt` FSTYPE 输出必须结构化解析；空白、多行、重复 `ext4` 允许规范化为 `ext4`。
+- 空输出、混合文件系统、任一非 `ext4`、命令失败必须拒绝。
+- ext4 安全边界不得放宽；reinitializer 写盘仍只能在 preflight 全部通过后发生。
+
+### 验收与检查清单
+
+- [x] 单测覆盖单行 `ext4`、重复 `ext4`、多行空白 `ext4`。
+- [x] 单测覆盖混合 `ext4+xfs`、空输出、命令失败拒绝。
+- [x] 拒绝路径仍在 `PostImportReinitializer` 写盘前。
 - [x] `cargo fmt --all -- --check`、`cargo test -p rustfs-transfer-center`、`cargo test --workspace`、`scripts/check-deploy.ps1` 通过后独立提交。
 
 ---
