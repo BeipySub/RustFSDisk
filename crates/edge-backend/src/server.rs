@@ -352,6 +352,7 @@ async fn trigger_scan(
     Json(request): Json<ScanTriggerRequest>,
 ) -> Result<Json<crate::control::ScanTriggerResponse>, ApiError> {
     authorize_control_api(&state, &headers)?;
+    refresh_transport_runtime_before_control(&state).await?;
     state
         .control
         .scan_once(request)
@@ -366,6 +367,7 @@ async fn create_export_job(
     Json(request): Json<CreateExportJobRequest>,
 ) -> Result<Json<crate::control::ExportJobResponse>, ApiError> {
     authorize_control_api(&state, &headers)?;
+    refresh_transport_runtime_before_control(&state).await?;
     state
         .control
         .create_export_job(request)
@@ -397,6 +399,7 @@ async fn start_export_job(
 ) -> Result<Json<crate::control::StartExportJobResponse>, ApiError> {
     authorize_control_api(&state, &headers)?;
     validate_export_job_id(export_job_id)?;
+    refresh_transport_runtime_before_control(&state).await?;
     state
         .control
         .start_export_job(export_job_id, request)
@@ -419,6 +422,21 @@ async fn recover_export_job(
         .await
         .map(Json)
         .map_err(Into::into)
+}
+
+async fn refresh_transport_runtime_before_control(state: &AppState) -> Result<(), ApiError> {
+    state
+        .disk_rescan
+        .run_rescan_once(DiskRescanTrigger::manual(None))
+        .await
+        .map(|_| ())
+        .map_err(|err| {
+            ApiError(ControlError {
+                http_status: StatusCode::CONFLICT,
+                error_code: "DISK_RESCAN_FAILED",
+                message: format!("transport disk rescan failed before control operation: {err}"),
+            })
+        })
 }
 
 fn authorize_control_api(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
@@ -562,7 +580,10 @@ mod tests {
     use std::{
         collections::BTreeMap,
         path::PathBuf,
-        sync::{Arc, Mutex},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        },
     };
     use tower::ServiceExt;
 
@@ -608,6 +629,22 @@ mod tests {
             _trigger: DiskRescanTrigger,
         ) -> crate::disk_detection::BoxFuture<'a, Result<usize, DiskDetectionError>> {
             Box::pin(async { Ok(0) })
+        }
+    }
+
+    struct CountingRescanRunner {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl DiskRescanRunner for CountingRescanRunner {
+        fn run_disk_rescan<'a>(
+            &'a self,
+            _trigger: DiskRescanTrigger,
+        ) -> crate::disk_detection::BoxFuture<'a, Result<usize, DiskDetectionError>> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(1)
+            })
         }
     }
 
@@ -911,6 +948,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scan_and_export_routes_refresh_disk_runtime_before_control_workflow() {
+        let export_job_id = Uuid::new_v4();
+        let control = Arc::new(FakeControl {
+            export_job_id,
+            ..Default::default()
+        });
+        let rescan_calls = Arc::new(AtomicUsize::new(0));
+        let router = app(test_state_with_rescan(
+            control.clone(),
+            DiskRescanCoordinator::new(Arc::new(CountingRescanRunner {
+                calls: rescan_calls.clone(),
+            })),
+        ));
+
+        let scan = router
+            .clone()
+            .oneshot(authenticated_json(
+                Method::POST,
+                "/api/edge/scan",
+                r#"{"enqueue_stable_objects":false}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(scan.status(), StatusCode::OK);
+
+        let create = router
+            .clone()
+            .oneshot(authenticated_json(
+                Method::POST,
+                "/api/edge/export-jobs",
+                r#"{"run_scan":true}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::OK);
+
+        let start = router
+            .oneshot(authenticated_json(
+                Method::POST,
+                &format!("/api/edge/export-jobs/{export_job_id}/start"),
+                "{}",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(start.status(), StatusCode::OK);
+
+        assert_eq!(rescan_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            control.calls.lock().unwrap().as_slice(),
+            &["scan_once", "create_export_job", "start_export_job"]
+        );
+    }
+
+    #[tokio::test]
     async fn export_job_routes_create_query_and_start() {
         let export_job_id = Uuid::new_v4();
         let control = Arc::new(FakeControl {
@@ -1058,6 +1149,16 @@ mod tests {
     }
 
     fn test_state(control: Arc<dyn EdgeControlService>) -> AppState {
+        test_state_with_rescan(
+            control,
+            DiskRescanCoordinator::new(Arc::new(NoopRescanRunner)),
+        )
+    }
+
+    fn test_state_with_rescan(
+        control: Arc<dyn EdgeControlService>,
+        disk_rescan: DiskRescanCoordinator,
+    ) -> AppState {
         let raw = r#"
             [server]
             bind = "127.0.0.1:8081"
@@ -1097,7 +1198,7 @@ mod tests {
             config: Arc::new(config),
             adapters,
             center_client,
-            disk_rescan: DiskRescanCoordinator::new(Arc::new(NoopRescanRunner)),
+            disk_rescan,
             control,
         }
     }

@@ -19,6 +19,24 @@ use uuid::Uuid;
 
 pub type ControlFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ControlError>> + Send + 'a>>;
 
+const DEFAULT_MAX_BUDGET_SQL: &str =
+    "SELECT MAX(object_budget_bytes) FROM disk_runtime WHERE status = 'READY'";
+const READY_DISKS_SQL: &str = r#"
+    SELECT disk_id, sn, mount_path, free_bytes, object_budget_bytes
+    FROM disk_runtime
+    WHERE status = 'READY'
+      AND disk_id IS NOT NULL
+      AND mount_path IS NOT NULL
+      AND object_budget_bytes > 0
+    ORDER BY id ASC
+    "#;
+const LOAD_DISK_RUNTIME_SQL: &str = r#"
+    SELECT sn, disk_id, device_path, mount_path, status, capacity_bytes, free_bytes, object_budget_bytes,
+           last_error_code, error_message
+    FROM disk_runtime
+    ORDER BY id ASC
+    "#;
+
 pub trait EdgeControlService: Send + Sync {
     fn scan_once<'a>(
         &'a self,
@@ -331,12 +349,10 @@ impl ProductionEdgeControlService {
     }
 
     async fn default_max_budget(&self) -> Result<u64, ControlError> {
-        let value: Option<i64> = sqlx::query_scalar(
-            "SELECT MAX(object_budget_bytes) FROM disk_runtime WHERE status = 'READY'",
-        )
-        .fetch_one(&self.pool)
-        .await
-        .context("query READY disk capacity budget")?;
+        let value: Option<i64> = sqlx::query_scalar(DEFAULT_MAX_BUDGET_SQL)
+            .fetch_one(&self.pool)
+            .await
+            .context("query READY disk capacity budget")?;
         let budget = value.unwrap_or_default().max(0) as u64;
         if budget == 0 {
             return Err(ControlError::conflict(
@@ -348,19 +364,10 @@ impl ProductionEdgeControlService {
     }
 
     async fn ready_disks(&self) -> Result<Vec<ReadyDisk>, ControlError> {
-        let rows = sqlx::query(
-            r#"
-            SELECT disk_id, sn, mount_path, free_bytes, object_budget_bytes
-            FROM disk_runtime
-            WHERE status = 'READY'
-              AND disk_id IS NOT NULL
-              AND object_budget_bytes > 0
-            ORDER BY id ASC
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .context("query READY transport disks")?;
+        let rows = sqlx::query(READY_DISKS_SQL)
+            .fetch_all(&self.pool)
+            .await
+            .context("query READY transport disks")?;
 
         let disks = rows
             .into_iter()
@@ -775,17 +782,10 @@ async fn load_object_status_counts(
 }
 
 async fn load_disk_runtime(pool: &PgPool) -> Result<Vec<DiskRuntimeSummary>, ControlError> {
-    let rows = sqlx::query(
-        r#"
-        SELECT sn, disk_id, device_path, mount_path, status, capacity_bytes, free_bytes, object_budget_bytes,
-               last_error_code, error_message
-        FROM disk_runtime
-        ORDER BY id ASC
-        "#,
-    )
-    .fetch_all(pool)
-    .await
-    .context("load disk runtime summary")?;
+    let rows = sqlx::query(LOAD_DISK_RUNTIME_SQL)
+        .fetch_all(pool)
+        .await
+        .context("load disk runtime summary")?;
 
     Ok(rows
         .into_iter()
@@ -1600,6 +1600,21 @@ mod tests {
             Some("one or more DiskWorker instances failed; partial cleanup failed"),
             &request
         ));
+    }
+
+    #[test]
+    fn ready_queries_use_current_rebuildable_runtime_only() {
+        for sql in [
+            DEFAULT_MAX_BUDGET_SQL,
+            READY_DISKS_SQL,
+            LOAD_DISK_RUNTIME_SQL,
+        ] {
+            assert!(!sql.contains("DISTINCT ON"));
+            assert!(!sql.contains("DELETE FROM export_job"));
+            assert!(!sql.contains("DELETE FROM export_object"));
+        }
+        assert!(READY_DISKS_SQL.contains("WHERE status = 'READY'"));
+        assert!(READY_DISKS_SQL.contains("ORDER BY id ASC"));
     }
 
     fn test_mount(case: &str, disk_id: Uuid) -> std::path::PathBuf {

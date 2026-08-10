@@ -27,6 +27,8 @@ use crate::{
 pub type ExportWorkerFuture<'a> =
     Pin<Box<dyn Future<Output = anyhow::Result<ExportWorkerReport>> + Send + 'a>>;
 
+const CLEAR_DISK_RUNTIME_AFTER_SEAL_SQL: &str = "DELETE FROM disk_runtime WHERE disk_id = $1";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExportWorkerReport {
     pub disk_count: u64,
@@ -573,6 +575,22 @@ impl ExportObjectRepository for PgExportObjectRepository {
         })
     }
 
+    fn clear_disk_runtime(&self, disk_id: Uuid) -> Result<(), DiskWorkerError> {
+        self.handle.block_on(async {
+            let result = sqlx::query(CLEAR_DISK_RUNTIME_AFTER_SEAL_SQL)
+                .bind(disk_id)
+                .execute(&self.pool)
+                .await
+                .map_err(sqlx_err)?;
+            tracing::info!(
+                disk_id = %disk_id,
+                removed_runtime_rows = result.rows_affected(),
+                "cleared edge disk runtime after successful seal"
+            );
+            Ok(())
+        })
+    }
+
     fn mark_job_sealed_checkpoint(
         &self,
         export_job_id: Uuid,
@@ -703,5 +721,16 @@ mod tests {
         assert!(summary.contains("export_failure_code=WRITE_BEFORE_PERMISSION_DENIED"));
         assert!(summary.contains("export_failure_stage=WRITE_BEFORE"));
         assert!(summary.contains("worker_error_code=MANIFEST_INVALID"));
+    }
+
+    #[test]
+    fn seal_success_runtime_cleanup_keeps_export_history_sql_out_of_scope() {
+        assert_eq!(
+            CLEAR_DISK_RUNTIME_AFTER_SEAL_SQL,
+            "DELETE FROM disk_runtime WHERE disk_id = $1"
+        );
+        assert!(!CLEAR_DISK_RUNTIME_AFTER_SEAL_SQL.contains("export_job"));
+        assert!(!CLEAR_DISK_RUNTIME_AFTER_SEAL_SQL.contains("export_object"));
+        assert!(!CLEAR_DISK_RUNTIME_AFTER_SEAL_SQL.contains("manifest"));
     }
 }

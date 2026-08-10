@@ -105,6 +105,7 @@
 | TASK-S1-EDGE-002 | 边缘磁盘检测、ext4 校验、disk_info 校验和恢复入口 | P1 主闭环 | Edge | [x] | Day 1 下午 | TASK-S1-COMMON-003, TASK-S1-EDGE-001 |
 | TASK-S1-EDGE-HOTFIX-001 | Edge 真实挂载盘硬件 SN 探测修补 | P0 解阻塞 | Edge | [x] | Day 2 联调修补 | TASK-S1-EDGE-002, TASK-S1-CENTER-003 |
 | TASK-S1-EDGE-HOTFIX-002 | Edge RustFS S3 凭据显式注入修补 | P0 解阻塞 | Edge | [x] | Day 2 联调修补 | TASK-S1-EDGE-003 |
+| TASK-S1-EDGE-HOTFIX-003 | Edge disk_runtime 可重建准入修补 | P0 解阻塞 | Edge | [x] | Day 3 VM 验收修补 | TASK-S1-EDGE-002, TASK-S1-CENTER-003 |
 | TASK-S1-EDGE-003 | RustFS 全 bucket 扫描、对象稳定性判断和快照入库 | P1 主闭环 | Edge | [x] | Day 1 下午 | TASK-S1-EDGE-001 |
 | TASK-S1-EDGE-004 | 导出任务 Planner、容量预算、多盘分配事务和分块登记 | P1 主闭环 | Edge | [x] | Day 1 下午 | TASK-S1-EDGE-002, TASK-S1-EDGE-003 |
 | TASK-S1-EDGE-005 | DiskWorker、加密写盘、metadata、manifest、封盘和导出 WS | P1 主闭环 | Edge | [x] | Day 2 上午 | TASK-S1-EDGE-004, TASK-S1-CENTER-003 |
@@ -891,6 +892,55 @@
 - [x] `cargo fmt --all -- --check` 通过。
 - [x] `cargo test -p rustfs-transfer-edge` 通过。
 - [x] 部署静态检查通过。
+
+---
+
+# 开发任务卡片：TASK-S1-EDGE-HOTFIX-003
+
+### 任务基本信息
+
+- **任务 ID**：TASK-S1-EDGE-HOTFIX-003
+- **任务名称**：Edge disk_runtime 可重建准入修补
+- **所属 Track / 模块**：
+  - [ ] Track 1: Common
+  - [x] Track 2: Edge (`crates/edge-backend`)
+  - [ ] Track 3: Center
+  - [ ] Track 4: Web
+- **任务状态**：[x] 开发完成
+- **负责人 / Role**：Codex 独立编码执行窗口
+- **计划时间**：Day 3 VM 验收修补
+- **依赖任务**：TASK-S1-EDGE-002, TASK-S1-CENTER-003
+
+### 任务目标与范围
+
+- **核心目标**：修补真实 Edge 上旧 `disk_runtime` 缓存阻断当前可信运输盘进入 scan/export 前置的问题，明确 `disk_runtime` 只代表当前插入、当前可运行的临时运行态。
+- **对应代码位置**：`crates/edge-backend/src/disk_detection.rs`、`crates/edge-backend/src/rescan.rs`、`crates/edge-backend/src/server.rs`、`crates/edge-backend/src/control.rs`、`crates/edge-backend/src/disk_worker.rs`、`crates/edge-backend/src/export_runtime.rs`
+
+### 协议与数据结构约束
+
+- Edge 运行态不得以旧 `disk_runtime.disk_id` 是否匹配盘内 `disk_info.disk_id` 作为新盘准入条件；旧缓存存在或不匹配不得拒绝当前可信盘。
+- 盘内 `disk_info.disk_id` 仍必须经 Center HMAC `/api/disk/verify` 与登记状态校验，且盘内生命周期必须为 `INITIALIZED`。
+- Edge 不删除历史 `export_job`、`export_object`、manifest 或 seal 产物作为新盘准入前置。
+
+### 安全与状态机边界
+
+- 控制入口在 scan、创建导出任务、启动导出任务前同步刷新一次本地运输盘发现，失败则写任务前拒绝。
+- 当前盘发现成功时仅按当前 `device_path`/`mount_path` 和当前盘 `disk_id` 替换同盘旧 `disk_runtime` 快照，再创建本次运行态。
+- 导出成功、manifest 与封盘写入完成后，DiskWorker 在同一受控完成流程中删除该盘对应 `disk_runtime`，导出任务和对象历史继续保留。
+- 物理槽位只用于当前发现写入和同盘旧 runtime 清理定位，不作为盘业务身份验收权威。
+- 非 ext4、缺硬件 SN、`.partial` 残留、`EDGE_COPYING`、Center 拒绝或非 `INITIALIZED` 仍不得进入任务池。
+
+### 验收与检查清单
+
+- [x] 回归测试覆盖当前盘内 `disk_info.disk_id` 直接成为新 READY 运行态身份，不依赖旧缓存。
+- [x] 回归测试覆盖 scan/create/start 控制入口先刷新运输盘发现再进入控制工作流。
+- [x] 回归测试覆盖当前盘发现只替换同盘 runtime，不删除导出历史表。
+- [x] 回归测试覆盖封盘成功后删除该盘 runtime，且导出对象历史和 manifest 保留。
+- [x] 回归测试覆盖 Center 签名拒绝、非 ext4、`.partial` 残留仍阻断 READY。
+- [x] `cargo fmt --all -- --check` 通过。
+- [x] `cargo test -p rustfs-transfer-edge` 通过。
+- [x] 部署静态检查通过。
+- [ ] 真实 Edge VM 尚未部署本补丁，需部署窗口复验只读 rescan 后再触发 scan/export。
 
 ---
 

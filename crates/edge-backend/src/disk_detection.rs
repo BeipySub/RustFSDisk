@@ -17,6 +17,14 @@ pub const SUPPORTED_FILESYSTEM: &str = "ext4";
 pub const SUPPORTED_PROTOCOL_VERSION: &str = "1.0";
 const GIB: u64 = 1024 * 1024 * 1024;
 const ESTIMATED_PROTOCOL_OVERHEAD_BYTES: u64 = 64 * 1024 * 1024;
+const REPLACE_CURRENT_RUNTIME_SQL: &str = r#"
+                DELETE FROM disk_runtime
+                WHERE status <> 'COPYING'
+                  AND (
+                    ($1::uuid IS NOT NULL AND disk_id = $1)
+                    OR (device_path = $2 AND mount_path IS NOT DISTINCT FROM $3)
+                  )
+                "#;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -457,6 +465,14 @@ impl DiskRuntimeLedger for PgDiskRuntimeLedger {
                 .disk_id
                 .as_deref()
                 .and_then(|value| Uuid::parse_str(value).ok());
+            sqlx::query(REPLACE_CURRENT_RUNTIME_SQL)
+                .bind(disk_id)
+                .bind(&record.device_path)
+                .bind(&record.mount_path)
+                .execute(&self.pool)
+                .await
+                .map_err(|err| DiskDetectionError::Ledger(err.to_string()))?;
+
             sqlx::query(
                 r#"
                 INSERT INTO disk_runtime (
@@ -1066,11 +1082,12 @@ mod tests {
         let mount = temp_mount("ready");
         write_disk_info(&mount, "INITIALIZED");
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let ledger = MockLedger::default();
         let detector = detector(
             vec![disk(&mount, "ext4")],
             verifier_response(true),
             requests.clone(),
-            MockLedger::default(),
+            ledger.clone(),
         );
 
         let records = detector.scan_existing_transport_disks().await.unwrap();
@@ -1085,6 +1102,55 @@ mod tests {
         assert_eq!(request.sn.as_deref(), Some("SN-001"));
         assert_eq!(request.status_code, "INITIALIZED");
         assert_eq!(request.protocol_version, "1.0");
+        let persisted = ledger.records.lock().unwrap().first().cloned().unwrap();
+        assert_eq!(
+            persisted.disk_id.as_deref(),
+            Some("11111111-1111-1111-1111-111111111111")
+        );
+        assert_eq!(persisted.runtime_status, "READY");
+        fs::remove_dir_all(mount).ok();
+    }
+
+    #[tokio::test]
+    async fn refreshed_disk_info_id_becomes_runtime_identity_without_cache_requirement() {
+        let mount = temp_mount("refreshed-disk-id");
+        write_disk_info_with_disk_id(
+            &mount,
+            "INITIALIZED",
+            "33333333-3333-3333-3333-333333333333",
+        );
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let ledger = MockLedger::default();
+        let detector = detector(
+            vec![disk(&mount, "ext4")],
+            DiskVerifyResponse {
+                allowed: true,
+                disk_id: "33333333-3333-3333-3333-333333333333".to_string(),
+                disk_enabled: true,
+                expected_status: "INITIALIZED".to_string(),
+                action: VerifyAction::AllowExport,
+                message: None,
+            },
+            requests.clone(),
+            ledger.clone(),
+        );
+
+        let records = detector.scan_existing_transport_disks().await.unwrap();
+
+        assert_eq!(records[0].runtime_status, "READY");
+        assert_eq!(
+            records[0].disk_id.as_deref(),
+            Some("33333333-3333-3333-3333-333333333333")
+        );
+        assert!(records[0].task_pool_eligible);
+        assert_eq!(
+            requests.lock().unwrap()[0].disk_id,
+            "33333333-3333-3333-3333-333333333333"
+        );
+        assert_eq!(
+            ledger.records.lock().unwrap()[0].disk_id.as_deref(),
+            Some("33333333-3333-3333-3333-333333333333")
+        );
         fs::remove_dir_all(mount).ok();
     }
 
@@ -1146,6 +1212,46 @@ mod tests {
         fs::remove_dir_all(mount).ok();
     }
 
+    #[tokio::test]
+    async fn center_signature_rejection_blocks_initialized_disk() {
+        let mount = temp_mount("signature-rejected");
+        write_disk_info(&mount, "INITIALIZED");
+        let detector = detector(
+            vec![disk(&mount, "ext4")],
+            DiskVerifyResponse {
+                allowed: false,
+                disk_id: "11111111-1111-1111-1111-111111111111".to_string(),
+                disk_enabled: true,
+                expected_status: "INITIALIZED".to_string(),
+                action: VerifyAction::Reject,
+                message: Some("center_signature invalid".to_string()),
+            },
+            Arc::new(Mutex::new(Vec::new())),
+            MockLedger::default(),
+        );
+
+        let records = detector.scan_existing_transport_disks().await.unwrap();
+
+        assert_eq!(records[0].runtime_status, "REJECTED");
+        assert_eq!(
+            records[0].last_error_code.as_deref(),
+            Some("CENTER_REJECTED")
+        );
+        assert!(!records[0].task_pool_eligible);
+        fs::remove_dir_all(mount).ok();
+    }
+
+    #[test]
+    fn runtime_refresh_sql_replaces_only_current_runtime_snapshots() {
+        assert!(REPLACE_CURRENT_RUNTIME_SQL.contains("DELETE FROM disk_runtime"));
+        assert!(REPLACE_CURRENT_RUNTIME_SQL.contains("status <> 'COPYING'"));
+        assert!(REPLACE_CURRENT_RUNTIME_SQL.contains("device_path = $2"));
+        assert!(REPLACE_CURRENT_RUNTIME_SQL.contains("mount_path IS NOT DISTINCT FROM $3"));
+        assert!(!REPLACE_CURRENT_RUNTIME_SQL.contains("export_job"));
+        assert!(!REPLACE_CURRENT_RUNTIME_SQL.contains("export_object"));
+        assert!(!REPLACE_CURRENT_RUNTIME_SQL.contains("manifest"));
+    }
+
     fn detector(
         disks: Vec<DetectedDisk>,
         response: DiskVerifyResponse,
@@ -1200,10 +1306,14 @@ mod tests {
     }
 
     fn write_disk_info(mount: &Path, status_code: &str) {
+        write_disk_info_with_disk_id(mount, status_code, "11111111-1111-1111-1111-111111111111");
+    }
+
+    fn write_disk_info_with_disk_id(mount: &Path, status_code: &str, disk_id: &str) {
         let payload = format!(
             r#"{{
   "protocol": {{ "version": "1.0" }},
-  "disk": {{ "disk_id": "11111111-1111-1111-1111-111111111111" }},
+  "disk": {{ "disk_id": "{disk_id}" }},
   "status": {{ "code": "{status_code}" }},
   "security": {{ "data_key_id": "22222222-2222-2222-2222-222222222222" }}
 }}"#

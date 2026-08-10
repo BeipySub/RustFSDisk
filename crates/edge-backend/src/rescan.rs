@@ -111,6 +111,13 @@ impl DiskRescanCoordinator {
         }
     }
 
+    pub async fn run_rescan_once(
+        &self,
+        trigger: DiskRescanTrigger,
+    ) -> Result<usize, DiskDetectionError> {
+        self.inner.runner.run_disk_rescan(trigger).await
+    }
+
     pub async fn request_rescan(&self, trigger: DiskRescanTrigger) -> DiskRescanAccepted {
         let mut state = self.inner.state.lock().await;
         if state.running {
@@ -224,5 +231,21 @@ mod tests {
         assert!(second.queued);
         tokio::time::sleep(Duration::from_millis(80)).await;
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn run_rescan_once_refreshes_before_control_operation() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let coordinator = DiskRescanCoordinator::new(Arc::new(SlowRunner {
+            calls: calls.clone(),
+        }));
+
+        let record_count = coordinator
+            .run_rescan_once(DiskRescanTrigger::manual(None))
+            .await
+            .unwrap();
+
+        assert_eq!(record_count, 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }
