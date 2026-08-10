@@ -7,7 +7,6 @@ use std::{
 use anyhow::{anyhow, Context};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use tokio::{runtime::Handle, task};
 use uuid::Uuid;
@@ -15,15 +14,12 @@ use uuid::Uuid;
 use crate::{
     center_security::CenterSecurity,
     reinitializer::{
-        validate_center_signature_for_reinitialize, CompletedImport, DiskInfo, DiskInfoDocument,
-        DiskInfoTemplate, DiskStatusCode, NewDataKey, PostImportReinitializer,
-        PostImportRepository, ReinitializeError, ReinitializedDisk, RuntimeStatus, DISK_INFO_FILE,
-        PROTOCOL_ROOT,
+        validate_center_signature_for_reinitialize, DiskInfoDocument, DiskInfoTemplate,
+        DiskStatusCode, NewDataKey, PostImportReinitializer, PostImportRepository,
+        RegisteredDiskIdentity, ReinitializeError, ReinitializedDisk, RuntimeStatus,
+        DISK_INFO_FILE, PROTOCOL_ROOT,
     },
 };
-
-const EXPORT_MANIFEST: &str = "manifests/export_manifest.json";
-const EXPORT_MANIFEST_SHA256: &str = "manifests/export_manifest.sha256";
 
 pub type CenterReinitializeFuture<'a> =
     Pin<Box<dyn Future<Output = anyhow::Result<CenterReinitializeResponse>> + Send + 'a>>;
@@ -272,46 +268,8 @@ fn validate_reinitialize_preflight(
         ));
     }
     validate_center_signature_for_reinitialize(&disk_info_document, security)?;
-    validate_manifest_files(mount_path, disk_info, disk_id, seal_id)?;
     reject_partials(mount_path)?;
     Ok(disk_info_document)
-}
-
-fn validate_manifest_files(
-    mount_path: &Path,
-    disk_info: &DiskInfo,
-    disk_id: Uuid,
-    seal_id: Uuid,
-) -> anyhow::Result<()> {
-    let manifest_ref = disk_info
-        .manifest
-        .as_ref()
-        .ok_or_else(|| anyhow!("disk_info manifest is required for imported disk cleanup"))?;
-    let root = mount_path.join(PROTOCOL_ROOT);
-    let manifest_path = root.join(EXPORT_MANIFEST);
-    let sha_path = root.join(EXPORT_MANIFEST_SHA256);
-    let manifest_bytes = std::fs::read(&manifest_path)
-        .with_context(|| format!("read {}", manifest_path.display()))?;
-    let actual_sha = sha256_hex(&manifest_bytes);
-    let expected_sha = std::fs::read_to_string(&sha_path)
-        .with_context(|| format!("read {}", sha_path.display()))?;
-    if expected_sha.trim() != actual_sha || manifest_ref.manifest_sha256 != actual_sha {
-        return Err(anyhow!(
-            "manifest sha256 does not match disk_info or sha256 sidecar"
-        ));
-    }
-
-    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
-        .with_context(|| format!("parse {}", manifest_path.display()))?;
-    let disk_id_text = disk_id.to_string();
-    if manifest.get("disk_id").and_then(|value| value.as_str()) != Some(disk_id_text.as_str()) {
-        return Err(anyhow!("manifest disk_id does not match disk_info"));
-    }
-    let seal_id_text = seal_id.to_string();
-    if manifest.get("seal_id").and_then(|value| value.as_str()) != Some(seal_id_text.as_str()) {
-        return Err(anyhow!("manifest seal_id does not match disk_info"));
-    }
-    Ok(())
 }
 
 fn reject_partials(mount_path: &Path) -> anyhow::Result<()> {
@@ -377,42 +335,26 @@ impl PgPostImportRepository {
 }
 
 impl PostImportRepository for PgPostImportRepository {
-    fn completed_import(
+    fn registered_disk(
         &mut self,
         disk_id: Uuid,
-        seal_id: Uuid,
-        old_data_key_id: Uuid,
-    ) -> Result<Option<CompletedImport>, ReinitializeError> {
+    ) -> Result<Option<RegisteredDiskIdentity>, ReinitializeError> {
         self.handle.block_on(async {
             let row = sqlx::query(
                 r#"
-                    SELECT ij.import_job_id
-                    FROM import_job ij
-                    JOIN disk_list dl
-                      ON dl.disk_id = ij.disk_id
-                    JOIN data_key dk
-                      ON dk.disk_id = ij.disk_id
-                     AND dk.data_key_id = $3
-                    WHERE ij.disk_id = $1
-                      AND ij.seal_id = $2
-                      AND ij.status = 'DONE'
-                      AND dl.status = TRUE
-                      AND dk.status IN ('ISSUED', 'SEALED_READONLY')
-                    ORDER BY ij.finish_time DESC NULLS LAST, ij.id DESC
-                    LIMIT 1
+                    SELECT disk_id, sn
+                    FROM disk_list
+                    WHERE disk_id = $1
+                      AND status = TRUE
                     "#,
             )
             .bind(disk_id)
-            .bind(seal_id)
-            .bind(old_data_key_id)
             .fetch_optional(&self.pool)
             .await
             .map_err(|err| ReinitializeError::Repository(err.to_string()))?;
-            Ok(row.map(|row| CompletedImport {
-                import_job_id: row.get("import_job_id"),
-                disk_id,
-                seal_id,
-                old_data_key_id,
+            Ok(row.map(|row| RegisteredDiskIdentity {
+                disk_id: row.get("disk_id"),
+                sn: row.get("sn"),
             }))
         })
     }
@@ -490,11 +432,10 @@ impl PostImportRepository for PgPostImportRepository {
         })
     }
 
-    fn activate_new_key_and_retire_old_key(
+    fn activate_new_key(
         &mut self,
         disk_id: Uuid,
         new_data_key_id: Uuid,
-        old_data_key_id: Uuid,
     ) -> Result<(), ReinitializeError> {
         self.handle.block_on(async {
             let mut tx = self
@@ -528,28 +469,6 @@ impl PostImportRepository for PgPostImportRepository {
                 ));
             }
 
-            let retired = sqlx::query(
-                r#"
-                UPDATE data_key
-                SET status = 'RETIRED',
-                    retire_time = (NOW() AT TIME ZONE 'UTC'),
-                    remark = 'retired after successful post-import reinitialize'
-                WHERE data_key_id = $1
-                  AND disk_id = $2
-                  AND status IN ('ISSUED', 'SEALED_READONLY')
-                "#,
-            )
-            .bind(old_data_key_id)
-            .bind(disk_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|err| ReinitializeError::Repository(err.to_string()))?;
-            if retired.rows_affected() != 1 {
-                return Err(ReinitializeError::Repository(
-                    "old data key was not eligible for retirement".to_string(),
-                ));
-            }
-
             sqlx::query(
                 r#"
                 UPDATE disk_list
@@ -568,10 +487,37 @@ impl PostImportRepository for PgPostImportRepository {
             Ok(())
         })
     }
-}
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
+    fn retire_old_key(
+        &mut self,
+        disk_id: Uuid,
+        old_data_key_id: Uuid,
+    ) -> Result<(), ReinitializeError> {
+        self.handle.block_on(async {
+            let retired = sqlx::query(
+                r#"
+                UPDATE data_key
+                SET status = 'RETIRED',
+                    retire_time = (NOW() AT TIME ZONE 'UTC'),
+                    remark = 'retired after successful post-import reinitialize'
+                WHERE data_key_id = $1
+                  AND disk_id = $2
+                  AND status IN ('ISSUED', 'SEALED_READONLY')
+                "#,
+            )
+            .bind(old_data_key_id)
+            .bind(disk_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|err| ReinitializeError::Repository(err.to_string()))?;
+            if retired.rows_affected() != 1 {
+                return Err(ReinitializeError::Repository(
+                    "old data key was not eligible for retirement".to_string(),
+                ));
+            }
+            Ok(())
+        })
+    }
 }
 
 #[cfg(test)]
@@ -581,42 +527,41 @@ mod tests {
     use crate::reinitializer::{
         CenterInfo, DiskIdentity, DiskInfo, EdgeSealInfo, ManifestInfo, ProtocolInfo, SecurityInfo,
     };
+    use sha2::{Digest, Sha256};
     use std::{
         collections::HashMap,
         fs,
         sync::{Arc, Mutex},
     };
 
+    const EXPORT_MANIFEST: &str = "manifests/export_manifest.json";
+    const EXPORT_MANIFEST_SHA256: &str = "manifests/export_manifest.sha256";
+
     #[derive(Default)]
     struct MemoryRepo {
-        completed_import: Option<CompletedImport>,
+        registered_disk: Option<RegisteredDiskIdentity>,
         runtime: Vec<RuntimeStatus>,
         staged_keys: HashMap<Uuid, NewDataKey>,
         active_key: Option<Uuid>,
         retired_key: Option<Uuid>,
+        fail_retire_old_key: bool,
     }
 
     #[derive(Clone, Default)]
     struct SharedRepo(Arc<Mutex<MemoryRepo>>);
 
     impl PostImportRepository for SharedRepo {
-        fn completed_import(
+        fn registered_disk(
             &mut self,
             disk_id: Uuid,
-            seal_id: Uuid,
-            old_data_key_id: Uuid,
-        ) -> Result<Option<CompletedImport>, ReinitializeError> {
+        ) -> Result<Option<RegisteredDiskIdentity>, ReinitializeError> {
             Ok(self
                 .0
                 .lock()
                 .unwrap()
-                .completed_import
+                .registered_disk
                 .clone()
-                .filter(|job| {
-                    job.disk_id == disk_id
-                        && job.seal_id == seal_id
-                        && job.old_data_key_id == old_data_key_id
-                }))
+                .filter(|registered| registered.disk_id == disk_id))
         }
 
         fn set_runtime(
@@ -648,14 +593,25 @@ mod tests {
             Ok(())
         }
 
-        fn activate_new_key_and_retire_old_key(
+        fn activate_new_key(
             &mut self,
             _disk_id: Uuid,
             new_data_key_id: Uuid,
-            old_data_key_id: Uuid,
         ) -> Result<(), ReinitializeError> {
             let mut guard = self.0.lock().unwrap();
             guard.active_key = Some(new_data_key_id);
+            Ok(())
+        }
+
+        fn retire_old_key(
+            &mut self,
+            _disk_id: Uuid,
+            old_data_key_id: Uuid,
+        ) -> Result<(), ReinitializeError> {
+            if self.0.lock().unwrap().fail_retire_old_key {
+                return Err(ReinitializeError::Repository("retire failed".to_string()));
+            }
+            let mut guard = self.0.lock().unwrap();
             guard.retired_key = Some(old_data_key_id);
             Ok(())
         }
@@ -881,12 +837,7 @@ mod tests {
         fs::write(temp.root().join("meta/object.json"), b"{}").unwrap();
 
         let repo = SharedRepo::default();
-        repo.0.lock().unwrap().completed_import = Some(CompletedImport {
-            import_job_id: Uuid::new_v4(),
-            disk_id,
-            seal_id,
-            old_data_key_id: old_key,
-        });
+        repo.0.lock().unwrap().registered_disk = Some(registered_disk(disk_id));
 
         let response = run_reinitialize_with_repo(
             repo.clone(),
@@ -917,6 +868,41 @@ mod tests {
     }
 
     #[test]
+    fn minimal_admission_reinitializes_without_manifest_or_import_job_gate() {
+        let temp = TempDisk::new();
+        let disk_id = Uuid::new_v4();
+        let seal_id = Uuid::new_v4();
+        let old_key = Uuid::new_v4();
+        write_imported_disk(&temp, disk_id, seal_id, old_key);
+        fs::remove_dir_all(temp.root().join("manifests")).unwrap();
+        fs::create_dir_all(temp.root().join("data")).unwrap();
+        fs::write(temp.root().join("data/object.enc"), b"ciphertext").unwrap();
+
+        let repo = SharedRepo::default();
+        repo.0.lock().unwrap().registered_disk = Some(registered_disk(disk_id));
+
+        let response = run_reinitialize_with_repo(
+            repo.clone(),
+            template(),
+            security(),
+            disk_id,
+            request(&temp.path, seal_id),
+            temp.path.clone(),
+            "ext4".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(response.disk_status_code, DiskStatusCode::Initialized);
+        let disk_info = crate::reinitializer::read_disk_info(&temp.path).unwrap();
+        assert_eq!(disk_info.status.code, DiskStatusCode::Initialized);
+        assert!(disk_info.manifest.is_none());
+        assert!(!temp.root().join("data/object.enc").exists());
+        let guard = repo.0.lock().unwrap();
+        assert_eq!(guard.active_key, Some(response.new_data_key_id));
+        assert_eq!(guard.retired_key, Some(old_key));
+    }
+
+    #[test]
     fn legacy_missing_updated_at_signature_reinitializes_through_runtime_and_core() {
         let temp = TempDisk::new();
         let disk_id = Uuid::new_v4();
@@ -928,12 +914,7 @@ mod tests {
         fs::write(temp.root().join("data/object.enc"), b"ciphertext").unwrap();
 
         let repo = SharedRepo::default();
-        repo.0.lock().unwrap().completed_import = Some(CompletedImport {
-            import_job_id: Uuid::new_v4(),
-            disk_id,
-            seal_id,
-            old_data_key_id: old_key,
-        });
+        repo.0.lock().unwrap().registered_disk = Some(registered_disk(disk_id));
 
         let response = run_reinitialize_with_repo(
             repo.clone(),
@@ -987,12 +968,7 @@ mod tests {
         let original_disk_info_bytes = fs::read(&disk_info_path).unwrap();
 
         let repo = SharedRepo::default();
-        repo.0.lock().unwrap().completed_import = Some(CompletedImport {
-            import_job_id: Uuid::new_v4(),
-            disk_id,
-            seal_id,
-            old_data_key_id: old_key,
-        });
+        repo.0.lock().unwrap().registered_disk = Some(registered_disk(disk_id));
 
         let error = run_reinitialize_with_repo(
             repo.clone(),
@@ -1043,7 +1019,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_missing_updated_at_reaches_later_manifest_guard_without_writing() {
+    fn legacy_missing_updated_at_ignores_manifest_as_admission_gate() {
         let temp = TempDisk::new();
         let disk_id = Uuid::new_v4();
         let seal_id = Uuid::new_v4();
@@ -1054,7 +1030,7 @@ mod tests {
         write_legacy_raw_imported_missing_updated_at_signature(&temp);
         fs::write(temp.root().join(EXPORT_MANIFEST_SHA256), "tampered-sidecar").unwrap();
 
-        let error = validate_reinitialize_preflight(
+        validate_reinitialize_preflight(
             &temp.path,
             disk_id,
             seal_id,
@@ -1062,9 +1038,8 @@ mod tests {
             "ext4",
             &security(),
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.to_string().contains("manifest"));
         let current: serde_json::Value =
             serde_json::from_slice(&fs::read(&disk_info_path).unwrap()).unwrap();
         assert_eq!(current["status"]["code"], "IMPORTED");
@@ -1072,7 +1047,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_status_and_signature_and_manifest_are_rejected() {
+    fn invalid_status_and_signature_are_rejected() {
         let temp = TempDisk::new();
         let disk_id = Uuid::new_v4();
         let seal_id = Uuid::new_v4();
@@ -1106,20 +1081,6 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("center_signature"));
-
-        disk_info.security.center_signature = security().sign_disk_info(&disk_info).unwrap();
-        crate::reinitializer::write_disk_info(&temp.path, &disk_info).unwrap();
-        write_manifest(&temp, disk_id, seal_id, "tampered-sidecar");
-        let error = validate_reinitialize_preflight(
-            &temp.path,
-            disk_id,
-            seal_id,
-            DiskStatusCode::Imported,
-            "ext4",
-            &security(),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("manifest sha256"));
     }
 
     #[test]
@@ -1193,6 +1154,47 @@ mod tests {
         assert!(value.get("status").is_none());
     }
 
+    #[test]
+    fn runtime_old_key_retirement_failure_does_not_block_reinitialize() {
+        let temp = TempDisk::new();
+        let disk_id = Uuid::new_v4();
+        let seal_id = Uuid::new_v4();
+        let old_key = Uuid::new_v4();
+        write_imported_disk(&temp, disk_id, seal_id, old_key);
+
+        let repo = SharedRepo::default();
+        {
+            let mut guard = repo.0.lock().unwrap();
+            guard.registered_disk = Some(registered_disk(disk_id));
+            guard.fail_retire_old_key = true;
+        }
+
+        let response = run_reinitialize_with_repo(
+            repo.clone(),
+            template(),
+            security(),
+            disk_id,
+            request(&temp.path, seal_id),
+            temp.path.clone(),
+            "ext4".to_string(),
+        )
+        .unwrap();
+
+        let disk_info = crate::reinitializer::read_disk_info(&temp.path).unwrap();
+        assert_eq!(disk_info.status.code, DiskStatusCode::Initialized);
+        let guard = repo.0.lock().unwrap();
+        assert_eq!(guard.active_key, Some(response.new_data_key_id));
+        assert_eq!(guard.retired_key, None);
+        assert_eq!(
+            guard.runtime,
+            vec![
+                RuntimeStatus::Cleaning,
+                RuntimeStatus::Reinitializing,
+                RuntimeStatus::Done,
+            ]
+        );
+    }
+
     fn request(mount_path: &Path, seal_id: Uuid) -> CenterReinitializeRequest {
         CenterReinitializeRequest {
             mount_path: mount_path.to_path_buf(),
@@ -1200,6 +1202,13 @@ mod tests {
             expected_status_code: DiskStatusCode::Imported,
             operator_reason: "vm acceptance cleanup for authorized disk".to_string(),
             confirm_reinitialize: true,
+        }
+    }
+
+    fn registered_disk(disk_id: Uuid) -> RegisteredDiskIdentity {
+        RegisteredDiskIdentity {
+            disk_id,
+            sn: Some("SN001".to_string()),
         }
     }
 
@@ -1241,6 +1250,10 @@ mod tests {
         disk_info.security.center_signature = String::new();
         disk_info.security.center_signature = security().sign_disk_info(&disk_info).unwrap();
         crate::reinitializer::write_disk_info(&temp.path, &disk_info).unwrap();
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        hex::encode(Sha256::digest(bytes))
     }
 
     fn write_legacy_raw_imported_missing_updated_at_signature(

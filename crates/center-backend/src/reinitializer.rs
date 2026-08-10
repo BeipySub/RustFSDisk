@@ -35,11 +35,16 @@ impl RuntimeStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompletedImport {
-    pub import_job_id: Uuid,
+pub struct RegisteredDiskIdentity {
     pub disk_id: Uuid,
-    pub seal_id: Uuid,
-    pub old_data_key_id: Uuid,
+    pub sn: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReinitializeAdmission {
+    disk_id: Uuid,
+    seal_id: Uuid,
+    old_data_key_id: Uuid,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,12 +64,10 @@ pub struct ReinitializedDisk {
 }
 
 pub trait PostImportRepository {
-    fn completed_import(
+    fn registered_disk(
         &mut self,
         disk_id: Uuid,
-        seal_id: Uuid,
-        old_data_key_id: Uuid,
-    ) -> Result<Option<CompletedImport>, ReinitializeError>;
+    ) -> Result<Option<RegisteredDiskIdentity>, ReinitializeError>;
 
     fn set_runtime(
         &mut self,
@@ -82,10 +85,15 @@ pub trait PostImportRepository {
 
     fn abort_staged_data_key(&mut self, data_key_id: Uuid) -> Result<(), ReinitializeError>;
 
-    fn activate_new_key_and_retire_old_key(
+    fn activate_new_key(
         &mut self,
         disk_id: Uuid,
         new_data_key_id: Uuid,
+    ) -> Result<(), ReinitializeError>;
+
+    fn retire_old_key(
+        &mut self,
+        disk_id: Uuid,
         old_data_key_id: Uuid,
     ) -> Result<(), ReinitializeError>;
 }
@@ -137,14 +145,19 @@ where
         validate_center_signature_for_reinitialize(&document, &self.security)?;
         let previous_disk_info = document.disk_info;
         validate_imported_disk_info(&previous_disk_info, disk_id, seal_id)?;
-        let old_data_key_id = previous_disk_info.security.data_key_id;
-        let import = self
+        let registered_disk = self
             .repo
-            .completed_import(disk_id, seal_id, old_data_key_id)?
-            .ok_or(ReinitializeError::ImportNotDone { disk_id, seal_id })?;
+            .registered_disk(disk_id)?
+            .ok_or(ReinitializeError::DiskNotRegistered { disk_id })?;
+        validate_registered_disk_identity(&previous_disk_info, &registered_disk)?;
+        let old_data_key_id = previous_disk_info.security.data_key_id;
+        let admission = ReinitializeAdmission {
+            disk_id,
+            seal_id,
+            old_data_key_id,
+        };
 
-        let result =
-            self.reinitialize_after_validated_import(mount_path, &import, &previous_disk_info);
+        let result = self.reinitialize_after_admission(mount_path, admission, &previous_disk_info);
         if let Err(error) = &result {
             let _ = write_disk_info(mount_path, &previous_disk_info);
             let _ = self.repo.set_runtime(
@@ -157,23 +170,23 @@ where
         result
     }
 
-    fn reinitialize_after_validated_import(
+    fn reinitialize_after_admission(
         &mut self,
         mount_path: &Path,
-        import: &CompletedImport,
+        admission: ReinitializeAdmission,
         previous_disk_info: &DiskInfo,
     ) -> Result<ReinitializedDisk, ReinitializeError> {
         ensure_no_partial_residue(mount_path)?;
         self.repo
-            .set_runtime(import.disk_id, RuntimeStatus::Cleaning, None, None)?;
+            .set_runtime(admission.disk_id, RuntimeStatus::Cleaning, None, None)?;
         clean_sealed_payload(mount_path)?;
 
         self.repo
-            .set_runtime(import.disk_id, RuntimeStatus::Reinitializing, None, None)?;
+            .set_runtime(admission.disk_id, RuntimeStatus::Reinitializing, None, None)?;
         create_protocol_dirs(mount_path)?;
 
-        let new_key = generate_data_key(import.disk_id, &self.security)?;
-        self.repo.stage_new_data_key(import.disk_id, &new_key)?;
+        let new_key = generate_data_key(admission.disk_id, &self.security)?;
+        self.repo.stage_new_data_key(admission.disk_id, &new_key)?;
 
         let initialized_disk_info = self.initialized_disk_info(previous_disk_info, &new_key);
         if let Err(error) = write_disk_info(mount_path, &initialized_disk_info) {
@@ -181,23 +194,33 @@ where
             return Err(error);
         }
 
-        if let Err(error) = self.repo.activate_new_key_and_retire_old_key(
-            import.disk_id,
-            new_key.data_key_id,
-            import.old_data_key_id,
-        ) {
+        if let Err(error) = self
+            .repo
+            .activate_new_key(admission.disk_id, new_key.data_key_id)
+        {
             let _ = self.repo.abort_staged_data_key(new_key.data_key_id);
             let _ = write_disk_info(mount_path, previous_disk_info);
             return Err(error);
         }
+        if let Err(error) = self
+            .repo
+            .retire_old_key(admission.disk_id, admission.old_data_key_id)
+        {
+            tracing::warn!(
+                disk_id = %admission.disk_id,
+                old_data_key_id = %admission.old_data_key_id,
+                error = %error,
+                "old data key retirement failed after successful reinitialize"
+            );
+        }
 
         self.repo
-            .set_runtime(import.disk_id, RuntimeStatus::Done, None, None)?;
+            .set_runtime(admission.disk_id, RuntimeStatus::Done, None, None)?;
 
         Ok(ReinitializedDisk {
-            disk_id: import.disk_id,
-            old_seal_id: import.seal_id,
-            old_data_key_id: import.old_data_key_id,
+            disk_id: admission.disk_id,
+            old_seal_id: admission.seal_id,
+            old_data_key_id: admission.old_data_key_id,
             new_data_key_id: new_key.data_key_id,
         })
     }
@@ -273,6 +296,30 @@ fn validate_imported_disk_info(
             expected: seal_id,
             actual: actual_seal_id,
         });
+    }
+    Ok(())
+}
+
+fn validate_registered_disk_identity(
+    disk_info: &DiskInfo,
+    registered_disk: &RegisteredDiskIdentity,
+) -> Result<(), ReinitializeError> {
+    if disk_info.disk.disk_id != registered_disk.disk_id {
+        return Err(ReinitializeError::DiskIdentityMismatch {
+            expected: registered_disk.disk_id,
+            actual: disk_info.disk.disk_id,
+        });
+    }
+    let registered_sn = registered_disk.sn.as_deref().map(str::trim);
+    let disk_sn = disk_info.disk.sn.as_deref().map(str::trim);
+    if let (Some(expected), Some(actual)) = (registered_sn, disk_sn) {
+        if !expected.is_empty() && !actual.is_empty() && expected != actual {
+            return Err(ReinitializeError::DiskRegistrationMismatch {
+                field: "sn",
+                expected: expected.to_string(),
+                actual: actual.to_string(),
+            });
+        }
     }
     Ok(())
 }
@@ -475,10 +522,16 @@ fn sync_dir(_path: &Path) -> Result<(), ReinitializeError> {
 
 #[derive(Debug, Error)]
 pub enum ReinitializeError {
-    #[error("import_job is not DONE for disk_id={disk_id} seal_id={seal_id}")]
-    ImportNotDone { disk_id: Uuid, seal_id: Uuid },
+    #[error("disk_id={disk_id} is not registered or enabled in center")]
+    DiskNotRegistered { disk_id: Uuid },
     #[error("disk_id mismatch: expected {expected}, got {actual}")]
     DiskIdentityMismatch { expected: Uuid, actual: Uuid },
+    #[error("registered disk {field} mismatch: expected {expected}, got {actual}")]
+    DiskRegistrationMismatch {
+        field: &'static str,
+        expected: String,
+        actual: String,
+    },
     #[error("disk is not IMPORTED, got {actual}")]
     DiskNotImported { actual: String },
     #[error("seal_id mismatch: expected {expected}, got {actual:?}")]
@@ -597,27 +650,26 @@ mod tests {
 
     #[derive(Default)]
     struct MemoryRepo {
-        completed_import: Option<CompletedImport>,
+        registered_disk: Option<RegisteredDiskIdentity>,
         runtime: Vec<(RuntimeStatus, Option<String>)>,
         staged_key: Option<Uuid>,
         active_key: Option<Uuid>,
         retired_key: Option<Uuid>,
         fail_stage: bool,
         fail_activate: bool,
+        fail_retire_old_key: bool,
     }
 
     impl PostImportRepository for RefCell<MemoryRepo> {
-        fn completed_import(
+        fn registered_disk(
             &mut self,
             disk_id: Uuid,
-            seal_id: Uuid,
-            old_data_key_id: Uuid,
-        ) -> Result<Option<CompletedImport>, ReinitializeError> {
-            Ok(self.borrow().completed_import.clone().filter(|job| {
-                job.disk_id == disk_id
-                    && job.seal_id == seal_id
-                    && job.old_data_key_id == old_data_key_id
-            }))
+        ) -> Result<Option<RegisteredDiskIdentity>, ReinitializeError> {
+            Ok(self
+                .borrow()
+                .registered_disk
+                .clone()
+                .filter(|registered| registered.disk_id == disk_id))
         }
 
         fn set_runtime(
@@ -653,17 +705,28 @@ mod tests {
             Ok(())
         }
 
-        fn activate_new_key_and_retire_old_key(
+        fn activate_new_key(
             &mut self,
             _disk_id: Uuid,
             new_data_key_id: Uuid,
-            old_data_key_id: Uuid,
         ) -> Result<(), ReinitializeError> {
             if self.borrow().fail_activate {
                 return Err(ReinitializeError::Repository("activate failed".to_string()));
             }
             let mut repo = self.borrow_mut();
             repo.active_key = Some(new_data_key_id);
+            Ok(())
+        }
+
+        fn retire_old_key(
+            &mut self,
+            _disk_id: Uuid,
+            old_data_key_id: Uuid,
+        ) -> Result<(), ReinitializeError> {
+            if self.borrow().fail_retire_old_key {
+                return Err(ReinitializeError::Repository("retire failed".to_string()));
+            }
+            let mut repo = self.borrow_mut();
             repo.retired_key = Some(old_data_key_id);
             Ok(())
         }
@@ -686,12 +749,7 @@ mod tests {
         fs::write(temp.root().join("manifests/export_manifest.json"), b"{}").unwrap();
 
         let repo = RefCell::new(MemoryRepo {
-            completed_import: Some(CompletedImport {
-                import_job_id: Uuid::new_v4(),
-                disk_id,
-                seal_id,
-                old_data_key_id: old_key,
-            }),
+            registered_disk: Some(registered_disk(disk_id)),
             ..Default::default()
         });
         let mut service = PostImportReinitializer::new(repo, template(), security());
@@ -735,12 +793,7 @@ mod tests {
         fs::write(temp.root().join("data"), b"not a directory").unwrap();
 
         let repo = RefCell::new(MemoryRepo {
-            completed_import: Some(CompletedImport {
-                import_job_id: Uuid::new_v4(),
-                disk_id,
-                seal_id,
-                old_data_key_id: old_key,
-            }),
+            registered_disk: Some(registered_disk(disk_id)),
             ..Default::default()
         });
         let mut service = PostImportReinitializer::new(repo, template(), security());
@@ -780,12 +833,7 @@ mod tests {
         .unwrap();
 
         let repo = RefCell::new(MemoryRepo {
-            completed_import: Some(CompletedImport {
-                import_job_id: Uuid::new_v4(),
-                disk_id,
-                seal_id,
-                old_data_key_id: old_key,
-            }),
+            registered_disk: Some(registered_disk(disk_id)),
             fail_activate: true,
             ..Default::default()
         });
@@ -911,12 +959,7 @@ mod tests {
         write_disk_info(&temp.path, &disk_info).unwrap();
 
         let repo = RefCell::new(MemoryRepo {
-            completed_import: Some(CompletedImport {
-                import_job_id: Uuid::new_v4(),
-                disk_id,
-                seal_id,
-                old_data_key_id: old_key,
-            }),
+            registered_disk: Some(registered_disk(disk_id)),
             ..Default::default()
         });
         let mut service = PostImportReinitializer::new(repo, template(), security());
@@ -944,12 +987,7 @@ mod tests {
         fs::write(temp.root().join("data/object.enc.partial"), b"incomplete").unwrap();
 
         let repo = RefCell::new(MemoryRepo {
-            completed_import: Some(CompletedImport {
-                import_job_id: Uuid::new_v4(),
-                disk_id,
-                seal_id,
-                old_data_key_id: old_key,
-            }),
+            registered_disk: Some(registered_disk(disk_id)),
             ..Default::default()
         });
         let mut service = PostImportReinitializer::new(repo, template(), security());
@@ -972,7 +1010,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_import_must_match_old_data_key_from_disk_info() {
+    fn old_data_key_binding_mismatch_is_not_an_admission_gate() {
         let temp = TempDisk::new();
         let disk_id = Uuid::new_v4();
         let seal_id = Uuid::new_v4();
@@ -984,29 +1022,25 @@ mod tests {
         .unwrap();
 
         let repo = RefCell::new(MemoryRepo {
-            completed_import: Some(CompletedImport {
-                import_job_id: Uuid::new_v4(),
-                disk_id,
-                seal_id,
-                old_data_key_id: Uuid::new_v4(),
-            }),
+            registered_disk: Some(registered_disk(disk_id)),
             ..Default::default()
         });
         let mut service = PostImportReinitializer::new(repo, template(), security());
 
-        let error = service
+        let output = service
             .reinitialize_imported_disk(&temp.path, disk_id, seal_id)
-            .unwrap_err();
+            .unwrap();
 
-        assert!(matches!(error, ReinitializeError::ImportNotDone { .. }));
+        assert_eq!(output.old_data_key_id, disk_old_key);
         assert_eq!(
-            read_disk_info(&temp.path).unwrap().security.data_key_id,
-            disk_old_key
+            read_disk_info(&temp.path).unwrap().status.code,
+            DiskStatusCode::Initialized
         );
+        assert_eq!(service.repo.borrow().retired_key, Some(disk_old_key));
     }
 
     #[test]
-    fn done_import_blocks_reimport_even_when_reinit_failed() {
+    fn unregistered_disk_rejects_before_cleaning_or_key_rotation() {
         let temp = TempDisk::new();
         let disk_id = Uuid::new_v4();
         let seal_id = Uuid::new_v4();
@@ -1016,12 +1050,77 @@ mod tests {
             &imported_disk_info(disk_id, seal_id, old_key, &security()),
         )
         .unwrap();
+        let repo = RefCell::new(MemoryRepo::default());
+        let mut service = PostImportReinitializer::new(repo, template(), security());
+
+        let error = service
+            .reinitialize_imported_disk(&temp.path, disk_id, seal_id)
+            .unwrap_err();
+
+        assert!(matches!(error, ReinitializeError::DiskNotRegistered { .. }));
+        assert_eq!(
+            read_disk_info(&temp.path).unwrap().security.data_key_id,
+            old_key
+        );
+        assert!(service.repo.borrow().runtime.is_empty());
+    }
+
+    #[test]
+    fn old_key_retirement_failure_warns_without_blocking_new_key_activation() {
+        let temp = TempDisk::new();
+        let disk_id = Uuid::new_v4();
+        let seal_id = Uuid::new_v4();
+        let old_key = Uuid::new_v4();
+        write_disk_info(
+            &temp.path,
+            &imported_disk_info(disk_id, seal_id, old_key, &security()),
+        )
+        .unwrap();
+
         let repo = RefCell::new(MemoryRepo {
-            completed_import: Some(CompletedImport {
-                import_job_id: Uuid::new_v4(),
-                disk_id: Uuid::new_v4(),
-                seal_id: Uuid::new_v4(),
-                old_data_key_id: Uuid::new_v4(),
+            registered_disk: Some(registered_disk(disk_id)),
+            fail_retire_old_key: true,
+            ..Default::default()
+        });
+        let mut service = PostImportReinitializer::new(repo, template(), security());
+
+        let output = service
+            .reinitialize_imported_disk(&temp.path, disk_id, seal_id)
+            .unwrap();
+
+        let disk_info = read_disk_info(&temp.path).unwrap();
+        assert_eq!(disk_info.status.code, DiskStatusCode::Initialized);
+        let repo = service.repo.borrow();
+        assert_eq!(repo.active_key, Some(output.new_data_key_id));
+        assert_eq!(repo.retired_key, None);
+        assert_eq!(
+            repo.runtime,
+            vec![
+                (RuntimeStatus::Cleaning, None),
+                (RuntimeStatus::Reinitializing, None),
+                (RuntimeStatus::Done, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn registered_sn_mismatch_rejects_before_cleaning() {
+        let temp = TempDisk::new();
+        let disk_id = Uuid::new_v4();
+        let seal_id = Uuid::new_v4();
+        let old_key = Uuid::new_v4();
+        write_disk_info(
+            &temp.path,
+            &imported_disk_info(disk_id, seal_id, old_key, &security()),
+        )
+        .unwrap();
+        fs::create_dir_all(temp.root().join("data")).unwrap();
+        fs::write(temp.root().join("data/object.bin"), b"sealed").unwrap();
+
+        let repo = RefCell::new(MemoryRepo {
+            registered_disk: Some(RegisteredDiskIdentity {
+                disk_id,
+                sn: Some("OTHER-SN".to_string()),
             }),
             ..Default::default()
         });
@@ -1031,7 +1130,19 @@ mod tests {
             .reinitialize_imported_disk(&temp.path, disk_id, seal_id)
             .unwrap_err();
 
-        assert!(matches!(error, ReinitializeError::ImportNotDone { .. }));
+        assert!(matches!(
+            error,
+            ReinitializeError::DiskRegistrationMismatch { field: "sn", .. }
+        ));
+        assert!(temp.root().join("data/object.bin").exists());
+        assert!(service.repo.borrow().runtime.is_empty());
+    }
+
+    fn registered_disk(disk_id: Uuid) -> RegisteredDiskIdentity {
+        RegisteredDiskIdentity {
+            disk_id,
+            sn: Some("SN001".to_string()),
+        }
     }
 
     fn template() -> DiskInfoTemplate {

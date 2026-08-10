@@ -115,6 +115,7 @@
 | TASK-S1-P1-CENTER-REINIT-UPDATED-AT-003 | Center reinitialize 兼容旧盘缺 updated_at | P1 主闭环 | Center | [x] | Day 2 VM 热修补 | TASK-S1-P1-CENTER-REINIT-FSTYPE-002 |
 | TASK-S1-P1-CENTER-REINIT-SIGNATURE-004 | Center reinitialize 兼容旧 IMPORTED 签名 canonical | P1 主闭环 | Center | [x] | Day 2 VM 热修补 | TASK-S1-P1-CENTER-REINIT-UPDATED-AT-003 |
 | TASK-S1-P1-CENTER-REINIT-SIGNATURE-005 | Center reinitialize 统一内外层 center_signature 验签 | P1 主闭环 | Center | [x] | Day 2 VM 热修补 | TASK-S1-P1-CENTER-REINIT-SIGNATURE-004 |
+| TASK-S1-P1-CENTER-REINIT-ADMISSION-006 | Center reinitialize 最小生命周期准入 | P1 主闭环 | Center | [x] | Day 2 VM 热修补 | TASK-S1-P1-CENTER-REINIT-SIGNATURE-005 |
 | TASK-S1-WEB-EDGE-001 | 边缘端 DashboardView、HTTP 汇总和 WS 进度展示 | P2 交付增强 | Web / Edge | [x] | Day 1-2 | TASK-S1-TEST-001 |
 | TASK-S1-WEB-CENTER-001 | 中控端 DashboardView、HTTP 汇总和 WS 进度展示 | P2 交付增强 | Web / Center | [x] | Day 1-2 | TASK-S1-TEST-001 |
 | TASK-S1-DASHBOARD-REALTIME-001 | 双端真实 Dashboard HTTP summary 与本端 WebSocket 推送 | P0 解阻塞 | Center / Edge / Web | [x] | Day 2 联调修补 | TASK-S1-WEB-EDGE-001, TASK-S1-WEB-CENTER-001 |
@@ -1298,6 +1299,49 @@
 - [x] `cargo test --workspace` 通过。
 - [x] `powershell -ExecutionPolicy Bypass -File scripts\check-deploy.ps1` 通过。
 - [x] 该补丁尚未部署真实 VM 验收，不得宣称 `FUSTFS-TST-A` 已完成 cleanup/reinitialize。
+
+---
+
+# 开发任务卡片：TASK-S1-P1-CENTER-REINIT-ADMISSION-006
+
+### 任务基本信息
+
+- **任务 ID**：TASK-S1-P1-CENTER-REINIT-ADMISSION-006
+- **任务名称**：Center reinitialize 最小生命周期准入
+- **所属 Track / 模块**：
+  - [ ] Track 1: Common
+  - [ ] Track 2: Edge
+  - [x] Track 3: Center (`crates/center-backend`)
+  - [ ] Track 4: Web / Deploy
+- **任务状态**：[x] 开发完成
+- **负责人 / Role**：Codex 串行合入/提交窗口
+- **计划时间**：Day 2 VM 热修补
+- **依赖任务**：TASK-S1-P1-CENTER-REINIT-SIGNATURE-005
+
+### 任务目标与范围
+
+- **核心目标**：按用户确认的最小生命周期准入口径，移除 manifest、object_ledger、import_job DONE、old data_key 绑定作为 cleanup/reinitialize 启动门槛，避免重复验证导入完成事实阻塞 Center 对已导入盘的受控清理重初始化。
+- **对应代码位置**：`crates/center-backend/src/reinitializer.rs`、`crates/center-backend/src/reinitialize_runtime.rs`
+
+### 准入与拒绝边界
+
+- 准入仅保留 Center 已登记且启用的目标盘身份、ext4、`.partial` 恢复检查、盘内 `disk_info.status.code=IMPORTED`、真实 `center_signature` 验签。
+- Center 登记身份以 `disk_id` 为主，SN 仅作辅助核验；登记 SN 与盘内 SN 同时存在且不一致时写入前拒绝。
+- 错误签名、非 `IMPORTED`、身份不匹配、非 ext4、`.partial` 残留仍在写入前拒绝。
+- manifest、object_ledger、import_job DONE、old data_key 绑定不再作为启动前置；本任务不改 archive/source/object_ledger。
+- 成功路径必须激活新 key；旧 key 退役缺失或失败只记录 warn，不回滚已成功的受控清理重初始化。
+
+### 验收与检查清单
+
+- [x] `minimal_admission_reinitializes_without_manifest_or_import_job_gate` 覆盖无 manifest/import_job 门槛时满足五项准入即可进入清理并写回 `INITIALIZED`。
+- [x] `old_data_key_binding_mismatch_is_not_an_admission_gate` 覆盖 old data key 绑定不再阻断准入。
+- [x] `old_key_retirement_failure_warns_without_blocking_new_key_activation` 与 `runtime_old_key_retirement_failure_does_not_block_reinitialize` 覆盖旧 key 退役失败只 warn，新 key 激活成功仍完成。
+- [x] 非 ext4、错误签名、非 `IMPORTED`、身份不匹配、`.partial` 残留仍写入前拒绝。
+- [x] `cargo fmt --all -- --check` 通过。
+- [x] `cargo test -p rustfs-transfer-center` 通过。
+- [x] `cargo test --workspace` 通过。
+- [x] `powershell -ExecutionPolicy Bypass -File scripts\check-deploy.ps1` 通过。
+- [x] 该最小准入补丁尚未部署真实 VM 验收，不得宣称 `FUSTFS-TST-A` 已完成 cleanup/reinitialize。
 
 ---
 
