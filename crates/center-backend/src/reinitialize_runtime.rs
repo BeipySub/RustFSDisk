@@ -991,6 +991,74 @@ mod tests {
     }
 
     #[test]
+    fn imported_status_change_without_resigning_passes_outer_and_inner_verifiers() {
+        let temp = TempDisk::new();
+        let disk_id = Uuid::new_v4();
+        let seal_id = Uuid::new_v4();
+        let old_key = Uuid::new_v4();
+        let mut disk_info = imported_disk_info(disk_id, seal_id, old_key);
+        disk_info.edge = None;
+        disk_info.manifest = None;
+        disk_info.status = crate::reinitializer::DiskStatus {
+            code: DiskStatusCode::Initialized,
+            sealed: false,
+            imported: false,
+            reusable: true,
+            last_error: None,
+        };
+        disk_info.security.center_signature = String::new();
+        disk_info.security.center_signature = security().sign_disk_info(&disk_info).unwrap();
+
+        disk_info.edge = Some(EdgeSealInfo {
+            edge_code: "edge-a".to_string(),
+            export_job_id: Uuid::new_v4(),
+            seal_id: Some(seal_id),
+        });
+        disk_info.manifest = Some(ManifestInfo {
+            manifest_sha256: "manifest-after-import".to_string(),
+        });
+        disk_info.status = crate::reinitializer::DiskStatus {
+            code: DiskStatusCode::Imported,
+            sealed: true,
+            imported: true,
+            reusable: true,
+            last_error: None,
+        };
+        crate::reinitializer::write_disk_info(&temp.path, &disk_info).unwrap();
+        fs::create_dir_all(temp.root().join("data")).unwrap();
+        fs::write(temp.root().join("data/object.enc"), b"ciphertext").unwrap();
+
+        validate_reinitialize_preflight(
+            &temp.path,
+            disk_id,
+            seal_id,
+            DiskStatusCode::Imported,
+            "ext4",
+            &security(),
+        )
+        .unwrap();
+
+        let repo = SharedRepo::default();
+        repo.0.lock().unwrap().registered_disk = Some(registered_disk(disk_id));
+        let response = run_reinitialize_with_repo(
+            repo.clone(),
+            template(),
+            security(),
+            disk_id,
+            request(&temp.path, seal_id),
+            temp.path.clone(),
+            "ext4".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(response.disk_status_code, DiskStatusCode::Initialized);
+        assert!(!temp.root().join("data/object.enc").exists());
+        let guard = repo.0.lock().unwrap();
+        assert_eq!(guard.retired_key, Some(old_key));
+        assert_eq!(guard.active_key, Some(response.new_data_key_id));
+    }
+
+    #[test]
     fn runtime_bad_signature_rejects_before_core_writes_or_repo_updates() {
         let temp = TempDisk::new();
         let disk_id = Uuid::new_v4();

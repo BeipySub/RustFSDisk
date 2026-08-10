@@ -15,8 +15,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::center_security::{
-    sign_disk_info_with_key, verify_disk_info_with_key, ENCRYPTION_ALG_AES_256_GCM,
-    SIGNATURE_ALG_HMAC_SHA256,
+    verify_disk_info_with_key, ENCRYPTION_ALG_AES_256_GCM, SIGNATURE_ALG_HMAC_SHA256,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -365,12 +364,7 @@ where
                     data_key: checked.data_key_binding(),
                 })?;
                 self.progress.finish();
-                mark_disk_imported(
-                    protocol_root,
-                    disk_info,
-                    import_job_id,
-                    &self.center_signature_key,
-                )?;
+                mark_disk_imported(protocol_root, disk_info, import_job_id)?;
                 Ok(ImportOutcome::Imported { import_job_id })
             }
             Err(err) => {
@@ -1068,7 +1062,6 @@ fn mark_disk_imported(
     protocol_root: &Path,
     mut disk_info: DiskInfo,
     import_job_id: Uuid,
-    center_signature_key: &[u8],
 ) -> ImportResult<()> {
     let now = Utc::now().to_rfc3339();
     disk_info.status.code = "IMPORTED".to_string();
@@ -1078,14 +1071,6 @@ fn mark_disk_imported(
     disk_info.center.import_job_id = import_job_id.to_string();
     disk_info.center.import_finished_at = now.clone();
     disk_info.updated_at = Some(now);
-    disk_info.security.center_signature = String::new();
-    disk_info.security.center_signature = sign_disk_info_with_key(&disk_info, center_signature_key)
-        .map_err(|err| {
-            ImportError::new(
-                ImportErrorCode::SignatureInvalid,
-                format!("failed to sign imported disk_info: {err}"),
-            )
-        })?;
     let path = protocol_root.join("disk_info.json");
     let tmp = protocol_root.join("disk_info.json.tmp");
     let bytes = serde_json::to_vec_pretty(&disk_info).map_err(|err| {

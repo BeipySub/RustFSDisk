@@ -603,7 +603,7 @@
 ### 协议与数据结构约束
 
 - `data_key.encrypted_key` 使用受控环境变量注入的本机主密钥执行 AES-256-GCM 包裹，`key_wrap_alg = LOCAL-MASTER-KEY`。
-- `disk_info.json.security.center_signature` 使用 HMAC-SHA256 和 canonical JSON 覆盖 `protocol`、`disk`、`center`、`security.center_key_id`、`security.signature_alg`、`security.data_key_id`。
+- `disk_info.json.security.center_signature` 使用 HMAC-SHA256 和 canonical JSON 覆盖 `protocol`、`disk`、`security.center_key_id`、`security.signature_alg`、`security.data_key_id`；按用户已更新冻结协议，`center` 不属于签名覆盖字段。
 - 运输盘和 manifest 只保存 `data_key_id`、nonce、tag、校验值等非明文元数据。
 
 ### 安全与状态机边界
@@ -1289,12 +1289,15 @@
 - 不修改 `docs/v1.0冻结/`，不新增迁移，不修改协议语义。
 - `validate_reinitialize_preflight` 返回同一份 `DiskInfoDocument`，runtime 和 `PostImportReinitializer` 都使用该 raw-context document。
 - 外层与核心层共用 `validate_center_signature_for_reinitialize`；不得用裸布尔值跳过核心层验签。
-- 当前 canonical 和旧 `IMPORTED`/缺 top-level `updated_at` raw canonical 均必须通过真实 Center HMAC 验签；错误签名、错 key、非 `IMPORTED`、带 `updated_at` 的历史签名仍在写入前拒绝。
+- 用户已更新冻结协议，`center_signature` 覆盖字段不再包含 `center`；当前 canonical 严格覆盖 `protocol`、`disk`、`security.center_key_id`、`security.signature_alg`、`security.data_key_id`。
+- 旧 `IMPORTED`/缺 top-level `updated_at` raw canonical 仍必须通过真实 Center HMAC 验签；错误签名、错 key、非 `IMPORTED`、带 `updated_at` 的历史签名仍在写入前拒绝。
 - 核心 reinitializer 仍保留 identity、`IMPORTED`、seal、DONE import、old data key、`.partial=0`、key staging/activation/retire 等防线。
 
 ### 验收与检查清单
 
 - [x] `legacy_missing_updated_at_signature_reinitializes_through_runtime_and_core` 覆盖旧 `IMPORTED` 盘从 runtime 到核心层成功清理并写回 `INITIALIZED`。
+- [x] `imported_status_change_without_resigning_passes_outer_and_inner_verifiers` 覆盖导入仅改 `IMPORTED`/edge/manifest/updated_at 且不重签时，外层 preflight 与核心层使用同一真实 HMAC canonical 放行。
+- [x] `imported_disk_info_keeps_signature_valid_after_center_import_mark_without_compat_path` 覆盖 `center` 导入元数据不在签名范围内，且 `data_key_id` 等签名字段篡改仍拒绝。
 - [x] `runtime_bad_signature_rejects_before_core_writes_or_repo_updates` 覆盖错误签名在写盘和 repo 更新前拒绝，保留原盘内文件和 payload。
 - [x] 既有 current 签名、历史签名范围、错签名/错 key、manifest、partial、非 ext4、非 `IMPORTED` 测试继续通过。
 - [x] `cargo fmt --all -- --check` 通过。

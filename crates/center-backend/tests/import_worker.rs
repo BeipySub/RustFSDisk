@@ -6,7 +6,8 @@ use aes_gcm::{
 };
 use base64::{engine::general_purpose, Engine as _};
 use rustfs_transfer_center::center_security::{
-    sign_disk_info_with_key, ENCRYPTION_ALG_AES_256_GCM, SIGNATURE_ALG_HMAC_SHA256,
+    sign_disk_info_with_key, verify_disk_info_with_key, ENCRYPTION_ALG_AES_256_GCM,
+    SIGNATURE_ALG_HMAC_SHA256,
 };
 use rustfs_transfer_center::import_worker::{
     ImportErrorCode, ImportOutcome, ImportWorker, MemoryArchiveStorage, MemoryRepository,
@@ -19,6 +20,12 @@ use uuid::Uuid;
 #[test]
 fn imports_fixture_sealed_disk() {
     let fixture = SealedDiskFixture::new_plain("alpha.txt", b"hello archive".to_vec());
+    let before_disk_info: Value =
+        serde_json::from_slice(&fs::read(fixture.root.join("disk_info.json")).unwrap()).unwrap();
+    let sealed_signature = before_disk_info["security"]["center_signature"]
+        .as_str()
+        .expect("sealed disk_info signature")
+        .to_string();
     let mut repo = fixture.repository();
     let mut storage = MemoryArchiveStorage::default();
     let mut progress = ProgressAggregator::default();
@@ -52,6 +59,8 @@ fn imports_fixture_sealed_disk() {
     let disk_info: Value =
         serde_json::from_slice(&fs::read(fixture.root.join("disk_info.json")).unwrap()).unwrap();
     assert_eq!(disk_info["status"]["code"], "IMPORTED");
+    assert_eq!(disk_info["security"]["center_signature"], sealed_signature);
+    assert!(verify_disk_info_with_key(&disk_info, &fixture.signature_key).is_ok());
     assert!(chrono::DateTime::parse_from_rfc3339(
         disk_info["updated_at"]
             .as_str()

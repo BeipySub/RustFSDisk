@@ -186,7 +186,6 @@ pub fn disk_info_canonical_json<T: Serialize>(disk_info: &T) -> Result<String> {
         .get("security")
         .ok_or_else(|| anyhow!("disk_info.security is missing"))?;
     let covered = json!({
-        "center": value.get("center").cloned().unwrap_or(Value::Null),
         "disk": value.get("disk").cloned().unwrap_or(Value::Null),
         "protocol": value.get("protocol").cloned().unwrap_or(Value::Null),
         "security": {
@@ -330,6 +329,43 @@ mod tests {
         });
         let signature = security.sign_disk_info(&disk_info).unwrap();
         disk_info["security"]["center_signature"] = json!(signature);
+        security.verify_disk_info(&disk_info).unwrap();
+
+        disk_info["security"]["data_key_id"] = json!(Uuid::new_v4());
+        assert!(security.verify_disk_info(&disk_info).is_err());
+    }
+
+    #[test]
+    fn imported_disk_info_keeps_signature_valid_after_center_import_mark_without_compat_path() {
+        let security = CenterSecurity::test();
+        let mut disk_info = json!({
+            "protocol": {"name": "rustfs-offline-transfer", "version": "1.0.0"},
+            "disk": {"disk_id": Uuid::new_v4(), "sn": "SN001", "capacity_bytes": 1024},
+            "center": {
+                "center_id": Uuid::new_v4(),
+                "import_job_id": "",
+                "import_started_at": "",
+                "import_finished_at": ""
+            },
+            "security": {
+                "center_key_id": security.center_key_id(),
+                "signature_alg": SIGNATURE_ALG_HMAC_SHA256,
+                "encryption_alg": ENCRYPTION_ALG_AES_256_GCM,
+                "data_key_id": Uuid::new_v4(),
+                "center_signature": ""
+            },
+            "status": {"code": "SEALED"}
+        });
+        let signature = security.sign_disk_info(&disk_info).unwrap();
+        disk_info["security"]["center_signature"] = json!(signature);
+
+        disk_info["status"]["code"] = json!("IMPORTED");
+        disk_info["center"]["import_job_id"] = json!(Uuid::new_v4().to_string());
+        disk_info["center"]["import_started_at"] = json!("2026-08-10T00:00:00Z");
+        disk_info["center"]["import_finished_at"] = json!("2026-08-10T00:00:00Z");
+        security.verify_disk_info(&disk_info).unwrap();
+
+        disk_info["center"]["center_id"] = json!(Uuid::new_v4());
         security.verify_disk_info(&disk_info).unwrap();
 
         disk_info["security"]["data_key_id"] = json!(Uuid::new_v4());
