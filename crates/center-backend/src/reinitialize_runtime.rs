@@ -469,21 +469,38 @@ impl PostImportRepository for PgPostImportRepository {
                 ));
             }
 
-            sqlx::query(
-                r#"
-                UPDATE disk_list
-                SET last_init_time = (NOW() AT TIME ZONE 'UTC')
-                WHERE disk_id = $1
-                "#,
-            )
-            .bind(disk_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|err| ReinitializeError::Repository(err.to_string()))?;
-
             tx.commit()
                 .await
                 .map_err(|err| ReinitializeError::Repository(err.to_string()))?;
+            Ok(())
+        })
+    }
+
+    fn rollback_new_key_activation(
+        &mut self,
+        disk_id: Uuid,
+        new_data_key_id: Uuid,
+    ) -> Result<(), ReinitializeError> {
+        self.handle.block_on(async {
+            sqlx::query(
+                r#"
+                UPDATE data_key
+                SET status = 'REVOKED',
+                    activate_time = NULL,
+                    remark = 'post-import reinitialize disk_info write failed after activation'
+                WHERE data_key_id = $1
+                  AND disk_id = $2
+                  AND status = 'ACTIVE'
+                  AND edge_code IS NULL
+                  AND export_job_id IS NULL
+                  AND seal_id IS NULL
+                "#,
+            )
+            .bind(new_data_key_id)
+            .bind(disk_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|err| ReinitializeError::Repository(err.to_string()))?;
             Ok(())
         })
     }
@@ -494,6 +511,18 @@ impl PostImportRepository for PgPostImportRepository {
         old_data_key_id: Uuid,
     ) -> Result<(), ReinitializeError> {
         self.handle.block_on(async {
+            sqlx::query(
+                r#"
+                UPDATE disk_list
+                SET last_init_time = (NOW() AT TIME ZONE 'UTC')
+                WHERE disk_id = $1
+                "#,
+            )
+            .bind(disk_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|err| ReinitializeError::Repository(err.to_string()))?;
+
             let retired = sqlx::query(
                 r#"
                 UPDATE data_key
@@ -600,6 +629,18 @@ mod tests {
         ) -> Result<(), ReinitializeError> {
             let mut guard = self.0.lock().unwrap();
             guard.active_key = Some(new_data_key_id);
+            Ok(())
+        }
+
+        fn rollback_new_key_activation(
+            &mut self,
+            _disk_id: Uuid,
+            new_data_key_id: Uuid,
+        ) -> Result<(), ReinitializeError> {
+            let mut guard = self.0.lock().unwrap();
+            if guard.active_key == Some(new_data_key_id) {
+                guard.active_key = None;
+            }
             Ok(())
         }
 

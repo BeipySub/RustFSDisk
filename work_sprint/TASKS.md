@@ -116,6 +116,7 @@
 | TASK-S1-P1-CENTER-REINIT-SIGNATURE-004 | Center reinitialize 兼容旧 IMPORTED 签名 canonical | P1 主闭环 | Center | [x] | Day 2 VM 热修补 | TASK-S1-P1-CENTER-REINIT-UPDATED-AT-003 |
 | TASK-S1-P1-CENTER-REINIT-SIGNATURE-005 | Center reinitialize 统一内外层 center_signature 验签 | P1 主闭环 | Center | [x] | Day 2 VM 热修补 | TASK-S1-P1-CENTER-REINIT-SIGNATURE-004 |
 | TASK-S1-P1-CENTER-REINIT-ADMISSION-006 | Center reinitialize 最小生命周期准入 | P1 主闭环 | Center | [x] | Day 2 VM 热修补 | TASK-S1-P1-CENTER-REINIT-SIGNATURE-005 |
+| TASK-S1-CENTER-HOTFIX-004 | Center reinitialize disk_info 失败原子性修补 | P0 解阻塞 | Center / Security | [x] | Day 2 VM 故障修补 | TASK-S1-P1-CENTER-REINIT-ADMISSION-006 |
 | TASK-S1-WEB-EDGE-001 | 边缘端 DashboardView、HTTP 汇总和 WS 进度展示 | P2 交付增强 | Web / Edge | [x] | Day 1-2 | TASK-S1-TEST-001 |
 | TASK-S1-WEB-CENTER-001 | 中控端 DashboardView、HTTP 汇总和 WS 进度展示 | P2 交付增强 | Web / Center | [x] | Day 1-2 | TASK-S1-TEST-001 |
 | TASK-S1-DASHBOARD-REALTIME-001 | 双端真实 Dashboard HTTP summary 与本端 WebSocket 推送 | P0 解阻塞 | Center / Edge / Web | [x] | Day 2 联调修补 | TASK-S1-WEB-EDGE-001, TASK-S1-WEB-CENTER-001 |
@@ -1342,6 +1343,56 @@
 - [x] `cargo test --workspace` 通过。
 - [x] `powershell -ExecutionPolicy Bypass -File scripts\check-deploy.ps1` 通过。
 - [x] 该最小准入补丁尚未部署真实 VM 验收，不得宣称 `FUSTFS-TST-A` 已完成 cleanup/reinitialize。
+
+---
+
+# 开发任务卡片：TASK-S1-CENTER-HOTFIX-004
+
+### 任务基本信息
+
+- **任务 ID**：TASK-S1-CENTER-HOTFIX-004
+- **任务名称**：Center reinitialize disk_info 失败原子性修补
+- **所属 Track / 模块**：
+  - [ ] Track 1: Common
+  - [ ] Track 2: Edge
+  - [x] Track 3: Center (`crates/center-backend`)
+  - [x] Track 4: Security / Tests
+- **任务状态**：[x] 开发完成
+- **负责人 / Role**：Codex 串行合入/提交窗口
+- **计划时间**：Day 2 VM 故障修补
+- **依赖任务**：TASK-S1-P1-CENTER-REINIT-ADMISSION-006
+
+### 任务目标与范围
+
+- **核心目标**：修补真实 VM 失败暴露的 reinitialize 原子性缺陷，确保前置兼容解析、验签、清理失败、目录重建失败、新 key 激活失败和最终写盘失败不会把旧 `disk_info.json` 重写成变异格式。
+- **对应代码位置**：`crates/center-backend/src/reinitializer.rs`、`crates/center-backend/src/reinitialize_runtime.rs`
+
+### 协议与数据结构约束
+
+- 前置解析、legacy `updated_at` 补值与验签必须完全在内存中完成。
+- 失败路径不得为了“恢复”而写回旧 `disk_info.json`；盘内生命周期仍保持旧 `IMPORTED` 字节。
+- 对旧 bug 已写入的精确 `1970-01-01T00:00:00Z` sentinel，仅在 `IMPORTED` 且移除该字段后真实 HMAC 验签通过时兼容。
+
+### 安全与状态机边界
+
+- 清理失败或 key 激活失败不得改变盘内 `disk_info.json` 字节，也不得激活/退役 DB key。
+- 成功路径最后写入新的 `INITIALIZED`、标准 `updated_at` 和当前 `center_signature`。
+- 最终 `disk_info.json` 原子写失败时，尽力把刚激活的新 key 回滚为不可发放状态；旧 key 退役仍只在写盘成功后执行。
+- 错误签名、错误 key、非 `IMPORTED`、身份不匹配、非 ext4、`.partial` 残留仍在写入前拒绝。
+
+### 验收与检查清单
+
+- [x] 清理失败时 `disk_info.json` 原始字节不变、签名仍有效、无 staged/active/retired key 变化。
+- [x] key 激活失败时不写盘、不退役旧 key。
+- [x] 精确 sentinel 过渡盘通过真实 HMAC 兼容，但失败路径不写盘。
+- [x] sentinel 过渡盘任意签名覆盖字段篡改仍拒绝。
+- [x] 成功路径写入非 sentinel `updated_at` 和当前有效签名。
+- [x] `cargo fmt --all -- --check` 通过。
+- [x] `cargo test -p rustfs-transfer-common` 通过。
+- [x] `cargo test -p rustfs-transfer-center` 通过。
+- [x] `cargo test --workspace` 通过。
+- [x] `powershell -ExecutionPolicy Bypass -File scripts\check-deploy.ps1` 通过。
+- [x] 该 failure-atomicity 补丁尚未部署真实 VM 复验，不得宣称 `FUSTFS-TST-A` 已完成 cleanup/reinitialize。
 
 ---
 

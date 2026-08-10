@@ -14,6 +14,7 @@ use crate::center_security::{
 pub const PROTOCOL_ROOT: &str = "rustfs-transfer";
 pub const DISK_INFO_FILE: &str = "disk_info.json";
 pub const REINIT_FAILED: &str = "REINIT_FAILED";
+pub const LEGACY_UPDATED_AT_SENTINEL: &str = "1970-01-01T00:00:00Z";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeStatus {
@@ -91,6 +92,12 @@ pub trait PostImportRepository {
         new_data_key_id: Uuid,
     ) -> Result<(), ReinitializeError>;
 
+    fn rollback_new_key_activation(
+        &mut self,
+        disk_id: Uuid,
+        new_data_key_id: Uuid,
+    ) -> Result<(), ReinitializeError>;
+
     fn retire_old_key(
         &mut self,
         disk_id: Uuid,
@@ -159,7 +166,6 @@ where
 
         let result = self.reinitialize_after_admission(mount_path, admission, &previous_disk_info);
         if let Err(error) = &result {
-            let _ = write_disk_info(mount_path, &previous_disk_info);
             let _ = self.repo.set_runtime(
                 disk_id,
                 RuntimeStatus::Error,
@@ -189,17 +195,18 @@ where
         self.repo.stage_new_data_key(admission.disk_id, &new_key)?;
 
         let initialized_disk_info = self.initialized_disk_info(previous_disk_info, &new_key);
-        if let Err(error) = write_disk_info(mount_path, &initialized_disk_info) {
-            let _ = self.repo.abort_staged_data_key(new_key.data_key_id);
-            return Err(error);
-        }
-
         if let Err(error) = self
             .repo
             .activate_new_key(admission.disk_id, new_key.data_key_id)
         {
             let _ = self.repo.abort_staged_data_key(new_key.data_key_id);
-            let _ = write_disk_info(mount_path, previous_disk_info);
+            return Err(error);
+        }
+        if let Err(error) = write_disk_info(mount_path, &initialized_disk_info) {
+            let _ = self
+                .repo
+                .rollback_new_key_activation(admission.disk_id, new_key.data_key_id);
+            let _ = self.repo.abort_staged_data_key(new_key.data_key_id);
             return Err(error);
         }
         if let Err(error) = self
@@ -247,12 +254,12 @@ where
         next.security.data_key_id = new_key.data_key_id;
         next.security.encryption_alg = new_key.encryption_alg.clone();
         next.security.signature_alg = self.template.signature_alg.clone();
+        next.updated_at = Utc::now();
         next.security.center_signature = String::new();
         next.security.center_signature = self
             .security
             .sign_disk_info(&next)
             .expect("disk_info signing uses validated center security key");
-        next.updated_at = Utc::now();
         next
     }
 }
@@ -448,11 +455,19 @@ pub(crate) fn validate_center_signature_for_reinitialize(
         return Ok(());
     }
     if !document.has_top_level_updated_at && is_legacy_imported_disk_info(&document.raw_value) {
-        return security.verify_disk_info(&document.raw_value).map_err(|_| {
-            ReinitializeError::SignatureInvalid(
-                "disk_info center_signature verification failed".to_string(),
-            )
-        });
+        return verify_raw_disk_info_for_reinitialize(&document.raw_value, security);
+    }
+    if has_legacy_updated_at_sentinel(&document.raw_value)
+        && is_imported_disk_info_raw(&document.raw_value)
+    {
+        let mut historical_value = document.raw_value.clone();
+        historical_value
+            .as_object_mut()
+            .ok_or_else(|| {
+                ReinitializeError::SignatureInvalid("disk_info root must be an object".to_string())
+            })?
+            .remove("updated_at");
+        return verify_raw_disk_info_for_reinitialize(&historical_value, security);
     }
     Err(ReinitializeError::SignatureInvalid(
         "disk_info center_signature verification failed".to_string(),
@@ -460,11 +475,32 @@ pub(crate) fn validate_center_signature_for_reinitialize(
 }
 
 fn is_legacy_imported_disk_info(raw_disk_info: &Value) -> bool {
-    raw_disk_info.get("updated_at").is_none()
-        && raw_disk_info
-            .pointer("/status/code")
-            .and_then(Value::as_str)
-            == Some("IMPORTED")
+    raw_disk_info.get("updated_at").is_none() && is_imported_disk_info_raw(raw_disk_info)
+}
+
+fn is_imported_disk_info_raw(raw_disk_info: &Value) -> bool {
+    raw_disk_info
+        .pointer("/status/code")
+        .and_then(Value::as_str)
+        == Some("IMPORTED")
+}
+
+fn has_legacy_updated_at_sentinel(raw_disk_info: &Value) -> bool {
+    raw_disk_info
+        .get("updated_at")
+        .and_then(Value::as_str)
+        .is_some_and(|updated_at| updated_at == LEGACY_UPDATED_AT_SENTINEL)
+}
+
+fn verify_raw_disk_info_for_reinitialize(
+    raw_disk_info: &Value,
+    security: &CenterSecurity,
+) -> Result<(), ReinitializeError> {
+    security.verify_disk_info(raw_disk_info).map_err(|_| {
+        ReinitializeError::SignatureInvalid(
+            "disk_info center_signature verification failed".to_string(),
+        )
+    })
 }
 
 pub fn write_disk_info(mount_path: &Path, disk_info: &DiskInfo) -> Result<(), ReinitializeError> {
@@ -646,6 +682,7 @@ impl DiskStatusCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::cell::RefCell;
 
     #[derive(Default)]
@@ -718,6 +755,18 @@ mod tests {
             Ok(())
         }
 
+        fn rollback_new_key_activation(
+            &mut self,
+            _disk_id: Uuid,
+            new_data_key_id: Uuid,
+        ) -> Result<(), ReinitializeError> {
+            let mut repo = self.borrow_mut();
+            if repo.active_key == Some(new_data_key_id) {
+                repo.active_key = None;
+            }
+            Ok(())
+        }
+
         fn retire_old_key(
             &mut self,
             _disk_id: Uuid,
@@ -763,7 +812,11 @@ mod tests {
         assert!(disk_info.status.reusable);
         assert_eq!(disk_info.edge, None);
         assert_eq!(disk_info.manifest, None);
-        assert!(disk_info.updated_at > legacy_missing_updated_at());
+        assert_ne!(
+            disk_info.updated_at.to_rfc3339(),
+            LEGACY_UPDATED_AT_SENTINEL
+        );
+        security().verify_disk_info(&disk_info).unwrap();
         assert_ne!(disk_info.security.data_key_id, old_key);
         assert_eq!(output.old_data_key_id, old_key);
         assert!(!temp.root().join("data/object.bin").exists());
@@ -789,7 +842,8 @@ mod tests {
         let seal_id = Uuid::new_v4();
         let old_key = Uuid::new_v4();
         let original = imported_disk_info(disk_id, seal_id, old_key, &security());
-        write_disk_info(&temp.path, &original).unwrap();
+        write_minified_disk_info(&temp.path, &original).unwrap();
+        let before = fs::read(temp.disk_info_path()).unwrap();
         fs::write(temp.root().join("data"), b"not a directory").unwrap();
 
         let repo = RefCell::new(MemoryRepo {
@@ -803,9 +857,11 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("remove"));
+        assert_eq!(fs::read(temp.disk_info_path()).unwrap(), before);
         let disk_info = read_disk_info(&temp.path).unwrap();
         assert_eq!(disk_info.status.code, DiskStatusCode::Imported);
         assert_eq!(disk_info.security.data_key_id, old_key);
+        security().verify_disk_info(&disk_info).unwrap();
 
         let repo = service.repo.borrow();
         assert_eq!(repo.staged_key, None);
@@ -821,16 +877,14 @@ mod tests {
     }
 
     #[test]
-    fn activation_failure_aborts_new_key_and_restores_imported_disk_info() {
+    fn activation_failure_aborts_new_key_and_leaves_disk_info_bytes_unchanged() {
         let temp = TempDisk::new();
         let disk_id = Uuid::new_v4();
         let seal_id = Uuid::new_v4();
         let old_key = Uuid::new_v4();
-        write_disk_info(
-            &temp.path,
-            &imported_disk_info(disk_id, seal_id, old_key, &security()),
-        )
-        .unwrap();
+        let original = imported_disk_info(disk_id, seal_id, old_key, &security());
+        write_minified_disk_info(&temp.path, &original).unwrap();
+        let before = fs::read(temp.disk_info_path()).unwrap();
 
         let repo = RefCell::new(MemoryRepo {
             registered_disk: Some(registered_disk(disk_id)),
@@ -844,6 +898,7 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("activate failed"));
+        assert_eq!(fs::read(temp.disk_info_path()).unwrap(), before);
         let disk_info = read_disk_info(&temp.path).unwrap();
         assert_eq!(disk_info.status.code, DiskStatusCode::Imported);
         assert_eq!(disk_info.security.data_key_id, old_key);
@@ -855,6 +910,73 @@ mod tests {
         assert!(repo
             .runtime
             .contains(&(RuntimeStatus::Error, Some(REINIT_FAILED.to_string()))));
+    }
+
+    #[test]
+    fn legacy_updated_at_sentinel_imported_disk_is_verified_without_rewriting_disk() {
+        let temp = TempDisk::new();
+        let disk_id = Uuid::new_v4();
+        let seal_id = Uuid::new_v4();
+        let old_key = Uuid::new_v4();
+        let mut sentinel_value = imported_disk_info_without_updated_at(disk_id, seal_id, old_key);
+        sentinel_value["updated_at"] = json!(LEGACY_UPDATED_AT_SENTINEL);
+        write_raw_disk_info(&temp.path, &sentinel_value).unwrap();
+        let before = fs::read(temp.disk_info_path()).unwrap();
+        fs::write(temp.root().join("data"), b"not a directory").unwrap();
+
+        let repo = RefCell::new(MemoryRepo {
+            registered_disk: Some(registered_disk(disk_id)),
+            ..Default::default()
+        });
+        let mut service = PostImportReinitializer::new(repo, template(), security());
+
+        let error = service
+            .reinitialize_imported_disk(&temp.path, disk_id, seal_id)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("remove"));
+        assert_eq!(fs::read(temp.disk_info_path()).unwrap(), before);
+        let repo = service.repo.borrow();
+        assert_eq!(repo.staged_key, None);
+        assert_eq!(repo.active_key, None);
+        assert_eq!(repo.retired_key, None);
+        assert_eq!(
+            repo.runtime,
+            vec![
+                (RuntimeStatus::Cleaning, None),
+                (RuntimeStatus::Error, Some(REINIT_FAILED.to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn legacy_updated_at_sentinel_still_rejects_tampered_signed_fields() {
+        let temp = TempDisk::new();
+        let disk_id = Uuid::new_v4();
+        let seal_id = Uuid::new_v4();
+        let old_key = Uuid::new_v4();
+        let mut sentinel_value = imported_disk_info_without_updated_at(disk_id, seal_id, old_key);
+        sentinel_value["updated_at"] = json!(LEGACY_UPDATED_AT_SENTINEL);
+        sentinel_value["security"]["data_key_id"] = json!(Uuid::new_v4());
+        write_raw_disk_info(&temp.path, &sentinel_value).unwrap();
+        fs::create_dir_all(temp.root().join("data")).unwrap();
+
+        let repo = RefCell::new(MemoryRepo {
+            registered_disk: Some(registered_disk(disk_id)),
+            ..Default::default()
+        });
+        let mut service = PostImportReinitializer::new(repo, template(), security());
+
+        let error = service
+            .reinitialize_imported_disk(&temp.path, disk_id, seal_id)
+            .unwrap_err();
+
+        assert!(matches!(error, ReinitializeError::SignatureInvalid(_)));
+        let repo = service.repo.borrow();
+        assert!(repo.runtime.is_empty());
+        assert_eq!(repo.staged_key, None);
+        assert_eq!(repo.active_key, None);
+        assert_eq!(repo.retired_key, None);
     }
 
     #[test]
@@ -1202,6 +1324,47 @@ mod tests {
         disk_info
     }
 
+    fn imported_disk_info_without_updated_at(
+        disk_id: Uuid,
+        seal_id: Uuid,
+        data_key_id: Uuid,
+    ) -> serde_json::Value {
+        let disk_info = imported_disk_info(disk_id, seal_id, data_key_id, &security());
+        let mut value = serde_json::to_value(&disk_info).unwrap();
+        value
+            .as_object_mut()
+            .expect("disk_info is object")
+            .remove("updated_at");
+        value["security"]["center_signature"] = json!("");
+        let signature = security().sign_disk_info(&value).unwrap();
+        value["security"]["center_signature"] = json!(signature);
+        value
+    }
+
+    fn write_minified_disk_info(
+        mount_path: &Path,
+        disk_info: &DiskInfo,
+    ) -> Result<(), ReinitializeError> {
+        write_raw_disk_info(mount_path, &serde_json::to_value(disk_info)?)
+    }
+
+    fn write_raw_disk_info(
+        mount_path: &Path,
+        value: &serde_json::Value,
+    ) -> Result<(), ReinitializeError> {
+        let root = protocol_root(mount_path);
+        fs::create_dir_all(&root).map_err(|source| ReinitializeError::Fs {
+            action: format!("create {}", root.display()),
+            source,
+        })?;
+        let path = root.join(DISK_INFO_FILE);
+        let bytes = serde_json::to_vec(value).map_err(ReinitializeError::Json)?;
+        fs::write(&path, bytes).map_err(|source| ReinitializeError::Fs {
+            action: format!("write {}", path.display()),
+            source,
+        })
+    }
+
     fn security() -> CenterSecurity {
         CenterSecurity::test()
     }
@@ -1219,6 +1382,10 @@ mod tests {
 
         fn root(&self) -> PathBuf {
             self.path.join(PROTOCOL_ROOT)
+        }
+
+        fn disk_info_path(&self) -> PathBuf {
+            self.root().join(DISK_INFO_FILE)
         }
     }
 
