@@ -253,6 +253,12 @@ fn worker_encrypts_writes_manifest_and_seals_disk() {
     assert_eq!(disk_info["manifest"]["manifest_sha256"], manifest_sha);
 
     let object = &manifest.objects[0];
+    assert_eq!(
+        object.aad,
+        format!(
+            "disk_id={disk_id};seal_id={seal_id};export_job_id={export_job_id};bucket=bucket-a;key=folder/object.txt;chunk_group_id=;chunk_index=0;chunk_total=1;chunk_offset_bytes=0"
+        )
+    );
     let mut ciphertext = fs::read(protocol_root.join(&object.relative_data_path)).unwrap();
     let nonce = BASE64.decode(&object.nonce).unwrap();
     let tag = BASE64.decode(&object.tag).unwrap();

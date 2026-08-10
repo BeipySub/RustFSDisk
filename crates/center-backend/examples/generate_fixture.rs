@@ -87,11 +87,14 @@ fn write_sealed_disk(mount_path: &PathBuf) -> anyhow::Result<()> {
     let nonce = [3_u8; 12];
     let aad = object_aad(ObjectAad {
         disk_id: &disk_id.to_string(),
+        seal_id: &seal_id.to_string(),
         export_job_id: &export_job_id.to_string(),
         bucket,
         object_key: key,
+        chunk_group_id: None,
         chunk_index: 0,
         chunk_total: 1,
+        chunk_offset_bytes: 0,
     });
     let encrypted = encrypt_aes256_gcm(&disk_data_key, &nonce, plaintext, &aad)?;
     let relative_data_path = "data/source/alpha.txt.enc";

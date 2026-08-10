@@ -130,11 +130,14 @@ pub struct AesGcmCiphertext {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectAad<'a> {
     pub disk_id: &'a str,
+    pub seal_id: &'a str,
     pub export_job_id: &'a str,
     pub bucket: &'a str,
     pub object_key: &'a str,
+    pub chunk_group_id: Option<&'a str>,
     pub chunk_index: u32,
     pub chunk_total: u32,
+    pub chunk_offset_bytes: u64,
 }
 
 pub fn sha256_lower_hex(bytes: &[u8]) -> String {
@@ -229,13 +232,16 @@ pub fn verify_hmac_base64(
 
 pub fn object_aad(aad: ObjectAad<'_>) -> Vec<u8> {
     format!(
-        "{}/{}/{}/{}/{}/{}",
+        "disk_id={};seal_id={};export_job_id={};bucket={};key={};chunk_group_id={};chunk_index={};chunk_total={};chunk_offset_bytes={}",
         aad.disk_id,
+        aad.seal_id,
         aad.export_job_id,
         aad.bucket,
         aad.object_key,
+        aad.chunk_group_id.unwrap_or_default(),
         aad.chunk_index,
-        aad.chunk_total
+        aad.chunk_total,
+        aad.chunk_offset_bytes
     )
     .into_bytes()
 }

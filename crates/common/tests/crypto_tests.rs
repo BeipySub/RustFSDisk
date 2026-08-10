@@ -80,11 +80,14 @@ fn aes_gcm_round_trips_with_protocol_aad() {
     let nonce = [3_u8; AES_GCM_NONCE_LEN];
     let aad = object_aad(ObjectAad {
         disk_id: "disk-1",
+        seal_id: "seal-1",
         export_job_id: "export-1",
         bucket: "source-bucket",
         object_key: "path/to/object.bin",
+        chunk_group_id: None,
         chunk_index: 0,
         chunk_total: 1,
+        chunk_offset_bytes: 0,
     });
 
     let encrypted = encrypt_aes256_gcm(&key, &nonce, b"plaintext object bytes", &aad).unwrap();

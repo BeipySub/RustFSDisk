@@ -13,6 +13,7 @@ use rustfs_transfer_center::import_worker::{
     ImportErrorCode, ImportOutcome, ImportWorker, MemoryArchiveStorage, MemoryRepository,
     ProgressAggregator, DATA_KEY_STATUS_ISSUED, DATA_KEY_STATUS_SEALED_READONLY,
 };
+use rustfs_transfer_common::crypto::{object_aad, ObjectAad};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -214,6 +215,29 @@ fn invalid_manifest_path_returns_standard_error_code() {
 }
 
 #[test]
+fn aad_mismatch_returns_standard_error_code_before_decrypt() {
+    let fixture = SealedDiskFixture::new_plain("alpha.txt", b"hello archive".to_vec());
+    fixture.rewrite_manifest(|manifest| {
+        manifest["objects"][0]["aad"] = json!("disk_id=other");
+    });
+    let mut repo = fixture.repository();
+    let mut storage = MemoryArchiveStorage::default();
+    let mut progress = ProgressAggregator::default();
+
+    let err = ImportWorker::new(
+        &mut repo,
+        &mut storage,
+        &mut progress,
+        fixture.signature_key.clone(),
+    )
+    .import_sealed_disk(&fixture.root)
+    .expect_err("aad mismatch is rejected");
+
+    assert_eq!(err.code, ImportErrorCode::ManifestInvalid);
+    assert!(repo.ledger().is_empty());
+}
+
+#[test]
 fn ciphertext_checksum_mismatch_returns_standard_error_code() {
     let fixture = SealedDiskFixture::new_plain("alpha.txt", b"hello archive".to_vec());
     fs::write(
@@ -369,11 +393,26 @@ impl SealedDiskFixture {
         let chunk_group_id = Uuid::new_v4();
         let key_bytes = vec![7_u8; 32];
         let nonce_bytes = nonce_for(chunk_index);
-        let aad = format!(
-            "{disk_id}/{seal_id}/{export_job_id}/source/{key}/{chunk_group_id}/{chunk_index}/{chunk_total}/{}",
-            chunk_index as u64 * plaintext.len() as u64
-        );
-        let (ciphertext, tag) = encrypt(&key_bytes, &nonce_bytes, aad.as_bytes(), &plaintext);
+        let disk_id_text = disk_id.to_string();
+        let seal_id_text = seal_id.to_string();
+        let export_job_id_text = export_job_id.to_string();
+        let chunk_group_id_text = chunk_group_id.to_string();
+        let aad = object_aad(ObjectAad {
+            disk_id: &disk_id_text,
+            seal_id: &seal_id_text,
+            export_job_id: &export_job_id_text,
+            bucket: "source",
+            object_key: key,
+            chunk_group_id: if chunked {
+                Some(chunk_group_id_text.as_str())
+            } else {
+                None
+            },
+            chunk_index,
+            chunk_total,
+            chunk_offset_bytes: chunk_index as u64 * plaintext.len() as u64,
+        });
+        let (ciphertext, tag) = encrypt(&key_bytes, &nonce_bytes, &aad, &plaintext);
         let object_path = format!("data/{key}.enc");
         fs::write(root.join(&object_path), &ciphertext).unwrap();
         fs::write(root.join(format!("meta/{key}.json")), b"{}").unwrap();
@@ -398,7 +437,7 @@ impl SealedDiskFixture {
             "data_key_id": data_key_id,
             "nonce": general_purpose::STANDARD.encode(nonce_bytes),
             "tag": general_purpose::STANDARD.encode(tag),
-            "aad": aad,
+            "aad": String::from_utf8(aad).unwrap(),
             "ciphertext_size_bytes": ciphertext.len() as u64,
             "ciphertext_sha256": sha256_hex(&ciphertext),
             "chunked": chunked,

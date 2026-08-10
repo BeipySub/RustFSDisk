@@ -118,6 +118,7 @@
 | TASK-S1-P1-CENTER-REINIT-ADMISSION-006 | Center reinitialize 最小生命周期准入 | P1 主闭环 | Center | [x] | Day 2 VM 热修补 | TASK-S1-P1-CENTER-REINIT-SIGNATURE-005 |
 | TASK-S1-CENTER-HOTFIX-004 | Center reinitialize disk_info 失败原子性修补 | P0 解阻塞 | Center / Security | [x] | Day 2 VM 故障修补 | TASK-S1-P1-CENTER-REINIT-ADMISSION-006 |
 | TASK-S1-CENTER-HOTFIX-005 | Center 导入成功后 data_key 封盘生命周期绑定 | P0 解阻塞 | Center / DB | [x] | Day 2 真实导入修补 | TASK-S1-CENTER-004, TASK-S1-CENTER-005 |
+| TASK-S1-SECURITY-HOTFIX-006 | AES-GCM AAD 同源构造与全加密面审计 | P0 解阻塞 | Common / Edge / Center / Security | [x] | Day 3 审计修补 | TASK-S1-COMMON-002, TASK-S1-EDGE-005, TASK-S1-CENTER-004 |
 | TASK-S1-WEB-EDGE-001 | 边缘端 DashboardView、HTTP 汇总和 WS 进度展示 | P2 交付增强 | Web / Edge | [x] | Day 1-2 | TASK-S1-TEST-001 |
 | TASK-S1-WEB-CENTER-001 | 中控端 DashboardView、HTTP 汇总和 WS 进度展示 | P2 交付增强 | Web / Center | [x] | Day 1-2 | TASK-S1-TEST-001 |
 | TASK-S1-DASHBOARD-REALTIME-001 | 双端真实 Dashboard HTTP summary 与本端 WebSocket 推送 | P0 解阻塞 | Center / Edge / Web | [x] | Day 2 联调修补 | TASK-S1-WEB-EDGE-001, TASK-S1-WEB-CENTER-001 |
@@ -192,7 +193,7 @@
 
 - HMAC 签名串为 `METHOD + "\n" + canonical_path_with_query + "\n" + X-Timestamp + "\n" + X-Nonce + "\n" + X-Body-SHA256`。
 - query 参数按冻结契约排序和 percent-encoding。
-- AES-GCM AAD 由 `disk_id/export_job_id/bucket/object_key/chunk_index/chunk_total` 等协议字段组成。
+- AES-GCM AAD 由 `disk_id`、`seal_id`、`export_job_id`、`bucket`、`object_key`、`chunk_group_id`、`chunk_index`、`chunk_total`、`chunk_offset_bytes` 等协议字段组成。
 
 ### 安全与状态机边界
 
@@ -1446,6 +1447,49 @@
 - [x] `cargo fmt --all -- --check` 通过。
 - [x] `cargo test -p rustfs-transfer-center` 通过。
 - [x] 未修改 `docs/v1.0冻结/`，未部署、未调用真实 API、未操作硬盘或生产 SQL。
+
+---
+
+# 开发任务卡片：TASK-S1-SECURITY-HOTFIX-006
+
+### 任务基本信息
+
+- **任务 ID**：TASK-S1-SECURITY-HOTFIX-006
+- **任务名称**：AES-GCM AAD 同源构造与全加密面审计
+- **所属 Track / 模块**：
+  - [x] Track 1: Common (`crates/common`)
+  - [x] Track 2: Edge (`crates/edge-backend`)
+  - [x] Track 3: Center (`crates/center-backend`)
+  - [ ] Track 4: Web
+- **任务状态**：[x] 开发完成
+- **负责人 / Role**：Codex 串行合入/提交窗口
+- **计划时间**：Day 3 审计修补
+- **依赖任务**：TASK-S1-COMMON-002, TASK-S1-EDGE-005, TASK-S1-CENTER-004
+
+### 任务目标与范围
+
+- **核心目标**：按用户已更新冻结协议做全加密面审计，确认 `center` 对象不进入 `center_signature` 或其它签名/加密输入，并修补 AES-GCM AAD 公共接口、Edge 写盘构造和 Center 导入复算校验的一致性缺口。
+- **对应代码位置**：`crates/common/src/crypto/mod.rs`、`crates/edge-backend/src/disk_worker.rs`、`crates/center-backend/src/import_worker.rs`、相关测试和 fixture。
+
+### 协议与数据结构约束
+
+- `center_signature` canonical 严格覆盖 `protocol`、`disk`、`security.center_key_id`、`security.signature_alg`、`security.data_key_id`，不覆盖整个 `center` 对象。
+- AES-GCM AAD 必须绑定 `disk_id`、`seal_id`、`export_job_id`、`bucket`、`key`、`chunk_group_id`、`chunk_index`、`chunk_total`、`chunk_offset_bytes`。
+- Center `disk_data_key` 包裹/解包仍使用本机主密钥和 `disk_id + data_key_id` AAD；不得误删签名密钥配置或数据加密逻辑。
+
+### 安全与状态机边界
+
+- 本任务只调整签名/加密输入和导入前校验，不新增导出、导入、清理、重初始化、格式化、SQL 或真实 API 操作。
+- Edge 写盘与 Center 导入使用 Common 同源 AAD 构造；Center 在 AES-GCM 解密前复算 AAD，不匹配则拒绝 manifest。
+- 全仓审计确认 Web、deploy、scripts 不保存或暴露明文 `disk_data_key`、控制 token 或签名密钥；示例配置仅保留占位值。
+
+### 验收与检查清单
+
+- [x] Common `ObjectAad` 覆盖冻结协议完整 AAD 字段。
+- [x] Edge DiskWorker 使用 Common AAD 构造并由测试断言 manifest AAD。
+- [x] Center ImportWorker 复算 manifest 对象 AAD，篡改 AAD 在解密前拒绝。
+- [x] 全加密面审计未发现整个 `center` 对象进入 `center_signature` 或其它签名/加密输入。
+- [x] 冻结文档未修改、未暂存。
 
 ---
 

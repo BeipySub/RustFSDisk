@@ -17,6 +17,7 @@ use uuid::Uuid;
 use crate::center_security::{
     verify_disk_info_with_key, ENCRYPTION_ALG_AES_256_GCM, SIGNATURE_ALG_HMAC_SHA256,
 };
+use rustfs_transfer_common::crypto::{object_aad, ObjectAad};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportErrorCode {
@@ -880,7 +881,7 @@ fn validate_manifest(
             "manifest object data_key_id does not match disk_info security.data_key_id",
         ));
     }
-    validate_objects(&manifest.objects)?;
+    validate_objects(&manifest)?;
     let object_count = manifest.objects.len() as u64;
     let total_bytes = manifest
         .objects
@@ -907,10 +908,10 @@ fn validate_manifest(
     })
 }
 
-fn validate_objects(objects: &[ManifestObject]) -> ImportResult<()> {
+fn validate_objects(manifest: &ExportManifest) -> ImportResult<()> {
     let mut nonces = HashSet::new();
     let mut chunks: HashMap<Uuid, Vec<&ManifestObject>> = HashMap::new();
-    for object in objects {
+    for object in &manifest.objects {
         if object.object_status != "EXPORTED"
             || !object.encrypted
             || object.encryption_alg != "AES-256-GCM"
@@ -938,6 +939,7 @@ fn validate_objects(objects: &[ManifestObject]) -> ImportResult<()> {
                 "manifest contains duplicate data_key_id + nonce",
             ));
         }
+        validate_object_aad(manifest, object)?;
         if object.chunked {
             validate_chunk_object(object)?;
             chunks
@@ -957,6 +959,31 @@ fn validate_objects(objects: &[ManifestObject]) -> ImportResult<()> {
     }
     for group in chunks.values() {
         validate_manifest_chunk_group(group)?;
+    }
+    Ok(())
+}
+
+fn validate_object_aad(manifest: &ExportManifest, object: &ManifestObject) -> ImportResult<()> {
+    let disk_id = manifest.disk_id.to_string();
+    let seal_id = manifest.seal_id.to_string();
+    let export_job_id = manifest.export_job_id.to_string();
+    let chunk_group_id = object.chunk_group_id.map(|id| id.to_string());
+    let expected = object_aad(ObjectAad {
+        disk_id: &disk_id,
+        seal_id: &seal_id,
+        export_job_id: &export_job_id,
+        bucket: &object.bucket,
+        object_key: &object.key,
+        chunk_group_id: chunk_group_id.as_deref(),
+        chunk_index: object.chunk_index,
+        chunk_total: object.chunk_total,
+        chunk_offset_bytes: object.chunk_offset_bytes,
+    });
+    if object.aad.as_bytes() != expected.as_slice() {
+        return Err(ImportError::new(
+            ImportErrorCode::ManifestInvalid,
+            "manifest object aad does not match bound fields",
+        ));
     }
     Ok(())
 }

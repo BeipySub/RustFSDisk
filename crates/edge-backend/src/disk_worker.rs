@@ -17,6 +17,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::progress::ProgressAggregator;
+use rustfs_transfer_common::crypto::{object_aad, ObjectAad};
 
 const PROTOCOL_ROOT: &str = "rustfs-transfer";
 const MANIFEST_PATH: &str = "manifests/export_manifest.json";
@@ -655,18 +656,30 @@ fn ensure_head_matches_task(object: &ExportObjectTask, head: &SourceObjectHead) 
 }
 
 fn build_aad(config: &DiskWorkerConfig, object: &ExportObjectTask) -> String {
-    format!(
-        "disk_id={};seal_id={};export_job_id={};bucket={};key={};chunk_group_id={};chunk_index={};chunk_total={};chunk_offset_bytes={}",
-        config.disk_id,
-        config.seal_id,
-        config.export_job_id,
-        object.bucket,
-        object.object_key,
-        object.chunk_group_id.map(|id| id.to_string()).unwrap_or_default(),
-        object.chunk_index,
-        object.chunk_total,
-        object.chunk_offset_bytes
-    )
+    let disk_id = config.disk_id.to_string();
+    let seal_id = config.seal_id.to_string();
+    let export_job_id = config.export_job_id.to_string();
+    let chunk_group_id = object.chunk_group_id.map(|id| id.to_string());
+    let chunk_index = object
+        .chunk_index
+        .try_into()
+        .expect("export task chunk_index is non-negative");
+    let chunk_total = object
+        .chunk_total
+        .try_into()
+        .expect("export task chunk_total is non-negative");
+    String::from_utf8(object_aad(ObjectAad {
+        disk_id: &disk_id,
+        seal_id: &seal_id,
+        export_job_id: &export_job_id,
+        bucket: &object.bucket,
+        object_key: &object.object_key,
+        chunk_group_id: chunk_group_id.as_deref(),
+        chunk_index,
+        chunk_total,
+        chunk_offset_bytes: object.chunk_offset_bytes,
+    }))
+    .expect("object AAD is formatted as UTF-8")
 }
 
 fn data_path(export_job_id: &Uuid, object_id: i64) -> String {
