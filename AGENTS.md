@@ -248,4 +248,4 @@ work_sprint/TASKS.md
 提交基线要求：
 
 - Sprint 并行开发启动前，必须先形成一个干净基线 Commit，包含 `AGENTS.md`、`work_sprint/TASKS.md`、冻结文档目录状态、工程骨架、依赖清单和锁文件。
-- 后续每个任务 Commit 只包含该任务必要改动、对应任务状态同步和当天 dev log 记录。
+- 后续每个任务 Commit 只包含该任务必要改动、对应任务状态同步和当天 dev log 记录，提交的需要以中文为主，禁止使用英文介绍。
