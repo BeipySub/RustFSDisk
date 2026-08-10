@@ -1,4 +1,11 @@
-import type { EdgeDashboardSummary, EdgeDiskProgress, EdgeGlobalProgress } from "../api/edgeDashboard";
+import {
+  normalizeDiskProgress,
+  type EdgeDashboardSummary,
+  type EdgeDiskProgress,
+  type EdgeGlobalProgress,
+  localEdgePath,
+  visibleDiskStatusCode,
+} from "../api/edgeDashboard";
 
 export type EdgeProgressEventType =
   | "COPY_PROGRESS"
@@ -17,7 +24,7 @@ export interface CopyProgressEvent {
   source: "edge";
   edge_code: string;
   export_job_id: string;
-  disk_status_code: EdgeDashboardSummary["disk_status_code"];
+  disk_status_code?: EdgeDashboardSummary["disk_status_code"];
   export_job_status: EdgeDashboardSummary["export_job_status"];
   global_progress: EdgeGlobalProgress;
   disks: EdgeDiskProgress[];
@@ -33,8 +40,24 @@ export interface EdgeProgressSocket {
   close: () => void;
 }
 
+const eventTypes: readonly EdgeProgressEventType[] = [
+  "COPY_PROGRESS",
+  "COPY_DONE",
+  "SEAL_DONE",
+  "DISK_DETECTED",
+  "DISK_REMOVED",
+  "DISK_CHECKING",
+  "DISK_READY",
+  "DISK_REJECTED",
+  "ERROR",
+];
+
 export function edgeDashboardWsPath(): string {
-  return import.meta.env.VITE_EDGE_DASHBOARD_WS_PATH ?? "/ws/edge/progress";
+  return localEdgePath(
+    (import.meta as unknown as { env?: Record<string, string | undefined> }).env
+      ?.VITE_EDGE_DASHBOARD_WS_PATH,
+    "/ws/edge/progress",
+  );
 }
 
 export function connectEdgeProgressSocket(
@@ -47,9 +70,7 @@ export function connectEdgeProgressSocket(
   let retryTimer: number | undefined;
 
   const connect = () => {
-    if (stopped) {
-      return;
-    }
+    if (stopped) return;
 
     socket = new WebSocket(toWebSocketUrl(path));
     socket.addEventListener("open", () => {
@@ -58,14 +79,10 @@ export function connectEdgeProgressSocket(
     });
     socket.addEventListener("message", (message) => {
       const event = parseCopyProgressEvent(message.data);
-      if (event) {
-        handlers.onEvent(event);
-      }
+      if (event) handlers.onEvent(event);
     });
     socket.addEventListener("close", () => {
-      if (stopped) {
-        return;
-      }
+      if (stopped) return;
       handlers.onConnectionChange(false, "WebSocket 已断开，正在重连");
       scheduleReconnect();
     });
@@ -102,35 +119,48 @@ export function applyCopyProgressEvent(
     edge_code: event.edge_code,
     export_job_id: event.export_job_id,
     export_job_status: event.export_job_status,
-    disk_status_code: event.disk_status_code,
+    disk_status_code: visibleDiskStatusCode(event.disk_status_code),
     global_progress: event.global_progress,
-    disks: event.disks,
+    disks: event.disks.map(normalizeDiskProgress),
     ws_connected: true,
     message: event.message,
   };
 }
 
-function toWebSocketUrl(path: string): string {
-  if (path.startsWith("ws://") || path.startsWith("wss://")) {
-    return path;
-  }
-
-  const url = new URL(path, window.location.origin);
+export function toWebSocketUrl(path: string): string {
+  const safePath = localEdgePath(path, "/ws/edge/progress");
+  const url = new URL(safePath, window.location.origin);
   url.protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   return url.toString();
 }
 
-function parseCopyProgressEvent(data: unknown): CopyProgressEvent | null {
-  if (typeof data !== "string") {
-    return null;
-  }
+export function parseCopyProgressEvent(data: unknown): CopyProgressEvent | null {
+  if (typeof data !== "string") return null;
 
   try {
     const event = JSON.parse(data) as Partial<CopyProgressEvent>;
-    if (event.source !== "edge" || !event.event_type || !Array.isArray(event.disks)) {
+    if (
+      event.source !== "edge" ||
+      !event.event_type ||
+      !eventTypes.includes(event.event_type) ||
+      !Array.isArray(event.disks) ||
+      !event.global_progress
+    ) {
       return null;
     }
-    return event as CopyProgressEvent;
+
+    return {
+      event_type: event.event_type,
+      event_time: event.event_time ?? new Date().toISOString(),
+      source: "edge",
+      edge_code: event.edge_code ?? "",
+      export_job_id: event.export_job_id ?? "",
+      disk_status_code: visibleDiskStatusCode(event.disk_status_code),
+      export_job_status: event.export_job_status ?? "COPYING",
+      global_progress: event.global_progress,
+      disks: event.disks.map(normalizeDiskProgress),
+      message: event.message ?? "",
+    };
   } catch {
     return null;
   }

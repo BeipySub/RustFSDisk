@@ -1482,6 +1482,11 @@
 - [x] 展示扫描状态、盘列表、拷贝进度、当前对象、速度、错误。
 - [x] WS 断开和页面刷新能恢复 HTTP 汇总状态。
 - [x] 非 ext4、未注册、拔盘、空间不足和恢复要求均有展示。
+- [x] Edge 前端保留 `/dashboard`、`/sync-records` 两页，Dashboard 为默认入口；未恢复 `/first-access`。
+- [x] 浏览器仅使用本地 Edge 公开只读 Dashboard summary、导出记录列表/详情和 Edge progress WS 契约，不读取、不展示、不发送 Center 地址、`authorization_key` 或控制 token。
+- [x] Edge 页面不展示 `IMPORTED`，不提供初始化、清理、格式化、导入或取消操作入口。
+- [x] 按 UI/UE 交接方案完成 Dashboard 与同步记录页 16:9 主视觉候选实现，并保留 `web/edge-web/design-qa.md` 视觉 QA 记录。
+- [x] 按用户最新决定将粒子传输效果排除出当前阻塞项；同步记录统计卡精确图标与稳定 1440x810 截图仍作为后续视觉复核残留。
 
 ---
 

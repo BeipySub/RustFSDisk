@@ -8,6 +8,8 @@ export type DiskStatusCode =
   | "IMPORTED"
   | "ERROR";
 
+export type EdgeVisibleDiskStatusCode = Exclude<DiskStatusCode, "IMPORTED">;
+
 export type RuntimeStatus =
   | "DETECTED"
   | "CHECKING"
@@ -37,6 +39,7 @@ export type ObjectStatus =
   | "SOURCE_CHANGED"
   | "SKIPPED";
 
+export type EdgeStatus = "ACTIVE" | "DISABLED" | "ERROR";
 export type ScanEventType = "SCAN_STARTED" | "SCAN_PROGRESS" | "SCAN_DONE" | "ERROR";
 
 export interface EdgeCurrentObject {
@@ -65,7 +68,7 @@ export interface EdgeDiskProgress {
   model?: string;
   vendor?: string;
   transport?: string;
-  disk_status_code?: DiskStatusCode;
+  disk_status_code?: EdgeVisibleDiskStatusCode;
   runtime_status: RuntimeStatus;
   total_bytes: number;
   done_bytes: number;
@@ -108,9 +111,10 @@ export interface EdgeDashboardSummary {
   source: "edge";
   edge_code: string;
   edge_name: string;
+  edge_status?: EdgeStatus;
   export_job_id: string;
   export_job_status: ExportJobStatus;
-  disk_status_code?: DiskStatusCode;
+  disk_status_code?: EdgeVisibleDiskStatusCode;
   scan: EdgeScanSummary;
   global_progress: EdgeGlobalProgress;
   disks: EdgeDiskProgress[];
@@ -119,8 +123,54 @@ export interface EdgeDashboardSummary {
   message: string;
 }
 
+export interface EdgeExportJobRecord {
+  export_job_id: string;
+  edge_code: string;
+  export_job_status: ExportJobStatus;
+  object_count: number;
+  copied_count: number;
+  total_bytes: number;
+  copied_bytes: number;
+  disk_count: number;
+  start_time?: string;
+  finish_time?: string;
+  error_message?: string;
+  object_status_counts: Partial<Record<ObjectStatus, number>>;
+}
+
+export interface EdgeExportJobDetail extends EdgeExportJobRecord {
+  disks: EdgeDiskProgress[];
+  events: EdgeExportJobEvent[];
+}
+
+export interface EdgeExportJobEvent {
+  event_time: string;
+  event_type: string;
+  runtime_status?: RuntimeStatus;
+  export_job_status?: ExportJobStatus;
+  disk_id?: string;
+  last_error_code?: string;
+  message: string;
+}
+
+export interface EdgeExportJobsQuery {
+  page: number;
+  page_size: number;
+  export_job_status?: ExportJobStatus | "";
+  started_from?: string;
+  started_to?: string;
+  q?: string;
+}
+
+export interface EdgeExportJobsResponse {
+  page: number;
+  page_size: number;
+  total: number;
+  items: EdgeExportJobRecord[];
+}
+
 interface EdgeControlScanSnapshot {
-  event_type?: ScanEventType;
+  event_type?: string;
   event_time?: string;
   scan_phase?: string;
   bucket_total?: number;
@@ -131,19 +181,22 @@ interface EdgeControlScanSnapshot {
   total_bytes?: number;
   current_bucket?: string | null;
   current_object_key?: string | null;
-  last_error_code?: string | null;
   message?: string | null;
 }
 
 interface EdgeControlExportJob {
   export_job_id: string;
   edge_code: string;
-  export_job_status: ExportJobStatus;
-  object_count: number;
-  copied_count: number;
-  total_bytes: number;
-  copied_bytes: number;
+  export_job_status: string;
+  object_count?: number;
+  copied_count?: number;
+  total_bytes?: number;
+  copied_bytes?: number;
+  disk_count?: number;
+  start_time?: string | null;
+  finish_time?: string | null;
   error_message?: string | null;
+  object_status_counts?: Record<string, number>;
 }
 
 interface EdgeControlDiskRuntime {
@@ -160,286 +213,168 @@ interface EdgeControlDiskRuntime {
   model?: string | null;
   vendor?: string | null;
   transport?: string | null;
-  disk_status_code?: DiskStatusCode | null;
-  runtime_status: RuntimeStatus;
+  disk_status_code?: string | null;
+  runtime_status?: string | null;
   capacity_bytes?: number;
-  free_bytes: number;
+  free_bytes?: number;
   object_budget_bytes?: number;
+  total_bytes?: number;
+  done_bytes?: number;
+  remaining_bytes?: number;
+  speed_bytes_per_sec?: number;
+  object_total?: number;
+  object_done?: number;
+  object_remaining?: number;
+  current_object?: Partial<EdgeCurrentObject> | null;
   last_error_code?: string | null;
   error_message?: string | null;
+  message?: string | null;
 }
 
 interface EdgeControlSummary {
   source: "edge";
   edge_code: string;
   edge_name?: string;
+  edge_status?: string;
   scan?: EdgeControlScanSnapshot;
   latest_export_job?: EdgeControlExportJob | null;
+  export_job?: EdgeControlExportJob | null;
+  export_job_id?: string;
+  export_job_status?: string;
+  disk_status_code?: string;
+  global_progress?: Partial<EdgeGlobalProgress>;
   disks?: EdgeControlDiskRuntime[];
   message?: string;
 }
 
+const exportJobStatuses: readonly ExportJobStatus[] = [
+  "PENDING",
+  "SCANNING",
+  "COPYING",
+  "SEALED",
+  "FAILED",
+  "CANCELLED",
+];
+
+const runtimeStatuses: readonly RuntimeStatus[] = [
+  "DETECTED",
+  "CHECKING",
+  "READY",
+  "COPYING",
+  "CLEANING",
+  "REINITIALIZING",
+  "DONE",
+  "REJECTED",
+  "REMOVED",
+  "ERROR",
+];
+
+const objectStatuses: readonly ObjectStatus[] = [
+  "PENDING",
+  "ASSIGNED",
+  "COPYING",
+  "EXPORTED",
+  "FAILED",
+  "SOURCE_CHANGED",
+  "SKIPPED",
+];
+
+const scanEventTypes: readonly ScanEventType[] = [
+  "SCAN_STARTED",
+  "SCAN_PROGRESS",
+  "SCAN_DONE",
+  "ERROR",
+];
+
+const visibleDiskStatusCodes: readonly EdgeVisibleDiskStatusCode[] = [
+  "UNREGISTERED",
+  "REGISTERED",
+  "INITIALIZED",
+  "EDGE_COPYING",
+  "SEALED",
+  "CENTER_IMPORTING",
+  "ERROR",
+];
+
 export class DashboardHttpError extends Error {
+  public readonly error_code: string;
+  public readonly http_status?: number;
+
   constructor(
-    public readonly error_code: string,
+    errorCode: string,
     message: string,
-    public readonly http_status?: number,
+    httpStatus?: number,
   ) {
     super(message);
+    this.error_code = errorCode;
+    this.http_status = httpStatus;
   }
 }
 
-export const edgeDashboardMockSummary: EdgeDashboardSummary = {
-  source: "edge",
-  edge_code: "edge-hz-01",
-  edge_name: "杭州边缘站点 01",
-  export_job_id: "export-job-fixture-20260809-001",
-  export_job_status: "COPYING",
-  disk_status_code: "EDGE_COPYING",
-  scan: {
-    scan_event_type: "SCAN_DONE",
-    scanned_bucket_count: 8,
-    scanned_object_count: 12846,
-    scanned_bytes: 1_956_421_623_808,
-    stable_object_count: 12821,
-    skipped_object_count: 25,
-    current_bucket: "medical-archive",
-    current_key: "2026/08/ct-study/index.json",
-    last_scan_at: "2026-08-09T08:45:13Z",
-    message: "扫描完成，25 个对象因 SOURCE_CHANGED 跳过本轮导出",
-  },
-  global_progress: {
-    total_bytes: 1_481_036_337_152,
-    done_bytes: 832_417_439_744,
-    remaining_bytes: 648_618_897_408,
-    speed_bytes_per_sec: 264_241_152,
-    object_total: 9360,
-    object_done: 5214,
-    object_remaining: 4146,
-  },
-  disks: [
-    {
-      disk_id: "disk-2b601d2f",
-      disk_sn: "323533383650343031383331",
-      hardware_serial: "323533383650343031383331",
-      id_serial: "SANDISK_ELE_323533383650343031383331-0:0",
-      stable_hardware_id: "SANDISK_ELE_323533383650343031383331-0:0",
-      mount_path: "/media/edge/FUSTFS-A-DRILL1",
-      device_path: "/dev/sdb1",
-      filesystem: "ext4",
-      filesystem_uuid: "47a293a6-7b0d-487a-8f20-492fe5cc4d74",
-      partition_uuid: "dae871ea-1da4-4719-bace-1e9479cc7fe4",
-      model: "ELE",
-      vendor: "SANDISK",
-      transport: "usb",
-      disk_status_code: "EDGE_COPYING",
-      runtime_status: "COPYING",
-      total_bytes: 658_119_753_728,
-      done_bytes: 421_477_646_336,
-      remaining_bytes: 236_642_107_392,
-      free_bytes: 1_842_093_096_960,
-      speed_bytes_per_sec: 132_112_384,
-      object_total: 4120,
-      object_done: 2782,
-      object_remaining: 1338,
-      current_object: {
-        bucket: "medical-archive",
-        key: "2026/08/ct-study/series-18/slice-0942.dcm",
-        display_name: "slice-0942.dcm",
-        relative_data_path: "data/medical-archive/2026/08/ct-study/series-18/slice-0942.dcm.enc",
-        size_bytes: 734_003_200,
-        done_bytes: 401_604_608,
-        remaining_bytes: 332_398_592,
-        speed_bytes_per_sec: 66_584_576,
-        object_status: "COPYING",
-      },
-      message: "正在写入对象密文",
-    },
-    {
-      disk_id: "disk-7f4cb309",
-      disk_sn: "SN-RFS-EDGE-A002",
-      hardware_serial: "SN-RFS-EDGE-A002",
-      stable_hardware_id: "USB-DISK-SN-RFS-EDGE-A002",
-      mount_path: "/mnt/rustfs-transfer/disk-b",
-      device_path: "/dev/sdc1",
-      filesystem: "ext4",
-      filesystem_uuid: "72c50601-4da4-4d57-a98f-61fbdf83b00a",
-      partition_uuid: "9d22c0d0-1898-49d7-8421-9c594df3e1cf",
-      model: "PortableSSD",
-      vendor: "DemoVendor",
-      transport: "usb",
-      disk_status_code: "EDGE_COPYING",
-      runtime_status: "COPYING",
-      total_bytes: 601_295_421_440,
-      done_bytes: 368_050_176_000,
-      remaining_bytes: 233_245_245_440,
-      free_bytes: 1_612_910_845_952,
-      speed_bytes_per_sec: 118_489_088,
-      object_total: 3778,
-      object_done: 2320,
-      object_remaining: 1458,
-      current_object: {
-        bucket: "logs-prod",
-        key: "edge-hz-01/2026/08/09/part-00384.parquet",
-        display_name: "part-00384.parquet",
-        relative_data_path: "data/logs-prod/edge-hz-01/2026/08/09/part-00384.parquet.enc",
-        size_bytes: 1_073_741_824,
-        done_bytes: 766_509_056,
-        remaining_bytes: 307_232_768,
-        speed_bytes_per_sec: 59_244_544,
-        object_status: "COPYING",
-      },
-      message: "多盘并行拷贝中",
-    },
-    {
-      disk_id: "disk-0fe891ab",
-      disk_sn: "SN-RFS-EDGE-A003",
-      hardware_serial: "SN-RFS-EDGE-A003",
-      mount_path: "/mnt/rustfs-transfer/disk-c",
-      device_path: "/dev/sdd1",
-      filesystem: "ext4",
-      disk_status_code: "INITIALIZED",
-      runtime_status: "REJECTED",
-      total_bytes: 221_621_161_984,
-      done_bytes: 42_889_617_408,
-      remaining_bytes: 178_731_544_576,
-      free_bytes: 402_653_184,
-      speed_bytes_per_sec: 0,
-      object_total: 1462,
-      object_done: 112,
-      object_remaining: 1350,
-      current_object: null,
-      last_error_code: "INSUFFICIENT_SPACE",
-      error_message: "对象预算容量不足，该盘停止继续分配；其他运输盘继续拷贝",
-      message: "空间不足，等待人工处理或更换运输盘",
-    },
-    {
-      disk_id: "disk-unregistered",
-      disk_sn: "SN-RFS-LAB-000",
-      hardware_serial: "SN-RFS-LAB-000",
-      mount_path: "/mnt/rustfs-transfer/lab-fat32",
-      device_path: "/dev/sde1",
-      filesystem: "vfat",
-      disk_status_code: "UNREGISTERED",
-      runtime_status: "REJECTED",
-      total_bytes: 0,
-      done_bytes: 0,
-      remaining_bytes: 0,
-      free_bytes: 0,
-      speed_bytes_per_sec: 0,
-      object_total: 0,
-      object_done: 0,
-      object_remaining: 0,
-      current_object: null,
-      last_error_code: "FILESYSTEM_UNSUPPORTED",
-      error_message: "检测到非 ext4 文件系统，拒绝进入导出任务池",
-      message: "未注册或文件系统不符合协议",
-    },
-    {
-      disk_id: "disk-recovery-required",
-      disk_sn: "SN-RFS-EDGE-A004",
-      hardware_serial: "SN-RFS-EDGE-A004",
-      mount_path: "/mnt/rustfs-transfer/disk-d",
-      device_path: "/dev/sdf1",
-      filesystem: "ext4",
-      disk_status_code: "EDGE_COPYING",
-      runtime_status: "ERROR",
-      total_bytes: 0,
-      done_bytes: 0,
-      remaining_bytes: 0,
-      free_bytes: 820_338_753_536,
-      speed_bytes_per_sec: 0,
-      object_total: 0,
-      object_done: 0,
-      object_remaining: 0,
-      current_object: null,
-      last_error_code: "RECOVERY_REQUIRED",
-      error_message: "发现 EDGE_COPYING 中间态和 .partial 残留，恢复检查通过前不得继续导出",
-      message: "需要恢复检查",
-    },
-    {
-      disk_id: "disk-removed",
-      disk_sn: "SN-RFS-EDGE-A005",
-      hardware_serial: "SN-RFS-EDGE-A005",
-      mount_path: "/mnt/rustfs-transfer/disk-e",
-      device_path: "/dev/sdg1",
-      filesystem: "ext4",
-      disk_status_code: "EDGE_COPYING",
-      runtime_status: "REMOVED",
-      total_bytes: 0,
-      done_bytes: 0,
-      remaining_bytes: 0,
-      free_bytes: 0,
-      speed_bytes_per_sec: 0,
-      object_total: 0,
-      object_done: 0,
-      object_remaining: 0,
-      current_object: null,
-      last_error_code: "DISK_REMOVED",
-      error_message: "拷贝过程中检测到运输盘拔出",
-      message: "运输盘已拔出",
-    },
-  ],
-  ws_connected: false,
-  last_http_refresh_at: "2026-08-09T08:46:02Z",
-  message: "Day 1 fixture：真实 HTTP 汇总和 WebSocket 将在 Day 2 接入",
-};
-
 export function edgeDashboardSummaryPath(): string {
-  return import.meta.env.VITE_EDGE_DASHBOARD_SUMMARY_PATH ?? "/api/edge/summary";
+  return envValue("VITE_EDGE_DASHBOARD_SUMMARY_PATH", "/api/edge/dashboard/summary");
+}
+
+export function edgeExportJobsPath(): string {
+  return envValue("VITE_EDGE_EXPORT_JOBS_PATH", "/api/edge/dashboard/export-jobs");
 }
 
 export async function fetchEdgeDashboardSummary(
   path = edgeDashboardSummaryPath(),
 ): Promise<EdgeDashboardSummary> {
-  const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), 6000);
-
-  try {
-    const response = await fetch(path, {
-      headers: { Accept: "application/json" },
-      signal: controller.signal,
-    });
-
-    if (!response.ok) {
-      throw new DashboardHttpError(
-        response.status === 404 ? "SUMMARY_ENDPOINT_NOT_READY" : "SUMMARY_HTTP_ERROR",
-        `HTTP ${response.status} while loading ${path}`,
-        response.status,
-      );
-    }
-
-    const payload = (await response.json()) as EdgeDashboardSummary | EdgeControlSummary;
-    return normalizeEdgeDashboardSummary(payload);
-  } catch (error) {
-    if (error instanceof DashboardHttpError) {
-      throw error;
-    }
-    if (error instanceof DOMException && error.name === "AbortError") {
-      throw new DashboardHttpError("SUMMARY_TIMEOUT", `Timed out while loading ${path}`);
-    }
-    throw new DashboardHttpError(
-      "SUMMARY_UNAVAILABLE",
-      error instanceof Error ? error.message : `Unable to load ${path}`,
-    );
-  } finally {
-    window.clearTimeout(timeout);
-  }
+  const payload = await getJson<EdgeDashboardSummary | EdgeControlSummary>(
+    localEdgePath(path, "/api/edge/dashboard/summary"),
+  );
+  return normalizeEdgeDashboardSummary(payload);
 }
 
-function normalizeEdgeDashboardSummary(
+export async function fetchEdgeExportJobs(
+  query: EdgeExportJobsQuery,
+  basePath = edgeExportJobsPath(),
+): Promise<EdgeExportJobsResponse> {
+  const payload = await getJson<Partial<EdgeExportJobsResponse> | EdgeExportJobRecord[]>(
+    buildExportJobsUrl(basePath, query),
+  );
+  return normalizeExportJobsResponse(payload, query);
+}
+
+export async function fetchEdgeExportJobDetail(
+  exportJobId: string,
+  basePath = edgeExportJobsPath(),
+): Promise<EdgeExportJobDetail> {
+  const safeId = encodeURIComponent(exportJobId);
+  const safeBasePath = localEdgePath(basePath, "/api/edge/dashboard/export-jobs");
+  const payload = await getJson<Partial<EdgeExportJobDetail>>(`${safeBasePath}/${safeId}`);
+  return normalizeExportJobDetail(payload);
+}
+
+export function buildExportJobsUrl(basePath: string, query: EdgeExportJobsQuery): string {
+  const url = new URL(localEdgePath(basePath, "/api/edge/dashboard/export-jobs"), browserOrigin());
+  url.searchParams.set("page", String(query.page));
+  url.searchParams.set("page_size", String(query.page_size));
+  if (query.export_job_status) url.searchParams.set("export_job_status", query.export_job_status);
+  if (query.started_from) url.searchParams.set("started_from", query.started_from);
+  if (query.started_to) url.searchParams.set("started_to", query.started_to);
+  if (query.q?.trim()) url.searchParams.set("q", query.q.trim());
+  return url.pathname + url.search;
+}
+
+export function normalizeEdgeDashboardSummary(
   payload: EdgeDashboardSummary | EdgeControlSummary,
 ): EdgeDashboardSummary {
-  if ("global_progress" in payload && Array.isArray(payload.disks)) {
+  if ("global_progress" in payload && Array.isArray(payload.disks) && "scan" in payload) {
+    const summary = payload as EdgeDashboardSummary;
     return {
-      ...payload,
+      ...summary,
+      disk_status_code: visibleDiskStatusCode(summary.disk_status_code),
+      disks: summary.disks.map(normalizeDiskProgress),
       ws_connected: false,
       last_http_refresh_at: new Date().toISOString(),
     };
   }
 
   const controlPayload = payload as EdgeControlSummary;
-  const latestExportJob = controlPayload.latest_export_job ?? null;
+  const latestExportJob = controlPayload.latest_export_job ?? controlPayload.export_job ?? null;
   const copiedBytes = latestExportJob?.copied_bytes ?? 0;
   const totalBytes = latestExportJob?.total_bytes ?? 0;
   const copiedCount = latestExportJob?.copied_count ?? 0;
@@ -450,21 +385,26 @@ function normalizeEdgeDashboardSummary(
     source: "edge",
     edge_code: controlPayload.edge_code,
     edge_name: controlPayload.edge_name ?? controlPayload.edge_code,
-    export_job_id: latestExportJob?.export_job_id ?? "",
-    export_job_status: latestExportJob?.export_job_status ?? "PENDING",
+    edge_status: edgeStatus(controlPayload.edge_status),
+    export_job_id: latestExportJob?.export_job_id ?? controlPayload.export_job_id ?? "",
+    export_job_status: exportJobStatus(
+      latestExportJob?.export_job_status ?? controlPayload.export_job_status,
+      "PENDING",
+    ),
+    disk_status_code: visibleDiskStatusCode(controlPayload.disk_status_code),
     scan: {
-      scan_event_type: scan.event_type ?? "SCAN_PROGRESS",
-      scanned_bucket_count: scan.bucket_done ?? 0,
-      scanned_object_count: scan.object_seen ?? 0,
-      scanned_bytes: scan.total_bytes ?? 0,
-      stable_object_count: scan.stable_object_count ?? 0,
-      skipped_object_count: scan.source_changed_count ?? 0,
+      scan_event_type: scanEventType(scan.event_type, "SCAN_PROGRESS"),
+      scanned_bucket_count: numberValue(scan.bucket_done),
+      scanned_object_count: numberValue(scan.object_seen),
+      scanned_bytes: numberValue(scan.total_bytes),
+      stable_object_count: numberValue(scan.stable_object_count),
+      skipped_object_count: numberValue(scan.source_changed_count),
       current_bucket: scan.current_bucket ?? "",
       current_key: scan.current_object_key ?? "",
       last_scan_at: scan.event_time ?? new Date().toISOString(),
       message: scan.message ?? scan.scan_phase ?? "等待 RustFS 扫描状态",
     },
-    global_progress: {
+    global_progress: normalizeGlobalProgress(controlPayload.global_progress, {
       total_bytes: totalBytes,
       done_bytes: copiedBytes,
       remaining_bytes: Math.max(0, totalBytes - copiedBytes),
@@ -472,41 +412,263 @@ function normalizeEdgeDashboardSummary(
       object_total: objectCount,
       object_done: copiedCount,
       object_remaining: Math.max(0, objectCount - copiedCount),
-    },
-    disks: (controlPayload.disks ?? []).map((disk, index) => {
-      const diskId = disk.disk_id ?? `unidentified-disk-${index + 1}`;
-      return {
-        disk_id: diskId,
-        disk_sn: disk.disk_sn ?? disk.hardware_serial ?? "待后端补充",
-        hardware_serial: disk.hardware_serial ?? undefined,
-        id_serial: disk.id_serial ?? undefined,
-        stable_hardware_id: disk.stable_hardware_id ?? undefined,
-        mount_path: disk.mount_path ?? "待后端补充",
-        device_path: disk.device_path ?? undefined,
-        filesystem: disk.filesystem ?? undefined,
-        filesystem_uuid: disk.filesystem_uuid ?? undefined,
-        partition_uuid: disk.partition_uuid ?? undefined,
-        model: disk.model ?? undefined,
-        vendor: disk.vendor ?? undefined,
-        transport: disk.transport ?? undefined,
-        disk_status_code: disk.disk_status_code ?? undefined,
-        runtime_status: disk.runtime_status,
-        total_bytes: disk.object_budget_bytes ?? disk.capacity_bytes ?? 0,
-        done_bytes: 0,
-        remaining_bytes: disk.object_budget_bytes ?? 0,
-        free_bytes: disk.free_bytes,
-        speed_bytes_per_sec: 0,
-        object_total: 0,
-        object_done: 0,
-        object_remaining: 0,
-        current_object: null,
-        last_error_code: disk.last_error_code ?? undefined,
-        error_message: disk.error_message ?? undefined,
-        message: disk.error_message ?? "等待 COPY_PROGRESS WebSocket 补充分盘实时进度",
-      } satisfies EdgeDiskProgress;
     }),
+    disks: (controlPayload.disks ?? []).map((disk, index) =>
+      normalizeDiskProgress({
+        disk_id: disk.disk_id ?? `unidentified-disk-${index + 1}`,
+        disk_sn: disk.disk_sn ?? disk.hardware_serial ?? "待后端补充",
+        hardware_serial: nullableString(disk.hardware_serial),
+        id_serial: nullableString(disk.id_serial),
+        stable_hardware_id: nullableString(disk.stable_hardware_id),
+        mount_path: disk.mount_path ?? "待后端补充",
+        device_path: nullableString(disk.device_path),
+        filesystem: nullableString(disk.filesystem),
+        filesystem_uuid: nullableString(disk.filesystem_uuid),
+        partition_uuid: nullableString(disk.partition_uuid),
+        model: nullableString(disk.model),
+        vendor: nullableString(disk.vendor),
+        transport: nullableString(disk.transport),
+        disk_status_code: visibleDiskStatusCode(disk.disk_status_code),
+        runtime_status: runtimeStatus(disk.runtime_status, "DETECTED"),
+        total_bytes: numberValue(disk.total_bytes ?? disk.object_budget_bytes ?? disk.capacity_bytes),
+        done_bytes: numberValue(disk.done_bytes),
+        remaining_bytes: numberValue(disk.remaining_bytes ?? disk.object_budget_bytes),
+        free_bytes: numberValue(disk.free_bytes),
+        speed_bytes_per_sec: numberValue(disk.speed_bytes_per_sec),
+        object_total: numberValue(disk.object_total),
+        object_done: numberValue(disk.object_done),
+        object_remaining: numberValue(disk.object_remaining),
+        current_object: normalizeCurrentObject(disk.current_object),
+        last_error_code: nullableString(disk.last_error_code),
+        error_message: nullableString(disk.error_message),
+        message:
+          disk.message ??
+          disk.error_message ??
+          "等待 COPY_PROGRESS WebSocket 补充分盘实时进度",
+      }),
+    ),
     ws_connected: false,
     last_http_refresh_at: new Date().toISOString(),
     message: controlPayload.message ?? "HTTP summary loaded; waiting for COPY_PROGRESS WebSocket",
   };
+}
+
+export function normalizeDiskProgress(disk: EdgeDiskProgress): EdgeDiskProgress {
+  return {
+    ...disk,
+    disk_status_code: visibleDiskStatusCode(disk.disk_status_code),
+    runtime_status: runtimeStatus(disk.runtime_status, "DETECTED"),
+    current_object: normalizeCurrentObject(disk.current_object),
+  };
+}
+
+export function visibleDiskStatusCode(
+  value: DiskStatusCode | string | null | undefined,
+): EdgeVisibleDiskStatusCode | undefined {
+  return visibleDiskStatusCodes.includes(value as EdgeVisibleDiskStatusCode)
+    ? (value as EdgeVisibleDiskStatusCode)
+    : undefined;
+}
+
+export function diskStatusDisplay(value: EdgeVisibleDiskStatusCode | undefined): string {
+  return value ?? "中控侧状态，Edge 不展示";
+}
+
+export function normalizeExportJobsResponse(
+  payload: Partial<EdgeExportJobsResponse> | EdgeExportJobRecord[],
+  query: Pick<EdgeExportJobsQuery, "page" | "page_size">,
+): EdgeExportJobsResponse {
+  if (Array.isArray(payload)) {
+    return {
+      page: query.page,
+      page_size: query.page_size,
+      total: payload.length,
+      items: payload.map(normalizeExportJobRecord),
+    };
+  }
+
+  return {
+    page: numberValue(payload.page, query.page),
+    page_size: numberValue(payload.page_size, query.page_size),
+    total: numberValue(payload.total),
+    items: (payload.items ?? []).map(normalizeExportJobRecord),
+  };
+}
+
+export function normalizeExportJobDetail(payload: Partial<EdgeExportJobDetail>): EdgeExportJobDetail {
+  return {
+    ...normalizeExportJobRecord(payload),
+    disks: (payload.disks ?? []).map(normalizeDiskProgress),
+    events: (payload.events ?? []).map((event) => ({
+      event_time: event.event_time ?? "",
+      event_type: event.event_type ?? "COPY_PROGRESS",
+      runtime_status: runtimeStatus(event.runtime_status, undefined),
+      export_job_status: exportJobStatus(event.export_job_status, undefined),
+      disk_id: event.disk_id,
+      last_error_code: event.last_error_code,
+      message: event.message ?? "",
+    })),
+  };
+}
+
+function normalizeExportJobRecord(payload: Partial<EdgeExportJobRecord>): EdgeExportJobRecord {
+  return {
+    export_job_id: payload.export_job_id ?? "",
+    edge_code: payload.edge_code ?? "",
+    export_job_status: exportJobStatus(payload.export_job_status, "PENDING"),
+    object_count: numberValue(payload.object_count),
+    copied_count: numberValue(payload.copied_count),
+    total_bytes: numberValue(payload.total_bytes),
+    copied_bytes: numberValue(payload.copied_bytes),
+    disk_count: numberValue(payload.disk_count),
+    start_time: payload.start_time,
+    finish_time: payload.finish_time,
+    error_message: payload.error_message,
+    object_status_counts: normalizeObjectStatusCounts(payload.object_status_counts),
+  };
+}
+
+function normalizeObjectStatusCounts(
+  counts: Partial<Record<ObjectStatus, number>> | undefined,
+): Partial<Record<ObjectStatus, number>> {
+  const safeCounts: Partial<Record<ObjectStatus, number>> = {};
+  for (const [key, value] of Object.entries(counts ?? {})) {
+    if (objectStatuses.includes(key as ObjectStatus)) {
+      safeCounts[key as ObjectStatus] = numberValue(value);
+    }
+  }
+  return safeCounts;
+}
+
+function normalizeGlobalProgress(
+  value: Partial<EdgeGlobalProgress> | undefined,
+  fallback: EdgeGlobalProgress,
+): EdgeGlobalProgress {
+  const totalBytes = numberValue(value?.total_bytes, fallback.total_bytes);
+  const doneBytes = numberValue(value?.done_bytes, fallback.done_bytes);
+  const objectTotal = numberValue(value?.object_total, fallback.object_total);
+  const objectDone = numberValue(value?.object_done, fallback.object_done);
+  return {
+    total_bytes: totalBytes,
+    done_bytes: doneBytes,
+    remaining_bytes: numberValue(value?.remaining_bytes, Math.max(0, totalBytes - doneBytes)),
+    speed_bytes_per_sec: numberValue(value?.speed_bytes_per_sec, fallback.speed_bytes_per_sec),
+    object_total: objectTotal,
+    object_done: objectDone,
+    object_remaining: numberValue(value?.object_remaining, Math.max(0, objectTotal - objectDone)),
+  };
+}
+
+function normalizeCurrentObject(
+  value: EdgeCurrentObject | Partial<EdgeCurrentObject> | null | undefined,
+): EdgeCurrentObject | null {
+  if (!value) return null;
+  return {
+    bucket: value.bucket ?? "",
+    key: value.key ?? "",
+    display_name: value.display_name ?? lastPathSegment(value.key) ?? "",
+    relative_data_path: value.relative_data_path ?? "",
+    size_bytes: numberValue(value.size_bytes),
+    done_bytes: numberValue(value.done_bytes),
+    remaining_bytes: numberValue(value.remaining_bytes),
+    speed_bytes_per_sec: numberValue(value.speed_bytes_per_sec),
+    object_status: objectStatus(value.object_status, "COPYING"),
+  };
+}
+
+async function getJson<T>(path: string): Promise<T> {
+  const controller = new AbortController();
+  const timeout = globalThis.setTimeout(() => controller.abort(), 6000);
+
+  try {
+    const response = await fetch(path, {
+      headers: { Accept: "application/json" },
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      throw new DashboardHttpError(
+        response.status === 404 ? "DASHBOARD_ENDPOINT_NOT_READY" : "DASHBOARD_HTTP_ERROR",
+        `HTTP ${response.status} while loading ${path}`,
+        response.status,
+      );
+    }
+
+    return (await response.json()) as T;
+  } catch (error) {
+    if (error instanceof DashboardHttpError) throw error;
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new DashboardHttpError("DASHBOARD_TIMEOUT", `Timed out while loading ${path}`);
+    }
+    throw new DashboardHttpError(
+      "DASHBOARD_UNAVAILABLE",
+      error instanceof Error ? error.message : `Unable to load ${path}`,
+    );
+  } finally {
+    globalThis.clearTimeout(timeout);
+  }
+}
+
+function envValue(key: string, fallback: string): string {
+  return localEdgePath(
+    (import.meta as unknown as { env?: Record<string, string | undefined> }).env?.[key],
+    fallback,
+  );
+}
+
+export function localEdgePath(value: string | undefined, fallback: string): string {
+  const trimmed = value?.trim();
+  if (!trimmed || trimmed.startsWith("//")) return fallback;
+
+  try {
+    const url = new URL(trimmed, browserOrigin());
+    if (url.origin !== browserOrigin()) return fallback;
+    return url.pathname + url.search;
+  } catch {
+    return fallback;
+  }
+}
+
+function browserOrigin(): string {
+  return (globalThis as { location?: Location }).location?.origin ?? "http://localhost";
+}
+
+function lastPathSegment(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const segments = value.split("/");
+  return segments[segments.length - 1];
+}
+
+function edgeStatus(value: string | undefined): EdgeStatus | undefined {
+  return value === "ACTIVE" || value === "DISABLED" || value === "ERROR" ? value : undefined;
+}
+
+function exportJobStatus<T extends ExportJobStatus | undefined>(
+  value: string | undefined,
+  fallback: T,
+): ExportJobStatus | T {
+  return exportJobStatuses.includes(value as ExportJobStatus) ? (value as ExportJobStatus) : fallback;
+}
+
+function runtimeStatus<T extends RuntimeStatus | undefined>(
+  value: string | undefined | null,
+  fallback: T,
+): RuntimeStatus | T {
+  return runtimeStatuses.includes(value as RuntimeStatus) ? (value as RuntimeStatus) : fallback;
+}
+
+function objectStatus(value: string | undefined, fallback: ObjectStatus): ObjectStatus {
+  return objectStatuses.includes(value as ObjectStatus) ? (value as ObjectStatus) : fallback;
+}
+
+function scanEventType(value: string | undefined, fallback: ScanEventType): ScanEventType {
+  return scanEventTypes.includes(value as ScanEventType) ? (value as ScanEventType) : fallback;
+}
+
+function nullableString(value: string | null | undefined): string | undefined {
+  return value ?? undefined;
+}
+
+function numberValue(value: unknown, fallback = 0): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
