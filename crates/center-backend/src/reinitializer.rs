@@ -60,6 +60,7 @@ pub trait PostImportRepository {
         &mut self,
         disk_id: Uuid,
         seal_id: Uuid,
+        old_data_key_id: Uuid,
     ) -> Result<Option<CompletedImport>, ReinitializeError>;
 
     fn set_runtime(
@@ -119,16 +120,16 @@ where
         disk_id: Uuid,
         seal_id: Uuid,
     ) -> Result<ReinitializedDisk, ReinitializeError> {
-        let import = self
-            .repo
-            .completed_import(disk_id, seal_id)?
-            .ok_or(ReinitializeError::ImportNotDone { disk_id, seal_id })?;
-
         let previous_disk_info = read_disk_info(mount_path)?;
         validate_imported_disk_info(&previous_disk_info, disk_id, seal_id)?;
         self.security
             .verify_disk_info(&previous_disk_info)
             .map_err(|error| ReinitializeError::SignatureInvalid(error.to_string()))?;
+        let old_data_key_id = previous_disk_info.security.data_key_id;
+        let import = self
+            .repo
+            .completed_import(disk_id, seal_id, old_data_key_id)?
+            .ok_or(ReinitializeError::ImportNotDone { disk_id, seal_id })?;
 
         let result =
             self.reinitialize_after_validated_import(mount_path, &import, &previous_disk_info);
@@ -150,6 +151,7 @@ where
         import: &CompletedImport,
         previous_disk_info: &DiskInfo,
     ) -> Result<ReinitializedDisk, ReinitializeError> {
+        ensure_no_partial_residue(mount_path)?;
         self.repo
             .set_runtime(import.disk_id, RuntimeStatus::Cleaning, None, None)?;
         clean_sealed_payload(mount_path)?;
@@ -291,6 +293,42 @@ fn create_protocol_dirs(mount_path: &Path) -> Result<(), ReinitializeError> {
     Ok(())
 }
 
+fn ensure_no_partial_residue(mount_path: &Path) -> Result<(), ReinitializeError> {
+    let root = protocol_root(mount_path);
+    let mut count = 0_usize;
+    count_partial_files(&root, &mut count)?;
+    if count > 0 {
+        return Err(ReinitializeError::PartialResidueFound { count });
+    }
+    Ok(())
+}
+
+fn count_partial_files(path: &Path, count: &mut usize) -> Result<(), ReinitializeError> {
+    if !path.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(path).map_err(|source| ReinitializeError::Fs {
+        action: format!("scan partials {}", path.display()),
+        source,
+    })? {
+        let entry = entry.map_err(|source| ReinitializeError::Fs {
+            action: format!("scan partials {}", path.display()),
+            source,
+        })?;
+        let entry_path = entry.path();
+        let file_type = entry.file_type().map_err(|source| ReinitializeError::Fs {
+            action: format!("scan partials {}", entry_path.display()),
+            source,
+        })?;
+        if file_type.is_dir() {
+            count_partial_files(&entry_path, count)?;
+        } else if entry_path.extension().and_then(|value| value.to_str()) == Some("partial") {
+            *count += 1;
+        }
+    }
+    Ok(())
+}
+
 pub fn read_disk_info(mount_path: &Path) -> Result<DiskInfo, ReinitializeError> {
     let path = protocol_root(mount_path).join(DISK_INFO_FILE);
     let bytes = fs::read(&path).map_err(|source| ReinitializeError::Fs {
@@ -366,6 +404,8 @@ pub enum ReinitializeError {
         expected: Uuid,
         actual: Option<Uuid>,
     },
+    #[error("partial residue blocks reinitialize: {count} .partial files found")]
+    PartialResidueFound { count: usize },
     #[error("{action}: {source}")]
     Fs { action: String, source: io::Error },
     #[error("json error: {0}")]
@@ -485,12 +525,13 @@ mod tests {
             &mut self,
             disk_id: Uuid,
             seal_id: Uuid,
+            old_data_key_id: Uuid,
         ) -> Result<Option<CompletedImport>, ReinitializeError> {
-            Ok(self
-                .borrow()
-                .completed_import
-                .clone()
-                .filter(|job| job.disk_id == disk_id && job.seal_id == seal_id))
+            Ok(self.borrow().completed_import.clone().filter(|job| {
+                job.disk_id == disk_id
+                    && job.seal_id == seal_id
+                    && job.old_data_key_id == old_data_key_id
+            }))
         }
 
         fn set_runtime(
@@ -711,7 +752,92 @@ mod tests {
     }
 
     #[test]
+    fn partial_residue_rejects_without_cleaning_or_retiring_key() {
+        let temp = TempDisk::new();
+        let disk_id = Uuid::new_v4();
+        let seal_id = Uuid::new_v4();
+        let old_key = Uuid::new_v4();
+        write_disk_info(
+            &temp.path,
+            &imported_disk_info(disk_id, seal_id, old_key, &security()),
+        )
+        .unwrap();
+        fs::create_dir_all(temp.root().join("data")).unwrap();
+        fs::write(temp.root().join("data/object.enc.partial"), b"incomplete").unwrap();
+
+        let repo = RefCell::new(MemoryRepo {
+            completed_import: Some(CompletedImport {
+                import_job_id: Uuid::new_v4(),
+                disk_id,
+                seal_id,
+                old_data_key_id: old_key,
+            }),
+            ..Default::default()
+        });
+        let mut service = PostImportReinitializer::new(repo, template(), security());
+
+        let error = service
+            .reinitialize_imported_disk(&temp.path, disk_id, seal_id)
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ReinitializeError::PartialResidueFound { .. }
+        ));
+        let repo = service.repo.borrow();
+        assert_eq!(
+            repo.runtime,
+            vec![(RuntimeStatus::Error, Some(REINIT_FAILED.to_string()))]
+        );
+        assert_eq!(repo.active_key, None);
+        assert_eq!(repo.retired_key, None);
+    }
+
+    #[test]
+    fn completed_import_must_match_old_data_key_from_disk_info() {
+        let temp = TempDisk::new();
+        let disk_id = Uuid::new_v4();
+        let seal_id = Uuid::new_v4();
+        let disk_old_key = Uuid::new_v4();
+        write_disk_info(
+            &temp.path,
+            &imported_disk_info(disk_id, seal_id, disk_old_key, &security()),
+        )
+        .unwrap();
+
+        let repo = RefCell::new(MemoryRepo {
+            completed_import: Some(CompletedImport {
+                import_job_id: Uuid::new_v4(),
+                disk_id,
+                seal_id,
+                old_data_key_id: Uuid::new_v4(),
+            }),
+            ..Default::default()
+        });
+        let mut service = PostImportReinitializer::new(repo, template(), security());
+
+        let error = service
+            .reinitialize_imported_disk(&temp.path, disk_id, seal_id)
+            .unwrap_err();
+
+        assert!(matches!(error, ReinitializeError::ImportNotDone { .. }));
+        assert_eq!(
+            read_disk_info(&temp.path).unwrap().security.data_key_id,
+            disk_old_key
+        );
+    }
+
+    #[test]
     fn done_import_blocks_reimport_even_when_reinit_failed() {
+        let temp = TempDisk::new();
+        let disk_id = Uuid::new_v4();
+        let seal_id = Uuid::new_v4();
+        let old_key = Uuid::new_v4();
+        write_disk_info(
+            &temp.path,
+            &imported_disk_info(disk_id, seal_id, old_key, &security()),
+        )
+        .unwrap();
         let repo = RefCell::new(MemoryRepo {
             completed_import: Some(CompletedImport {
                 import_job_id: Uuid::new_v4(),
@@ -722,11 +848,9 @@ mod tests {
             ..Default::default()
         });
         let mut service = PostImportReinitializer::new(repo, template(), security());
-        let disk_id = Uuid::new_v4();
-        let seal_id = Uuid::new_v4();
 
         let error = service
-            .reinitialize_imported_disk(Path::new("unused"), disk_id, seal_id)
+            .reinitialize_imported_disk(&temp.path, disk_id, seal_id)
             .unwrap_err();
 
         assert!(matches!(error, ReinitializeError::ImportNotDone { .. }));

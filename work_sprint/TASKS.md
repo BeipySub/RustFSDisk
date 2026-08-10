@@ -110,6 +110,7 @@
 | TASK-S1-EDGE-005 | DiskWorker、加密写盘、metadata、manifest、封盘和导出 WS | P1 主闭环 | Edge | [x] | Day 2 上午 | TASK-S1-EDGE-004, TASK-S1-CENTER-003 |
 | TASK-S1-CENTER-004 | 导入 Worker、manifest 校验、解密上传、去重账本和导入 WS | P1 主闭环 | Center | [x] | Day 2 上午 | TASK-S1-CENTER-003, TASK-S1-TEST-001 |
 | TASK-S1-CENTER-005 | 导入后清理、重新初始化、密钥退役和失败恢复 | P1 主闭环 | Center | [x] | Day 2 下午 | TASK-S1-CENTER-004 |
+| TASK-S1-P1-CENTER-REINIT-API-001 | Center 受控清理重初始化生产 API | P1 主闭环 | Center | [x] | Day 2 VM 验收修补 | TASK-S1-CENTER-005 |
 | TASK-S1-WEB-EDGE-001 | 边缘端 DashboardView、HTTP 汇总和 WS 进度展示 | P2 交付增强 | Web / Edge | [x] | Day 1-2 | TASK-S1-TEST-001 |
 | TASK-S1-WEB-CENTER-001 | 中控端 DashboardView、HTTP 汇总和 WS 进度展示 | P2 交付增强 | Web / Center | [x] | Day 1-2 | TASK-S1-TEST-001 |
 | TASK-S1-DASHBOARD-REALTIME-001 | 双端真实 Dashboard HTTP summary 与本端 WebSocket 推送 | P0 解阻塞 | Center / Edge / Web | [x] | Day 2 联调修补 | TASK-S1-WEB-EDGE-001, TASK-S1-WEB-CENTER-001 |
@@ -1086,6 +1087,53 @@
 - [ ] 清理失败不会重复导入同一 `disk_id + seal_id`。
 - [ ] 重新初始化失败时新密钥不可发放。
 - [ ] 成功后运输盘可再次交付边缘端。
+
+---
+
+# 开发任务卡片：TASK-S1-P1-CENTER-REINIT-API-001
+
+### 任务基本信息
+
+- **任务 ID**：TASK-S1-P1-CENTER-REINIT-API-001
+- **任务名称**：Center 受控清理重初始化生产 API
+- **所属 Track / 模块**：
+  - [ ] Track 1: Common
+  - [ ] Track 2: Edge
+  - [x] Track 3: Center (`crates/center-backend`)
+  - [ ] Track 4: Web
+- **任务状态**：[x] 开发完成
+- **负责人 / Role**：Codex 串行合入/提交窗口
+- **计划时间**：Day 2 VM 验收修补
+- **依赖任务**：TASK-S1-CENTER-005
+
+### 任务目标与范围
+
+- **核心目标**：修补真实 VM 验收发现的 Center 部署态缺口，提供合法的受控 cleanup/reinitialize API，使已成功导入的 `IMPORTED` 运输盘可由 Center 清理封存数据并重新初始化为 `INITIALIZED`。
+- **对应代码位置**：`crates/center-backend/src/reinitialize_runtime.rs`、`crates/center-backend/src/reinitializer.rs`、`crates/center-backend/src/lib.rs`、`crates/center-backend/src/main.rs`
+
+### 协议与状态机约束
+
+- 新增 `POST /api/center/disks/{disk_id}/reinitialize`，继续使用 `X-Center-Control-Token`，请求必须包含 `mount_path`、`seal_id`、`expected_status_code=IMPORTED`、`operator_reason`、`confirm_reinitialize=true`。
+- 写盘前 guard 必须确认 ext4、盘内 `disk_info.status.code=IMPORTED`、disk/seal 身份匹配、Center 签名验签通过、manifest 和 sha256 sidecar 校验通过、`.partial` 数量为 0。
+- DB guard 必须确认 `import_job.status='DONE'`、目标盘仍启用、盘内 old `data_key_id` 属于同盘且状态为 `ISSUED` 或 `SEALED_READONLY`。
+- `CLEANING`、`REINITIALIZING` 仅作为运行态日志/响应语义，不写入盘内生命周期；最终盘内生命周期写回 `INITIALIZED`。
+- 成功后清理 `data/`、`meta/`、`manifests/` 等协议封存区，创建新 data key 并激活，旧 data key 仅在成功后进入 `RETIRED`。
+
+### 安全与审计边界
+
+- 不调用 Edge，不修改 RustFS 源对象，不删除或覆盖归档对象，不写 `object_ledger`。
+- 不允许通过 `/api/disk/initialize` 覆盖式绕过清理；重初始化必须走受控 API 和状态机 guard。
+- 任一 guard 失败时拒绝且盘维持原状；`.partial`、签名失败、manifest 失败、非 `IMPORTED`、非 ext4、其他 disk_id 均不得进入清理。
+- 明文 data key 不写日志、DB 或运输盘；新 key 沿用当前 Center `LOCAL-MASTER-KEY` 包裹和 HMAC disk_info 签名。
+- 本提交只完成代码合入和本地验证；真实 VM 尚未部署/验收，不得据此宣称目标盘已重新初始化完成。
+
+### 验收与检查清单
+
+- [x] 缺失或错误 `X-Center-Control-Token` 会拒绝且不触发服务。
+- [x] 非 `IMPORTED`、签名缺失/验签失败、manifest sha256 不匹配、`.partial` 残留、非 ext4、其他 disk_id 均拒绝且不清理。
+- [x] 成功路径清理封存 payload，盘内状态变为 `INITIALIZED`，响应使用 `disk_status_code`、`runtime_status`，无裸 `status`。
+- [x] 成功后新 data key 激活，旧 data key 退役；失败时旧 key 和盘内 `IMPORTED` 边界保留。
+- [x] `cargo fmt --all -- --check`、`cargo test -p rustfs-transfer-center`、`cargo test --workspace`、`scripts/check-deploy.ps1` 通过后独立提交。
 
 ---
 

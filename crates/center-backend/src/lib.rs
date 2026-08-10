@@ -11,7 +11,7 @@ use axum::{
     body::Body,
     extract::{
         ws::{Message, WebSocket},
-        State, WebSocketUpgrade,
+        Path as AxumPath, State, WebSocketUpgrade,
     },
     http::{HeaderMap, Request, StatusCode},
     response::Response,
@@ -33,6 +33,7 @@ pub mod center_security;
 pub mod config;
 pub mod import_runtime;
 pub mod import_worker;
+pub mod reinitialize_runtime;
 pub mod reinitializer;
 
 use center_security::{
@@ -50,6 +51,7 @@ pub struct AppState {
     service: CenterService,
     control_api_token: Option<String>,
     import_control: Option<Arc<dyn import_runtime::CenterImportControlService>>,
+    reinitialize_control: Option<Arc<dyn reinitialize_runtime::CenterReinitializeControlService>>,
 }
 
 impl AppState {
@@ -58,6 +60,7 @@ impl AppState {
             service,
             control_api_token: None,
             import_control: None,
+            reinitialize_control: None,
         }
     }
 
@@ -71,6 +74,14 @@ impl AppState {
         import_control: Arc<dyn import_runtime::CenterImportControlService>,
     ) -> Self {
         self.import_control = Some(import_control);
+        self
+    }
+
+    pub fn with_reinitialize_control(
+        mut self,
+        reinitialize_control: Arc<dyn reinitialize_runtime::CenterReinitializeControlService>,
+    ) -> Self {
+        self.reinitialize_control = Some(reinitialize_control);
         self
     }
 }
@@ -88,6 +99,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/disk/verify", post(verify_disk_handler))
         .route("/api/disk/export-key", post(export_key_handler))
         .route("/api/center/import-jobs/start", post(start_import_handler))
+        .route(
+            "/api/center/disks/{disk_id}/reinitialize",
+            post(reinitialize_disk_handler),
+        )
         .with_state(state)
         .layer(TraceLayer::new_for_http())
 }
@@ -1546,6 +1561,24 @@ async fn start_import_handler(
         .map_err(Into::into)
 }
 
+async fn reinitialize_disk_handler(
+    State(state): State<AppState>,
+    AxumPath(disk_id): AxumPath<Uuid>,
+    headers: HeaderMap,
+    Json(req): Json<reinitialize_runtime::CenterReinitializeRequest>,
+) -> Result<Json<reinitialize_runtime::CenterReinitializeResponse>, ApiError> {
+    authorize_center_control_api(&state, &headers)?;
+    let reinitialize_control = state
+        .reinitialize_control
+        .as_ref()
+        .ok_or_else(|| anyhow!("center reinitialize control service is not configured"))?;
+    reinitialize_control
+        .reinitialize_disk(disk_id, req)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
 fn authorize_center_control_api(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
     let configured = state
         .control_api_token
@@ -2195,6 +2228,123 @@ mod tests {
         assert_eq!(body["import_job_status"], "DONE");
         assert!(body.get("status").is_none());
         assert_eq!(control.calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn controlled_reinitialize_route_triggers_service_with_token() {
+        #[derive(Default)]
+        struct FakeReinitializeControl {
+            calls: Mutex<Vec<(Uuid, PathBuf)>>,
+        }
+
+        impl reinitialize_runtime::CenterReinitializeControlService for FakeReinitializeControl {
+            fn reinitialize_disk<'a>(
+                &'a self,
+                disk_id: Uuid,
+                request: reinitialize_runtime::CenterReinitializeRequest,
+            ) -> reinitialize_runtime::CenterReinitializeFuture<'a> {
+                Box::pin(async move {
+                    self.calls
+                        .lock()
+                        .unwrap()
+                        .push((disk_id, request.mount_path));
+                    Ok(reinitialize_runtime::CenterReinitializeResponse {
+                        disk_id,
+                        old_seal_id: request.seal_id,
+                        old_data_key_id: Uuid::new_v4(),
+                        new_data_key_id: Uuid::new_v4(),
+                        disk_status_code: reinitializer::DiskStatusCode::Initialized,
+                        runtime_status: "DONE".to_string(),
+                        message: "ok".to_string(),
+                    })
+                })
+            }
+        }
+
+        let disk_id = Uuid::new_v4();
+        let seal_id = Uuid::new_v4();
+        let control = Arc::new(FakeReinitializeControl::default());
+        let app = router(
+            AppState::new(memory_service())
+                .with_control_api_token(Some("center-control-token".to_string()))
+                .with_reinitialize_control(control.clone()),
+        );
+        let body = format!(
+            r#"{{
+                "mount_path":"C:\\transport\\FUSTFS-TST-A",
+                "seal_id":"{seal_id}",
+                "expected_status_code":"IMPORTED",
+                "operator_reason":"VM acceptance cleanup for FUSTFS-TST-A",
+                "confirm_reinitialize":true
+            }}"#
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/center/disks/{disk_id}/reinitialize"))
+                    .header("content-type", "application/json")
+                    .header("X-Center-Control-Token", "center-control-token")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["disk_status_code"], "INITIALIZED");
+        assert_eq!(body["runtime_status"], "DONE");
+        assert!(body.get("status").is_none());
+        assert_eq!(control.calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn controlled_reinitialize_route_rejects_missing_token() {
+        #[derive(Default)]
+        struct FakeReinitializeControl;
+
+        impl reinitialize_runtime::CenterReinitializeControlService for FakeReinitializeControl {
+            fn reinitialize_disk<'a>(
+                &'a self,
+                _disk_id: Uuid,
+                _request: reinitialize_runtime::CenterReinitializeRequest,
+            ) -> reinitialize_runtime::CenterReinitializeFuture<'a> {
+                Box::pin(async { panic!("reinitialize service must not be called without token") })
+            }
+        }
+
+        let disk_id = Uuid::new_v4();
+        let seal_id = Uuid::new_v4();
+        let app = router(
+            AppState::new(memory_service())
+                .with_control_api_token(Some("center-control-token".to_string()))
+                .with_reinitialize_control(Arc::new(FakeReinitializeControl)),
+        );
+        let body = format!(
+            r#"{{
+                "mount_path":"C:\\transport\\FUSTFS-TST-A",
+                "seal_id":"{seal_id}",
+                "expected_status_code":"IMPORTED",
+                "operator_reason":"VM acceptance cleanup for FUSTFS-TST-A",
+                "confirm_reinitialize":true
+            }}"#
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/center/disks/{disk_id}/reinitialize"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     async fn active_data_key_ids_for_disk(service: &CenterService, disk_id: Uuid) -> Vec<Uuid> {
