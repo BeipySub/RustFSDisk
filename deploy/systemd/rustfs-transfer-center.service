@@ -5,10 +5,23 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+User=rustfs-transfer
+Group=rustfs-transfer
+WorkingDirectory=/opt/rustfs-transfer
+Environment=RUSTFS_TRANSFER__CONFIG_PATH=/etc/rustfs-transfer/center.toml
+Environment=RUSTFS_TRANSFER__PATHS__DATA_DIR=/var/lib/rustfs-transfer/center
+Environment=RUSTFS_TRANSFER__PATHS__LOG_DIR=/var/log/rustfs-transfer/center
 ExecStart=/opt/rustfs-transfer/rustfs-transfer-center
 EnvironmentFile=-/etc/rustfs-transfer/center.env
 Restart=on-failure
 RestartSec=5s
+StateDirectory=rustfs-transfer/center
+LogsDirectory=rustfs-transfer/center
+RuntimeDirectory=rustfs-transfer-center
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/rustfs-transfer /var/log/rustfs-transfer /mnt /media /run
 
 [Install]
 WantedBy=multi-user.target

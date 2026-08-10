@@ -87,25 +87,34 @@
 
 | 任务 ID | 任务名称 | 优先级 | Track / 模块 | 状态 | 计划 | 依赖 |
 |---|---|---|---|---|---|---|
-| TASK-S1-COMMON-001 | 协议类型、状态枚举、HTTP/WS payload 和 golden JSON | P0 解阻塞 | Common | [ ] | Day 1 上午 | 无 |
+| TASK-S1-COMMON-001 | 协议类型、状态枚举、HTTP/WS payload 和 golden JSON | P0 解阻塞 | Common | [x] | Day 1 上午 | 无 |
 | TASK-S1-DB-001 | 双端 PostgreSQL 迁移补齐并冻结 DDL | P0 解阻塞 | DB | [x] | Day 1 上午 | 无 |
-| TASK-S1-COMMON-002 | HMAC、SHA256、AES-GCM 和 nonce 工具 | P0 解阻塞 | Common | [ ] | Day 1 上午 | TASK-S1-COMMON-001 可并行 |
-| TASK-S1-COMMON-003 | 运输盘协议文件、原子写、fsync、安全路径和 `.partial` 扫描 | P0 解阻塞 | Common | [ ] | Day 1 上午 | TASK-S1-COMMON-001 |
-| TASK-S1-TEST-001 | Fixture、模拟运输盘、manifest 样例和 HMAC 请求样例 | P0 解阻塞 | Tests | [ ] | Day 1 上午 | TASK-S1-COMMON-001 可并行 |
-| TASK-S1-CENTER-001 | 中控服务骨架、配置、DB/S3 adapter、health check | P0 解阻塞 | Center | [ ] | Day 1 上午 | TASK-S1-DB-001 |
-| TASK-S1-EDGE-001 | 边缘服务骨架、配置、中控 HMAC 客户端、DB/S3 adapter | P0 解阻塞 | Edge | [ ] | Day 1 上午 | TASK-S1-COMMON-002, TASK-S1-DB-001 |
-| TASK-S1-CENTER-002 | 中控 HMAC 鉴权、nonce 防重放和 `/api/edge/auth` | P1 主闭环 | Center | [ ] | Day 1 下午 | TASK-S1-COMMON-002, TASK-S1-CENTER-001 |
-| TASK-S1-CENTER-003 | 中控运输盘注册初始化、`/api/disk/verify`、`/api/disk/export-key` | P1 主闭环 | Center | [ ] | Day 1 下午 | TASK-S1-COMMON-003, TASK-S1-CENTER-002 |
-| TASK-S1-EDGE-002 | 边缘磁盘检测、ext4 校验、disk_info 校验和恢复入口 | P1 主闭环 | Edge | [ ] | Day 1 下午 | TASK-S1-COMMON-003, TASK-S1-EDGE-001 |
-| TASK-S1-EDGE-003 | RustFS 全 bucket 扫描、对象稳定性判断和快照入库 | P1 主闭环 | Edge | [ ] | Day 1 下午 | TASK-S1-EDGE-001 |
-| TASK-S1-EDGE-004 | 导出任务 Planner、容量预算、多盘分配事务和分块登记 | P1 主闭环 | Edge | [ ] | Day 1 下午 | TASK-S1-EDGE-002, TASK-S1-EDGE-003 |
-| TASK-S1-EDGE-005 | DiskWorker、加密写盘、metadata、manifest、封盘和导出 WS | P1 主闭环 | Edge | [ ] | Day 2 上午 | TASK-S1-EDGE-004, TASK-S1-CENTER-003 |
-| TASK-S1-CENTER-004 | 导入 Worker、manifest 校验、解密上传、去重账本和导入 WS | P1 主闭环 | Center | [ ] | Day 2 上午 | TASK-S1-CENTER-003, TASK-S1-TEST-001 |
-| TASK-S1-CENTER-005 | 导入后清理、重新初始化、密钥退役和失败恢复 | P1 主闭环 | Center | [ ] | Day 2 下午 | TASK-S1-CENTER-004 |
-| TASK-S1-WEB-EDGE-001 | 边缘端 DashboardView、HTTP 汇总和 WS 进度展示 | P2 交付增强 | Web / Edge | [ ] | Day 1-2 | TASK-S1-TEST-001 |
-| TASK-S1-WEB-CENTER-001 | 中控端 DashboardView、HTTP 汇总和 WS 进度展示 | P2 交付增强 | Web / Center | [ ] | Day 1-2 | TASK-S1-TEST-001 |
-| TASK-S1-DEPLOY-001 | systemd、udev、配置示例和本地联调脚本 | P2 交付增强 | Deploy | [ ] | Day 1-2 | TASK-S1-CENTER-001, TASK-S1-EDGE-001 |
-| TASK-S1-INTEGRATION-001 | 主闭环联调、验收、风险登记和交付检查 | P2 交付增强 | Integration | [ ] | Day 2 下午 | Day 2 主闭环任务 |
+| TASK-S1-COMMON-002 | HMAC、SHA256、AES-GCM 和 nonce 工具 | P0 解阻塞 | Common | [x] | Day 1 上午 | TASK-S1-COMMON-001 可并行 |
+| TASK-S1-COMMON-003 | 运输盘协议文件、原子写、fsync、安全路径和 `.partial` 扫描 | P0 解阻塞 | Common | [x] | Day 1 上午 | TASK-S1-COMMON-001 |
+| TASK-S1-TEST-001 | Fixture、模拟运输盘、manifest 样例和 HMAC 请求样例 | P0 解阻塞 | Tests | [x] | Day 1 上午 | TASK-S1-COMMON-001 可并行 |
+| TASK-S1-CENTER-001 | 中控服务骨架、配置、DB/S3 adapter、health check | P0 解阻塞 | Center | [x] | Day 1 上午 | TASK-S1-DB-001 |
+| TASK-S1-EDGE-001 | 边缘服务骨架、配置、中控 HMAC 客户端、DB/S3 adapter | P0 解阻塞 | Edge | [x] | Day 1 上午 | TASK-S1-COMMON-002, TASK-S1-DB-001 |
+| TASK-S1-CENTER-002 | 中控 HMAC 鉴权、nonce 防重放和 `/api/edge/auth` | P1 主闭环 | Center | [x] | Day 1 下午 | TASK-S1-COMMON-002, TASK-S1-CENTER-001 |
+| TASK-S1-CENTER-003 | 中控运输盘注册初始化、`/api/disk/verify`、`/api/disk/export-key` | P1 主闭环 | Center | [x] | Day 1 下午 | TASK-S1-COMMON-003, TASK-S1-CENTER-002 |
+| TASK-S1-CENTER-HOTFIX-001 | Center 初始化失败不得遗留可发放 ACTIVE data_key | P0 解阻塞 | Center | [x] | Day 2 联调修补 | TASK-S1-CENTER-003 |
+| TASK-S1-CENTER-HOTFIX-002 | Center verify/export-key 强制 Edge HMAC 鉴权 | P0 解阻塞 | Center / Edge | [x] | Day 2 审计修补 | TASK-S1-CENTER-002, TASK-S1-CENTER-003, TASK-S1-EDGE-001 |
+| TASK-S1-CENTER-HOTFIX-003 | Center 真实 data_key 包裹与 disk_info 签名验签 | P0 解阻塞 | Center / Security | [x] | Day 2 审计修补 | TASK-S1-CENTER-003, TASK-S1-CENTER-004, TASK-S1-CENTER-005 |
+| TASK-S1-P0-WORKER-RUNTIME-001 | 生产路径接入 DiskWorker / ImportWorker 受控触发 | P0 解阻塞 | Edge / Center | [x] | Day 2 审计修补 | TASK-S1-EDGE-005, TASK-S1-CENTER-004 |
+| TASK-S1-P0-EXPORT-RECOVERY-001 | Edge 失败导出任务受控零写入恢复 | P0 解阻塞 | Edge / Center | [x] | Day 2 联调修补 | TASK-S1-P0-WORKER-RUNTIME-001 |
+| TASK-S1-P0-EXPORT-RECOVERY-002 | Edge 恢复失败根因可机读审计与旧任务确认 | P0 解阻塞 | Edge | [x] | Day 2 VM 验收修补 | TASK-S1-P0-EXPORT-RECOVERY-001 |
+| TASK-S1-EDGE-002 | 边缘磁盘检测、ext4 校验、disk_info 校验和恢复入口 | P1 主闭环 | Edge | [x] | Day 1 下午 | TASK-S1-COMMON-003, TASK-S1-EDGE-001 |
+| TASK-S1-EDGE-HOTFIX-001 | Edge 真实挂载盘硬件 SN 探测修补 | P0 解阻塞 | Edge | [x] | Day 2 联调修补 | TASK-S1-EDGE-002, TASK-S1-CENTER-003 |
+| TASK-S1-EDGE-HOTFIX-002 | Edge RustFS S3 凭据显式注入修补 | P0 解阻塞 | Edge | [x] | Day 2 联调修补 | TASK-S1-EDGE-003 |
+| TASK-S1-EDGE-003 | RustFS 全 bucket 扫描、对象稳定性判断和快照入库 | P1 主闭环 | Edge | [x] | Day 1 下午 | TASK-S1-EDGE-001 |
+| TASK-S1-EDGE-004 | 导出任务 Planner、容量预算、多盘分配事务和分块登记 | P1 主闭环 | Edge | [x] | Day 1 下午 | TASK-S1-EDGE-002, TASK-S1-EDGE-003 |
+| TASK-S1-EDGE-005 | DiskWorker、加密写盘、metadata、manifest、封盘和导出 WS | P1 主闭环 | Edge | [x] | Day 2 上午 | TASK-S1-EDGE-004, TASK-S1-CENTER-003 |
+| TASK-S1-CENTER-004 | 导入 Worker、manifest 校验、解密上传、去重账本和导入 WS | P1 主闭环 | Center | [x] | Day 2 上午 | TASK-S1-CENTER-003, TASK-S1-TEST-001 |
+| TASK-S1-CENTER-005 | 导入后清理、重新初始化、密钥退役和失败恢复 | P1 主闭环 | Center | [x] | Day 2 下午 | TASK-S1-CENTER-004 |
+| TASK-S1-WEB-EDGE-001 | 边缘端 DashboardView、HTTP 汇总和 WS 进度展示 | P2 交付增强 | Web / Edge | [x] | Day 1-2 | TASK-S1-TEST-001 |
+| TASK-S1-WEB-CENTER-001 | 中控端 DashboardView、HTTP 汇总和 WS 进度展示 | P2 交付增强 | Web / Center | [x] | Day 1-2 | TASK-S1-TEST-001 |
+| TASK-S1-DASHBOARD-REALTIME-001 | 双端真实 Dashboard HTTP summary 与本端 WebSocket 推送 | P0 解阻塞 | Center / Edge / Web | [x] | Day 2 联调修补 | TASK-S1-WEB-EDGE-001, TASK-S1-WEB-CENTER-001 |
+| TASK-S1-DEPLOY-001 | systemd、udev、配置示例和本地联调脚本 | P2 交付增强 | Deploy | [x] | Day 1-2 | TASK-S1-CENTER-001, TASK-S1-EDGE-001 |
+| TASK-S1-INTEGRATION-001 | 主闭环联调、验收、风险登记和交付检查 | P2 交付增强 | Integration | [~] | Day 2 下午 | Day 2 主闭环任务 |
 
 ---
 
@@ -120,7 +129,7 @@
   - [ ] Track 2: Edge (`crates/edge-backend`)
   - [ ] Track 3: Center (`crates/center-backend`)
   - [ ] Track 4: Web (`web/`)
-- **任务状态**：[ ] 未开始
+- **任务状态**：[x] 开发完成
 - **负责人 / Role**：Agent A1
 - **计划时间**：Day 1 上午
 - **依赖任务**：无
@@ -160,7 +169,7 @@
   - [ ] Track 2: Edge (`crates/edge-backend`)
   - [ ] Track 3: Center (`crates/center-backend`)
   - [ ] Track 4: Web (`web/`)
-- **任务状态**：[ ] 未开始
+- **任务状态**：[x] 开发完成
 - **负责人 / Role**：Agent A2
 - **计划时间**：Day 1 上午
 - **依赖任务**：TASK-S1-COMMON-001 可并行
@@ -201,7 +210,7 @@
   - [ ] Track 2: Edge (`crates/edge-backend`)
   - [ ] Track 3: Center (`crates/center-backend`)
   - [ ] Track 4: Web (`web/`)
-- **任务状态**：[ ] 未开始
+- **任务状态**：[x] 开发完成
 - **负责人 / Role**：Agent A2
 - **计划时间**：Day 1 上午
 - **依赖任务**：TASK-S1-COMMON-001
@@ -283,7 +292,7 @@
   - [x] Track 2: Edge
   - [x] Track 3: Center
   - [x] Track 4: Tests (`tests/`)
-- **任务状态**：[ ] 未开始
+- **任务状态**：[x] 开发完成
 - **负责人 / Role**：Agent F
 - **计划时间**：Day 1 上午启动，Day 2 持续补齐
 - **依赖任务**：TASK-S1-COMMON-001 可并行
@@ -322,7 +331,7 @@
   - [ ] Track 2: Edge
   - [x] Track 3: Center (`crates/center-backend`)
   - [ ] Track 4: Web
-- **任务状态**：[ ] 未开始
+- **任务状态**：[x] 开发完成
 - **负责人 / Role**：Agent C1
 - **计划时间**：Day 1 上午
 - **依赖任务**：TASK-S1-DB-001
@@ -361,7 +370,7 @@
   - [ ] Track 2: Edge
   - [x] Track 3: Center (`crates/center-backend`)
   - [ ] Track 4: Web
-- **任务状态**：[ ] 未开始
+- **任务状态**：[x] 开发完成
 - **负责人 / Role**：Agent C1
 - **计划时间**：Day 1 下午
 - **依赖任务**：TASK-S1-COMMON-002, TASK-S1-CENTER-001
@@ -401,7 +410,7 @@
   - [ ] Track 2: Edge
   - [x] Track 3: Center (`crates/center-backend`)
   - [ ] Track 4: Web
-- **任务状态**：[ ] 未开始
+- **任务状态**：[x] 开发完成
 - **负责人 / Role**：Agent C2
 - **计划时间**：Day 1 下午
 - **依赖任务**：TASK-S1-COMMON-003, TASK-S1-CENTER-002
@@ -443,7 +452,7 @@
   - [x] Track 2: Edge (`crates/edge-backend`)
   - [ ] Track 3: Center
   - [ ] Track 4: Web
-- **任务状态**：[ ] 未开始
+- **任务状态**：[x] 开发完成
 - **负责人 / Role**：Agent D1
 - **计划时间**：Day 1 上午
 - **依赖任务**：TASK-S1-COMMON-002, TASK-S1-DB-001
@@ -471,6 +480,283 @@
 
 ---
 
+# 开发任务卡片：TASK-S1-CENTER-HOTFIX-001
+
+### 任务基本信息
+
+- **任务 ID**：TASK-S1-CENTER-HOTFIX-001
+- **任务名称**：Center 初始化失败不得遗留可发放 ACTIVE data_key
+- **所属 Track / 模块**：
+  - [ ] Track 1: Common
+  - [ ] Track 2: Edge
+  - [x] Track 3: Center (`crates/center-backend`)
+  - [ ] Track 4: Web
+- **任务状态**：[x] 开发完成
+- **负责人 / Role**：Codex 独立编码执行窗口
+- **计划时间**：Day 2 联调修补
+- **依赖任务**：TASK-S1-CENTER-003
+
+### 任务目标与范围
+
+- **核心目标**：修补 `/api/disk/initialize` 首次写盘失败后遗留 `ACTIVE` data_key 的一致性缺陷，确保重试成功后同盘只有盘内引用的新 key 可发放。
+- **对应代码位置**：`crates/center-backend/src/lib.rs`
+
+### 协议与数据结构约束
+
+- `disk_info.json.status.code` 仍以盘内生命周期为准，成功初始化写入 `INITIALIZED`。
+- `data_key.status` 仍只使用冻结枚举：`ACTIVE`、`ISSUED`、`SEALED_READONLY`、`RETIRED`、`REVOKED`。
+- 不新增协议字段，不修改 `docs/v1.0冻结/`。
+
+### 安全与状态机边界
+
+- 盘内目录、`disk_info.json`、原子 rename 或 `fsync` 失败时，新生成 key 不得处于可发放 `ACTIVE`。
+- 成功激活新初始化 key 时，仅撤销同盘未发放、未封盘的旧 `ACTIVE` key，不触碰 `ISSUED`、`SEALED_READONLY`、`RETIRED` 历史数据。
+- 明文 `disk_data_key` 只在初始化进程内存中短暂生成并包裹保存，不写入运输盘或边缘端数据库。
+
+### 验收与检查清单
+
+- [x] 回归测试覆盖写盘失败后没有新增可发放 `ACTIVE` key。
+- [x] 回归测试覆盖重试成功后同盘只有盘内引用的新 key 为 `ACTIVE`。
+- [x] `cargo fmt --all -- --check` 通过。
+- [x] `cargo test -p rustfs-transfer-center` 通过。
+
+---
+
+# 开发任务卡片：TASK-S1-CENTER-HOTFIX-002
+
+### 任务基本信息
+
+- **任务 ID**：TASK-S1-CENTER-HOTFIX-002
+- **任务名称**：Center verify/export-key 强制 Edge HMAC 鉴权
+- **所属 Track / 模块**：
+  - [ ] Track 1: Common
+  - [x] Track 2: Edge (`crates/edge-backend`)
+  - [x] Track 3: Center (`crates/center-backend`)
+  - [ ] Track 4: Web
+- **任务状态**：[x] 开发完成
+- **负责人 / Role**：Codex 串行合入执行窗口
+- **计划时间**：Day 2 审计修补
+- **依赖任务**：TASK-S1-CENTER-002, TASK-S1-CENTER-003, TASK-S1-EDGE-001
+
+### 任务目标与范围
+
+- **核心目标**：强制 `/api/disk/verify` 与 `/api/disk/export-key` 使用 Edge HMAC 请求鉴权，避免敏感磁盘校验与密钥发放接口被未签名请求调用。
+- **对应代码位置**：`crates/center-backend/src/center_auth.rs`、`crates/center-backend/src/lib.rs`、`crates/center-backend/tests/edge_auth.rs`、`crates/edge-backend/src/center_client.rs`
+
+### 协议与数据结构约束
+
+- 继续使用 common canonical HMAC：method、canonical path/query、timestamp、nonce、body SHA256 参与签名。
+- HMAC header 名大小写兼容 HTTP 行为；`edge_code` 身份来自鉴权 header，body 内若携带不一致 `edge_code` 必须拒绝。
+- 不新增 WebSocket 或跨端同步通道，不修改 `docs/v1.0冻结/`。
+
+### 安全与状态机边界
+
+- 缺失、错误、过期、重放、body hash/method/path 不匹配的签名请求返回 401，且不得进入业务逻辑。
+- 禁用 Edge 在业务逻辑前拒绝。
+- `/api/disk/export-key` 鉴权失败时不得泄露 `disk_data_key` 或 key 包裹材料。
+- Dashboard summary/WS 路由保持可用，管理类健康检查路由不纳入本 hotfix 范围。
+
+### 验收与检查清单
+
+- [x] `/api/disk/verify` 未签名请求被拒绝，正确签名请求通过。
+- [x] `/api/disk/export-key` 未签名请求被拒绝，正确签名请求通过且不序列化 `expires_at`。
+- [x] 回归测试覆盖 header 小写、重放 nonce、错误 timestamp、错误 body、错误 method/path、禁用 Edge。
+- [x] Edge client 签名与 Center shared canonical HMAC 验证保持一致。
+- [x] `cargo fmt --all -- --check` 通过。
+- [x] `cargo test -p rustfs-transfer-center` 通过。
+- [x] `cargo test -p rustfs-transfer-edge` 通过。
+- [x] `cargo test --workspace` 通过。
+- [x] 部署静态检查通过。
+
+---
+
+# 开发任务卡片：TASK-S1-CENTER-HOTFIX-003
+
+### 任务基本信息
+
+- **任务 ID**：TASK-S1-CENTER-HOTFIX-003
+- **任务名称**：Center 真实 data_key 包裹与 disk_info 签名验签
+- **所属 Track / 模块**：
+  - [ ] Track 1: Common
+  - [ ] Track 2: Edge
+  - [x] Track 3: Center (`crates/center-backend`)
+  - [x] Track 4: Deploy / Security
+- **任务状态**：[x] 开发完成
+- **负责人 / Role**：Codex 串行合入执行窗口
+- **计划时间**：Day 2 审计修补
+- **依赖任务**：TASK-S1-CENTER-003, TASK-S1-CENTER-004, TASK-S1-CENTER-005
+
+### 任务目标与范围
+
+- **核心目标**：替换 Center data_key 明文等价 mock 包裹和 `disk_info.json` mock 签名，实现上线前必须具备的真实密钥保护与签名验签。
+- **对应代码位置**：`crates/center-backend/src/center_security.rs`、`crates/center-backend/src/lib.rs`、`crates/center-backend/src/import_worker.rs`、`crates/center-backend/src/reinitializer.rs`、`deploy/`、`scripts/`
+
+### 协议与数据结构约束
+
+- `data_key.encrypted_key` 使用受控环境变量注入的本机主密钥执行 AES-256-GCM 包裹，`key_wrap_alg = LOCAL-MASTER-KEY`。
+- `disk_info.json.security.center_signature` 使用 HMAC-SHA256 和 canonical JSON 覆盖 `protocol`、`disk`、`center`、`security.center_key_id`、`security.signature_alg`、`security.data_key_id`。
+- 运输盘和 manifest 只保存 `data_key_id`、nonce、tag、校验值等非明文元数据。
+
+### 安全与状态机边界
+
+- 旧 `mock:v1:*`、`local-wrap:*` 或 mock signature 测试数据不得静默降级；必须拒绝发放、导入或重新初始化，并要求由 Center 重新初始化生成新 `data_key_id + disk_info.json`。
+- `RUSTFS_TRANSFER__SECURITY__LOCAL_MASTER_KEY` 和 `RUSTFS_TRANSFER__SECURITY__CENTER_SIGNATURE_KEY` 缺失、占位或非 32-byte 时 Center 启动失败。
+- `disk_info.json` 签名篡改、错误主密钥解包、盘内出现明文 key 等情况必须有回归测试覆盖。
+
+### 验收与检查清单
+
+- [x] data_key 包裹密文不包含明文 `disk_data_key` 等价内容。
+- [x] 错误主密钥无法解包旧密文。
+- [x] 初始化、导入、重新初始化路径写入或校验真实 `center_signature`。
+- [x] 篡改 `disk_info.json` 被拒绝。
+- [x] 启动安全配置缺失或占位值失败路径有测试。
+- [x] 旧 mock key wrap 被拒绝，真实盘需重新初始化迁移。
+- [x] `cargo fmt --all -- --check` 通过。
+- [x] `cargo test -p rustfs-transfer-common` 通过。
+- [x] `cargo test -p rustfs-transfer-center` 通过。
+
+---
+
+# 开发任务卡片：TASK-S1-P0-WORKER-RUNTIME-001
+
+### 任务基本信息
+
+- **任务 ID**：TASK-S1-P0-WORKER-RUNTIME-001
+- **任务名称**：生产路径接入 DiskWorker / ImportWorker 受控触发
+- **所属 Track / 模块**：
+  - [ ] Track 1: Common
+  - [x] Track 2: Edge (`crates/edge-backend`)
+  - [x] Track 3: Center (`crates/center-backend`)
+  - [ ] Track 4: Web
+- **任务状态**：[x] 开发完成
+- **负责人 / Role**：Codex 串行合入执行窗口
+- **计划时间**：Day 2 审计修补
+- **依赖任务**：TASK-S1-EDGE-005, TASK-S1-CENTER-004
+
+### 任务目标与范围
+
+- **核心目标**：修补生产主闭环断点，将已有 `DiskWorker` / `ImportWorker` 接入受控 HTTP API 与生产服务后台。
+- **对应代码位置**：`crates/edge-backend/src/control.rs`、`crates/edge-backend/src/export_runtime.rs`、`crates/center-backend/src/lib.rs`、`crates/center-backend/src/import_runtime.rs`
+
+### 协议与数据结构约束
+
+- Edge `POST /api/edge/export-jobs/{export_job_id}/start` 只在本地 control token 通过后分配 READY 盘对象并启动 `DiskWorker`。
+- `DiskWorker` 启动前必须通过 HMAC `CenterHmacClient` 调用 `/api/disk/export-key` 领取内存态 `disk_data_key`。
+- Center `POST /api/center/import-jobs/start` 使用 `X-Center-Control-Token`，请求必须显式传入 `mount_path`。
+- API 响应继续使用 `export_job_status`、`import_job_status` 等语义字段，不新增裸 `status`。
+
+### 安全与状态机边界
+
+- 服务启动扫描、udev rescan 和 READY 运行态不得自动写盘、自动导出或自动导入。
+- 明文 `disk_data_key` 不得来自配置、请求或数据库，不得写入日志、数据库或运输盘。
+- Center/Edge 在线交互仍只走 HTTP HMAC API；WebSocket 只用于本端前端进度推送。
+- ImportWorker 失败路径不得写 `IMPORTED`，不得写入 `object_ledger`。
+
+### 验收与检查清单
+
+- [x] Edge start API 分配后启动 `DiskWorker`，且只处理本次分配到对象的盘。
+- [x] Edge export key 通过 HMAC client 获取，明文 key 只在内存中传入 worker。
+- [x] Center 导入必须通过受控 token API 显式触发。
+- [x] 生产 `ImportRepository` 解包 Center 安全包裹 data_key，并沿用 disk_info 签名验签。
+- [x] `cargo fmt --all -- --check` 通过。
+- [x] `cargo test -p rustfs-transfer-edge` 通过。
+- [x] `cargo test -p rustfs-transfer-center` 通过。
+
+---
+
+# 开发任务卡片：TASK-S1-P0-EXPORT-RECOVERY-001
+
+### 任务基本信息
+
+- **任务 ID**：TASK-S1-P0-EXPORT-RECOVERY-001
+- **任务名称**：Edge 失败导出任务受控零写入恢复
+- **所属 Track / 模块**：
+  - [ ] Track 1: Common
+  - [x] Track 2: Edge (`crates/edge-backend`)
+  - [x] Track 3: Center (`crates/center-backend`)
+  - [ ] Track 4: Web
+- **任务状态**：[x] 开发完成
+- **负责人 / Role**：Codex 串行合入执行窗口
+- **计划时间**：Day 2 联调修补
+- **依赖任务**：TASK-S1-P0-WORKER-RUNTIME-001
+
+### 任务目标与范围
+
+- **核心目标**：为写盘前失败的原导出任务提供受控恢复入口，复用原 `export_job_id`、原 `ASSIGNED` 对象和原盘 assignment，不创建新 job、不绕过 Center key 状态机。
+- **对应代码位置**：`crates/edge-backend/src/control.rs`、`crates/edge-backend/src/server.rs`、`crates/edge-backend/src/export_runtime.rs`、`crates/center-backend/src/lib.rs`
+
+### 协议与数据结构约束
+
+- Edge 新增本端受控 API：`POST /api/edge/export-jobs/{export_job_id}/recover`，必须使用 `X-Edge-Control-Token`。
+- 恢复只允许 `export_job.status = FAILED` 且 `copied_count = 0`、`copied_bytes = 0`。
+- 所有 `export_object` 必须仍为 `ASSIGNED`，且不得已有 hash、nonce、tag、partial/data/meta 路径等写盘字段。
+- API 响应使用 `export_job_status`、`recovered_disk_count`、`worker_started_count`、`worker_failed_count`，不新增裸 `status`。
+
+### 安全与状态机边界
+
+- 恢复前必须确认原盘最新 `disk_runtime.status = READY`、无 partial residue、盘内 `disk_info.json.status.code = INITIALIZED`、`disk_id` 匹配、`data/`、`meta/`、`manifests/` 无残留文件。
+- 只允许写前失败分类恢复；`SOURCE_CHANGED`、checksum/decrypt、sealed、manifest invalid、partial、disk full、disk removed 等失败不允许自动恢复。
+- 恢复会向 `export_job.error_message` 追加 `export_recovery_requested_at` 与 `recovery_reason`，保留原失败信息。
+- Center `/api/disk/export-key` 继续保持同 `export_job_id` 幂等；不同 job 不能接管已 `ISSUED` 的 data_key。
+
+### 验收与检查清单
+
+- [x] 无 `X-Edge-Control-Token` 的 recover 请求被拒绝。
+- [x] recover 响应无裸 `status`。
+- [x] 非 `FAILED` job 会拒绝恢复。
+- [x] 对象已有写盘字段或非 `ASSIGNED` 会拒绝恢复。
+- [x] 干净 `INITIALIZED` 原盘通过，data/meta/manifest/partial 残留拒绝。
+- [x] 失败原因分类只允许写前阶段。
+- [x] Center 同 job export-key 幂等、不同 job 拒绝有测试覆盖。
+
+---
+
+# 开发任务卡片：TASK-S1-P0-EXPORT-RECOVERY-002
+
+### 任务基本信息
+
+- **任务 ID**：TASK-S1-P0-EXPORT-RECOVERY-002
+- **任务名称**：Edge 恢复失败根因可机读审计与旧任务确认
+- **所属 Track / 模块**：
+  - [ ] Track 1: Common
+  - [x] Track 2: Edge (`crates/edge-backend`)
+  - [ ] Track 3: Center
+  - [ ] Track 4: Web
+- **任务状态**：[x] 开发完成
+- **负责人 / Role**：Codex 串行合入执行窗口
+- **计划时间**：Day 2 VM 验收修补
+- **依赖任务**：TASK-S1-P0-EXPORT-RECOVERY-001
+
+### 任务目标与范围
+
+- **核心目标**：修补真实 VM 验收发现的恢复入口缺陷：生产 worker 失败聚合必须保留可机读失败代码和阶段，recover guard 不能把任意 generic worker 失败判为可恢复。
+- **对应代码位置**：`crates/edge-backend/src/export_runtime.rs`、`crates/edge-backend/src/control.rs`、`crates/edge-backend/src/server.rs`
+
+### 协议与状态机约束
+
+- worker 失败会追加到 `export_job.error_message`，包含 `export_failure_code`、`export_failure_stage`、`worker_error_code` 和 `worker_error_message`。
+- `recover` 请求新增受控字段：`admin_confirm_write_before_zero_copy` 和 `write_before_failure_code`，用于旧 generic failed job 的管理员确认。
+- 新失败优先通过 `export_failure_stage=WRITE_BEFORE` 加白名单 `export_failure_code` 判定可恢复。
+- 旧 failed job 只有在零写入证据全部通过，且管理员确认字段为 true 并提供白名单 `write_before_failure_code` 时才允许恢复。
+
+### 安全与审计边界
+
+- 未知 generic 聚合错误默认拒绝。
+- `SOURCE_CHANGED`、校验失败、解密失败、partial、磁盘满、拔盘和写后阶段失败均拒绝恢复。
+- 已写对象字段、manifest/data/meta/`.partial` 残留拒绝逻辑不放宽。
+- 不新增 job、不重新分配对象、不直接 SQL 绕过状态机。
+
+### 验收与检查清单
+
+- [x] `MANIFEST_INVALID` 权限类写前失败会持久化为可机读 `WRITE_BEFORE` 审计。
+- [x] 带可机读写前 marker 的失败允许恢复。
+- [x] 未知 generic worker 失败拒绝恢复。
+- [x] 旧 generic worker 失败必须管理员确认加白名单代码才允许恢复。
+- [x] 已写/partial/manifest 拒绝规则保持。
+- [x] Edge recover route 测试覆盖新 DTO 字段且响应无裸 `status`。
+
+---
+
 # 开发任务卡片：TASK-S1-EDGE-002
 
 ### 任务基本信息
@@ -482,7 +768,7 @@
   - [x] Track 2: Edge (`crates/edge-backend`)
   - [ ] Track 3: Center
   - [ ] Track 4: Web
-- **任务状态**：[ ] 未开始
+- **任务状态**：[x] 开发完成
 - **负责人 / Role**：Agent D1
 - **计划时间**：Day 1 下午
 - **依赖任务**：TASK-S1-COMMON-003, TASK-S1-EDGE-001
@@ -511,6 +797,93 @@
 
 ---
 
+# 开发任务卡片：TASK-S1-EDGE-HOTFIX-001
+
+### 任务基本信息
+
+- **任务 ID**：TASK-S1-EDGE-HOTFIX-001
+- **任务名称**：Edge 真实挂载盘硬件 SN 探测修补
+- **所属 Track / 模块**：
+  - [ ] Track 1: Common
+  - [x] Track 2: Edge (`crates/edge-backend`)
+  - [ ] Track 3: Center
+  - [ ] Track 4: Web
+- **任务状态**：[x] 开发完成
+- **负责人 / Role**：Codex 独立编码执行窗口
+- **计划时间**：Day 2 联调修补
+- **依赖任务**：TASK-S1-EDGE-002, TASK-S1-CENTER-003
+
+### 任务目标与范围
+
+- **核心目标**：修补真实 Edge 重新扫描时 `ConfiguredMountProbe` 将挂载目录名或 label 当作 `sn` 发送给 Center 的缺陷，确保 `/api/disk/verify` payload 使用硬件 SN。
+- **对应代码位置**：`crates/edge-backend/src/disk_detection.rs`
+
+### 协议与数据结构约束
+
+- 业务主身份仍为盘内 `disk_info.json.disk.disk_id` 和协议生命周期，硬件 SN 只作为 Center 注册记录的辅助校验。
+- Edge verify 请求继续使用 `edge_code`、`disk_id`、`sn`、`capacity_bytes`、`free_bytes`、`status_code`、`protocol_version`，不得新增裸 `status`。
+- 探测层读取并保留设备路径、FS UUID、label、`ID_SERIAL_SHORT` 和 `ID_SERIAL`；`sn` 优先使用 `ID_SERIAL_SHORT`，其次 `ID_SERIAL`。
+
+### 安全与状态机边界
+
+- 非 ext4 仍在本地拒绝并记录 `FILESYSTEM_UNSUPPORTED`，不得进入 Center verify。
+- ext4 盘无法读取硬件 SN 时，本地拒绝并记录 `HARDWARE_SN_UNAVAILABLE`，不得向 Center 发送 `sn = null` 后进入任务池。
+- `FUSTFS-TST-A` 等挂载目录名或文件系统 label 不得替代硬件 SN。
+
+### 验收与检查清单
+
+- [x] 回归测试覆盖 `ConfiguredMountProbe` 不使用挂载目录名作为硬件 SN。
+- [x] 回归测试覆盖 verify payload 使用硬件 SN，且缺失硬件 SN 时不会调用 Center。
+- [x] `cargo fmt --all -- --check` 通过。
+- [x] `cargo test -p rustfs-transfer-edge` 通过。
+- [x] 部署静态检查通过。
+
+---
+
+# 开发任务卡片：TASK-S1-EDGE-HOTFIX-002
+
+### 任务基本信息
+
+- **任务 ID**：TASK-S1-EDGE-HOTFIX-002
+- **任务名称**：Edge RustFS S3 凭据显式注入修补
+- **所属 Track / 模块**：
+  - [ ] Track 1: Common
+  - [x] Track 2: Edge (`crates/edge-backend`)
+  - [ ] Track 3: Center
+  - [ ] Track 4: Web
+- **任务状态**：[x] 开发完成
+- **负责人 / Role**：Codex 独立编码执行窗口
+- **计划时间**：Day 2 联调修补
+- **依赖任务**：TASK-S1-EDGE-003
+
+### 任务目标与范围
+
+- **核心目标**：修补 Edge RustFS/S3 adapter 未显式使用 `edge.toml` 中 `rustfs.access_key_id` / `rustfs.secret_access_key` 的问题，避免系统环境没有 AWS SDK 凭据变量时 `/api/edge/scan` 返回 `rustfs operation failed: dispatch failure`。
+- **对应代码位置**：`crates/edge-backend/src/adapters.rs`、`crates/edge-backend/src/config.rs`、`crates/edge-backend/src/server.rs`
+
+### 协议与数据结构约束
+
+- 不新增 API、WebSocket、manifest 字段。
+- 保留 RustFS endpoint、region 和既有 AWS SDK endpoint/TLS 行为。
+- 配置环境变量覆盖继续使用 `RUSTFS_TRANSFER__` 前缀。
+
+### 安全与状态机边界
+
+- 不日志输出 `secret_access_key`，不把 RustFS S3 凭据写入数据库或运输盘。
+- `edge_auth_secret` 仍只用于 Edge 调用 Center HTTP API 鉴权，不复用于 RustFS/S3。
+- Edge scan 仍只走 List/HEAD 读路径，不删除、覆盖或修改 RustFS 源对象。
+
+### 验收与检查清单
+
+- [x] Edge S3 adapter 使用配置提供的静态凭据构造 `aws-sdk-s3` client。
+- [x] 缺少 `rustfs.access_key_id` 或 `rustfs.secret_access_key` 时返回明确配置错误。
+- [x] 回归测试覆盖无 AWS 系统环境变量时凭据来自 Edge 配置。
+- [x] `cargo fmt --all -- --check` 通过。
+- [x] `cargo test -p rustfs-transfer-edge` 通过。
+- [x] 部署静态检查通过。
+
+---
+
 # 开发任务卡片：TASK-S1-EDGE-003
 
 ### 任务基本信息
@@ -522,7 +895,7 @@
   - [x] Track 2: Edge (`crates/edge-backend`)
   - [ ] Track 3: Center
   - [ ] Track 4: Web
-- **任务状态**：[ ] 未开始
+- **任务状态**：[x] 开发完成
 - **负责人 / Role**：Agent D2
 - **计划时间**：Day 1 下午
 - **依赖任务**：TASK-S1-EDGE-001
@@ -562,7 +935,7 @@
   - [x] Track 2: Edge (`crates/edge-backend`)
   - [ ] Track 3: Center
   - [ ] Track 4: Web
-- **任务状态**：[ ] 未开始
+- **任务状态**：[x] 开发完成
 - **负责人 / Role**：Agent D2
 - **计划时间**：Day 1 下午
 - **依赖任务**：TASK-S1-EDGE-002, TASK-S1-EDGE-003
@@ -603,7 +976,7 @@
   - [x] Track 2: Edge (`crates/edge-backend`)
   - [ ] Track 3: Center
   - [x] Track 4: Web contract
-- **任务状态**：[ ] 未开始
+- **任务状态**：[x] 开发完成
 - **负责人 / Role**：Agent D1/D2
 - **计划时间**：Day 2 上午
 - **依赖任务**：TASK-S1-EDGE-004, TASK-S1-CENTER-003
@@ -644,7 +1017,7 @@
   - [ ] Track 2: Edge
   - [x] Track 3: Center (`crates/center-backend`)
   - [x] Track 4: Web contract
-- **任务状态**：[ ] 未开始
+- **任务状态**：[x] 开发完成
 - **负责人 / Role**：Agent C1/C2
 - **计划时间**：Day 2 上午
 - **依赖任务**：TASK-S1-CENTER-003, TASK-S1-TEST-001
@@ -686,7 +1059,7 @@
   - [ ] Track 2: Edge
   - [x] Track 3: Center (`crates/center-backend`)
   - [ ] Track 4: Web
-- **任务状态**：[ ] 未开始
+- **任务状态**：[x] 开发完成
 - **负责人 / Role**：Agent C2
 - **计划时间**：Day 2 下午
 - **依赖任务**：TASK-S1-CENTER-004
@@ -727,7 +1100,7 @@
   - [ ] Track 2: Edge
   - [ ] Track 3: Center
   - [x] Track 4: Web (`web/edge-web`)
-- **任务状态**：[ ] 未开始
+- **任务状态**：[x] 开发完成
 - **负责人 / Role**：Agent E1
 - **计划时间**：Day 1-2
 - **依赖任务**：TASK-S1-TEST-001
@@ -749,9 +1122,9 @@
 
 ### 验收与检查清单
 
-- [ ] 展示扫描状态、盘列表、拷贝进度、当前对象、速度、错误。
-- [ ] WS 断开和页面刷新能恢复 HTTP 汇总状态。
-- [ ] 非 ext4、未注册、拔盘、空间不足和恢复要求均有展示。
+- [x] 展示扫描状态、盘列表、拷贝进度、当前对象、速度、错误。
+- [x] WS 断开和页面刷新能恢复 HTTP 汇总状态。
+- [x] 非 ext4、未注册、拔盘、空间不足和恢复要求均有展示。
 
 ---
 
@@ -766,7 +1139,7 @@
   - [ ] Track 2: Edge
   - [ ] Track 3: Center
   - [x] Track 4: Web (`web/center-web`)
-- **任务状态**：[ ] 未开始
+- **任务状态**：[x] 开发完成
 - **负责人 / Role**：Agent E2
 - **计划时间**：Day 1-2
 - **依赖任务**：TASK-S1-TEST-001
@@ -788,9 +1161,9 @@
 
 ### 验收与检查清单
 
-- [ ] 展示注册/初始化状态、待导入盘、导入进度、当前对象、速度、错误、是否可复用。
-- [ ] 重复插入已导入硬盘不会显示为待导入。
-- [ ] `REINIT_FAILED` 有明确展示。
+- [x] 展示注册/初始化状态、待导入盘、导入进度、当前对象、速度、错误、是否可复用。
+- [x] 重复插入已导入硬盘不会显示为待导入。
+- [x] `REINIT_FAILED` 有明确展示。
 
 ---
 
@@ -805,7 +1178,7 @@
   - [x] Track 2: Edge (`deploy/`, `scripts/`)
   - [x] Track 3: Center (`deploy/`, `scripts/`)
   - [ ] Track 4: Web
-- **任务状态**：[ ] 未开始
+- **任务状态**：[x] 开发完成
 - **负责人 / Role**：Agent F
 - **计划时间**：Day 1-2
 - **依赖任务**：TASK-S1-CENTER-001, TASK-S1-EDGE-001
@@ -833,6 +1206,54 @@
 
 ---
 
+# 开发任务卡片：TASK-S1-DASHBOARD-REALTIME-001
+
+### 任务基本信息
+
+- **任务 ID**：TASK-S1-DASHBOARD-REALTIME-001
+- **任务名称**：双端真实 Dashboard HTTP summary 与本端 WebSocket 推送
+- **所属 Track / 模块**：
+  - [ ] Track 1: Common
+  - [x] Track 2: Edge (`crates/edge-backend`)
+  - [x] Track 3: Center (`crates/center-backend`)
+  - [x] Track 4: Web contract
+- **任务状态**：[x] 开发完成
+- **负责人 / Role**：Codex 串行合入执行窗口
+- **计划时间**：Day 2 联调修补
+- **依赖任务**：TASK-S1-WEB-EDGE-001, TASK-S1-WEB-CENTER-001
+
+### 任务目标与范围
+
+- **核心目标**：补齐双端 Dashboard 刷新后的真实 HTTP summary 和运行中本端 WebSocket 推送入口，替换前端 fixture/mock 数据源。
+- **对应代码位置**：`crates/center-backend/src/lib.rs`、`crates/edge-backend/src/control.rs`、`crates/edge-backend/src/server.rs`
+
+### 协议与数据结构约束
+
+- Center HTTP：`GET /api/center/summary`。
+- Center WS：`GET /ws/center/import-progress`，兼容前端默认 `/ws/center/progress`，事件使用 `IMPORT_PROGRESS`。
+- Edge HTTP：`GET /api/edge/summary`。
+- Edge WS：`GET /ws/edge/copy-progress`，兼容前端默认 `/ws/edge/progress`，事件使用 `COPY_PROGRESS`。
+- 输出继续使用 `disk_status_code`、`runtime_status`、`export_job_status`、`import_job_status`、`disk_enabled` 等语义字段。
+
+### 安全与状态机边界
+
+- WebSocket 只服务本端前端展示，不用于 Center/Edge 之间同步。
+- 不新增导出、导入、清理或初始化写路径。
+- Edge HTTP control token 保护保持不变；前端部署代理继续负责本地注入读取 summary 所需 token。
+
+### 验收与检查清单
+
+- [x] Edge Dashboard 页面刷新后调用真实 `/api/edge/summary`。
+- [x] Center Dashboard 页面刷新后调用真实 `/api/center/summary`。
+- [x] 双端 WS 输出事件无裸 `status` 字段。
+- [x] `cargo fmt --all -- --check` 通过。
+- [x] `cargo test -p rustfs-transfer-center` 通过。
+- [x] `cargo test -p rustfs-transfer-edge` 通过。
+- [x] 双端前端 typecheck/build 通过。
+- [x] 部署静态检查通过。
+
+---
+
 # 开发任务卡片：TASK-S1-INTEGRATION-001
 
 ### 任务基本信息
@@ -844,7 +1265,7 @@
   - [x] Track 2: Edge
   - [x] Track 3: Center
   - [x] Track 4: Web / Deploy / Tests
-- **任务状态**：[ ] 未开始
+- **任务状态**：[~] 开发中
 - **负责人 / Role**：首席系统架构师 / Agent F
 - **计划时间**：Day 2 下午
 - **依赖任务**：Day 2 主闭环任务
@@ -867,7 +1288,7 @@
 ### 验收与检查清单
 
 - [ ] 后端测试或等价检查通过。
-- [ ] 前端构建或类型检查通过。
+- [x] 前端构建或类型检查通过。
 - [ ] 迁移脚本可在空库执行。
 - [ ] 主闭环联调记录写入当天 dev log。
 - [ ] 未完成项已回写对应任务卡和 dev log。

@@ -5,10 +5,23 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+User=rustfs-transfer
+Group=rustfs-transfer
+WorkingDirectory=/opt/rustfs-transfer
+Environment=RUSTFS_TRANSFER__CONFIG_PATH=/etc/rustfs-transfer/edge.toml
+Environment=RUSTFS_TRANSFER__PATHS__DATA_DIR=/var/lib/rustfs-transfer/edge
+Environment=RUSTFS_TRANSFER__PATHS__LOG_DIR=/var/log/rustfs-transfer/edge
 ExecStart=/opt/rustfs-transfer/rustfs-transfer-edge
 EnvironmentFile=-/etc/rustfs-transfer/edge.env
 Restart=on-failure
 RestartSec=5s
+StateDirectory=rustfs-transfer/edge
+LogsDirectory=rustfs-transfer/edge
+RuntimeDirectory=rustfs-transfer-edge
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/rustfs-transfer /var/log/rustfs-transfer /mnt /media /run
 
 [Install]
 WantedBy=multi-user.target

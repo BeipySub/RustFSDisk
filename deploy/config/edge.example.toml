@@ -1,17 +1,27 @@
 [server]
 bind = "0.0.0.0:8081"
+control_api_token_env = "RUSTFS_TRANSFER__SERVER__CONTROL_API_TOKEN"
 
 [database]
-url = "postgres://user:password@127.0.0.1:5432/rustfs_transfer_edge"
+url = "postgres://rustfs_transfer_edge:change-me@127.0.0.1:5432/rustfs_transfer_edge"
 
 [center]
 base_url = "http://center.example.com:8080"
+edge_code = "edge-demo"
+auth_key_id = "CHANGE_ME_AUTH_KEY_ID"
+edge_auth_secret_env = "RUSTFS_TRANSFER__CENTER__EDGE_AUTH_SECRET"
 
 [rustfs]
 endpoint = "http://127.0.0.1:9000"
 region = "us-east-1"
+access_key_id = "CHANGE_ME_ACCESS_KEY"
+secret_access_key = "CHANGE_ME_SECRET_KEY"
 
 [paths]
-data_dir = "/var/lib/rustfs-transfer"
-log_dir = "/var/log/rustfs-transfer"
+data_dir = "/var/lib/rustfs-transfer/edge"
+log_dir = "/var/log/rustfs-transfer/edge"
+transport_mount_root = "/mnt/rustfs-transfer"
+
+[rescan]
+token_env = "RUSTFS_TRANSFER__RESCAN__TOKEN"
 

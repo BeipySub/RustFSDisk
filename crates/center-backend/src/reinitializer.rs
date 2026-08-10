@@ -1,0 +1,817 @@
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::fs::{self, File};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use thiserror::Error;
+use uuid::Uuid;
+
+use crate::center_security::{CenterSecurity, ENCRYPTION_ALG_AES_256_GCM};
+
+pub const PROTOCOL_ROOT: &str = "rustfs-transfer";
+pub const DISK_INFO_FILE: &str = "disk_info.json";
+pub const REINIT_FAILED: &str = "REINIT_FAILED";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeStatus {
+    Cleaning,
+    Reinitializing,
+    Done,
+    Error,
+}
+
+impl RuntimeStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cleaning => "CLEANING",
+            Self::Reinitializing => "REINITIALIZING",
+            Self::Done => "DONE",
+            Self::Error => "ERROR",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletedImport {
+    pub import_job_id: Uuid,
+    pub disk_id: Uuid,
+    pub seal_id: Uuid,
+    pub old_data_key_id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewDataKey {
+    pub data_key_id: Uuid,
+    pub encrypted_key: String,
+    pub encryption_alg: String,
+    pub key_wrap_alg: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReinitializedDisk {
+    pub disk_id: Uuid,
+    pub old_seal_id: Uuid,
+    pub old_data_key_id: Uuid,
+    pub new_data_key_id: Uuid,
+}
+
+pub trait PostImportRepository {
+    fn completed_import(
+        &mut self,
+        disk_id: Uuid,
+        seal_id: Uuid,
+    ) -> Result<Option<CompletedImport>, ReinitializeError>;
+
+    fn set_runtime(
+        &mut self,
+        disk_id: Uuid,
+        runtime_status: RuntimeStatus,
+        last_error_code: Option<&str>,
+        error_message: Option<&str>,
+    ) -> Result<(), ReinitializeError>;
+
+    fn stage_new_data_key(
+        &mut self,
+        disk_id: Uuid,
+        data_key: &NewDataKey,
+    ) -> Result<(), ReinitializeError>;
+
+    fn abort_staged_data_key(&mut self, data_key_id: Uuid) -> Result<(), ReinitializeError>;
+
+    fn activate_new_key_and_retire_old_key(
+        &mut self,
+        disk_id: Uuid,
+        new_data_key_id: Uuid,
+        old_data_key_id: Uuid,
+    ) -> Result<(), ReinitializeError>;
+}
+
+#[derive(Debug, Clone)]
+pub struct DiskInfoTemplate {
+    pub protocol_version: String,
+    pub center_id: Uuid,
+    pub center_name: Option<String>,
+    pub center_key_id: Uuid,
+    pub signature_alg: String,
+}
+
+pub struct PostImportReinitializer<R> {
+    repo: R,
+    template: DiskInfoTemplate,
+    security: CenterSecurity,
+}
+
+impl<R> PostImportReinitializer<R>
+where
+    R: PostImportRepository,
+{
+    pub fn new(repo: R, template: DiskInfoTemplate, security: CenterSecurity) -> Self {
+        Self {
+            repo,
+            template,
+            security,
+        }
+    }
+
+    pub fn reinitialize_imported_disk(
+        &mut self,
+        mount_path: &Path,
+        disk_id: Uuid,
+        seal_id: Uuid,
+    ) -> Result<ReinitializedDisk, ReinitializeError> {
+        let import = self
+            .repo
+            .completed_import(disk_id, seal_id)?
+            .ok_or(ReinitializeError::ImportNotDone { disk_id, seal_id })?;
+
+        let previous_disk_info = read_disk_info(mount_path)?;
+        validate_imported_disk_info(&previous_disk_info, disk_id, seal_id)?;
+        self.security
+            .verify_disk_info(&previous_disk_info)
+            .map_err(|error| ReinitializeError::SignatureInvalid(error.to_string()))?;
+
+        let result =
+            self.reinitialize_after_validated_import(mount_path, &import, &previous_disk_info);
+        if let Err(error) = &result {
+            let _ = write_disk_info(mount_path, &previous_disk_info);
+            let _ = self.repo.set_runtime(
+                disk_id,
+                RuntimeStatus::Error,
+                Some(REINIT_FAILED),
+                Some(&error.to_string()),
+            );
+        }
+        result
+    }
+
+    fn reinitialize_after_validated_import(
+        &mut self,
+        mount_path: &Path,
+        import: &CompletedImport,
+        previous_disk_info: &DiskInfo,
+    ) -> Result<ReinitializedDisk, ReinitializeError> {
+        self.repo
+            .set_runtime(import.disk_id, RuntimeStatus::Cleaning, None, None)?;
+        clean_sealed_payload(mount_path)?;
+
+        self.repo
+            .set_runtime(import.disk_id, RuntimeStatus::Reinitializing, None, None)?;
+        create_protocol_dirs(mount_path)?;
+
+        let new_key = generate_data_key(import.disk_id, &self.security)?;
+        self.repo.stage_new_data_key(import.disk_id, &new_key)?;
+
+        let initialized_disk_info = self.initialized_disk_info(previous_disk_info, &new_key);
+        if let Err(error) = write_disk_info(mount_path, &initialized_disk_info) {
+            let _ = self.repo.abort_staged_data_key(new_key.data_key_id);
+            return Err(error);
+        }
+
+        if let Err(error) = self.repo.activate_new_key_and_retire_old_key(
+            import.disk_id,
+            new_key.data_key_id,
+            import.old_data_key_id,
+        ) {
+            let _ = self.repo.abort_staged_data_key(new_key.data_key_id);
+            let _ = write_disk_info(mount_path, previous_disk_info);
+            return Err(error);
+        }
+
+        self.repo
+            .set_runtime(import.disk_id, RuntimeStatus::Done, None, None)?;
+
+        Ok(ReinitializedDisk {
+            disk_id: import.disk_id,
+            old_seal_id: import.seal_id,
+            old_data_key_id: import.old_data_key_id,
+            new_data_key_id: new_key.data_key_id,
+        })
+    }
+
+    fn initialized_disk_info(
+        &self,
+        previous_disk_info: &DiskInfo,
+        new_key: &NewDataKey,
+    ) -> DiskInfo {
+        let mut next = previous_disk_info.clone();
+        next.protocol.version = self.template.protocol_version.clone();
+        next.center.center_id = self.template.center_id;
+        next.center.center_name = self.template.center_name.clone();
+        next.edge = None;
+        next.manifest = None;
+        next.status = DiskStatus {
+            code: DiskStatusCode::Initialized,
+            sealed: false,
+            imported: false,
+            reusable: true,
+            last_error: None,
+        };
+        next.security.center_key_id = self.template.center_key_id;
+        next.security.data_key_id = new_key.data_key_id;
+        next.security.encryption_alg = new_key.encryption_alg.clone();
+        next.security.signature_alg = self.template.signature_alg.clone();
+        next.security.center_signature = String::new();
+        next.security.center_signature = self
+            .security
+            .sign_disk_info(&next)
+            .expect("disk_info signing uses validated center security key");
+        next.updated_at = Utc::now();
+        next
+    }
+}
+
+fn generate_data_key(
+    disk_id: Uuid,
+    security: &CenterSecurity,
+) -> Result<NewDataKey, ReinitializeError> {
+    let data_key_id = Uuid::new_v4();
+    let plaintext_key = security.generate_disk_data_key();
+    let encrypted_key = security
+        .wrap_disk_data_key(disk_id, data_key_id, &plaintext_key)
+        .map_err(|error| ReinitializeError::Repository(error.to_string()))?;
+    Ok(NewDataKey {
+        data_key_id,
+        encrypted_key,
+        encryption_alg: ENCRYPTION_ALG_AES_256_GCM.to_string(),
+        key_wrap_alg: "LOCAL-MASTER-KEY".to_string(),
+    })
+}
+
+fn validate_imported_disk_info(
+    disk_info: &DiskInfo,
+    disk_id: Uuid,
+    seal_id: Uuid,
+) -> Result<(), ReinitializeError> {
+    if disk_info.disk.disk_id != disk_id {
+        return Err(ReinitializeError::DiskIdentityMismatch {
+            expected: disk_id,
+            actual: disk_info.disk.disk_id,
+        });
+    }
+    if disk_info.status.code != DiskStatusCode::Imported {
+        return Err(ReinitializeError::DiskNotImported {
+            actual: disk_info.status.code.as_str().to_string(),
+        });
+    }
+    let actual_seal_id = disk_info.edge.as_ref().and_then(|edge| edge.seal_id);
+    if actual_seal_id != Some(seal_id) {
+        return Err(ReinitializeError::SealMismatch {
+            expected: seal_id,
+            actual: actual_seal_id,
+        });
+    }
+    Ok(())
+}
+
+fn clean_sealed_payload(mount_path: &Path) -> Result<(), ReinitializeError> {
+    let root = protocol_root(mount_path);
+    for dir_name in ["data", "meta", "manifests", "logs", "quarantine"] {
+        let path = root.join(dir_name);
+        if path.exists() {
+            fs::remove_dir_all(&path).map_err(|source| ReinitializeError::Fs {
+                action: format!("remove {}", path.display()),
+                source,
+            })?;
+        }
+    }
+    sync_dir(&root)?;
+    Ok(())
+}
+
+fn create_protocol_dirs(mount_path: &Path) -> Result<(), ReinitializeError> {
+    let root = protocol_root(mount_path);
+    for dir_name in ["data", "meta", "manifests", "logs", "quarantine/partial"] {
+        let path = root.join(dir_name);
+        fs::create_dir_all(&path).map_err(|source| ReinitializeError::Fs {
+            action: format!("create {}", path.display()),
+            source,
+        })?;
+    }
+    sync_dir(&root)?;
+    Ok(())
+}
+
+pub fn read_disk_info(mount_path: &Path) -> Result<DiskInfo, ReinitializeError> {
+    let path = protocol_root(mount_path).join(DISK_INFO_FILE);
+    let bytes = fs::read(&path).map_err(|source| ReinitializeError::Fs {
+        action: format!("read {}", path.display()),
+        source,
+    })?;
+    serde_json::from_slice(&bytes).map_err(ReinitializeError::Json)
+}
+
+pub fn write_disk_info(mount_path: &Path, disk_info: &DiskInfo) -> Result<(), ReinitializeError> {
+    let root = protocol_root(mount_path);
+    fs::create_dir_all(&root).map_err(|source| ReinitializeError::Fs {
+        action: format!("create {}", root.display()),
+        source,
+    })?;
+    let path = root.join(DISK_INFO_FILE);
+    let temp_path = root.join(format!("{}.tmp-{}", DISK_INFO_FILE, Uuid::new_v4()));
+    let bytes = serde_json::to_vec_pretty(disk_info).map_err(ReinitializeError::Json)?;
+
+    {
+        let mut file = File::create(&temp_path).map_err(|source| ReinitializeError::Fs {
+            action: format!("create {}", temp_path.display()),
+            source,
+        })?;
+        file.write_all(&bytes)
+            .map_err(|source| ReinitializeError::Fs {
+                action: format!("write {}", temp_path.display()),
+                source,
+            })?;
+        file.sync_all().map_err(|source| ReinitializeError::Fs {
+            action: format!("fsync {}", temp_path.display()),
+            source,
+        })?;
+    }
+
+    fs::rename(&temp_path, &path).map_err(|source| ReinitializeError::Fs {
+        action: format!("rename {} to {}", temp_path.display(), path.display()),
+        source,
+    })?;
+    sync_dir(&root)?;
+    Ok(())
+}
+
+fn protocol_root(mount_path: &Path) -> PathBuf {
+    mount_path.join(PROTOCOL_ROOT)
+}
+
+#[cfg(unix)]
+fn sync_dir(path: &Path) -> Result<(), ReinitializeError> {
+    File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|source| ReinitializeError::Fs {
+            action: format!("fsync {}", path.display()),
+            source,
+        })
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_path: &Path) -> Result<(), ReinitializeError> {
+    Ok(())
+}
+
+#[derive(Debug, Error)]
+pub enum ReinitializeError {
+    #[error("import_job is not DONE for disk_id={disk_id} seal_id={seal_id}")]
+    ImportNotDone { disk_id: Uuid, seal_id: Uuid },
+    #[error("disk_id mismatch: expected {expected}, got {actual}")]
+    DiskIdentityMismatch { expected: Uuid, actual: Uuid },
+    #[error("disk is not IMPORTED, got {actual}")]
+    DiskNotImported { actual: String },
+    #[error("seal_id mismatch: expected {expected}, got {actual:?}")]
+    SealMismatch {
+        expected: Uuid,
+        actual: Option<Uuid>,
+    },
+    #[error("{action}: {source}")]
+    Fs { action: String, source: io::Error },
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("repository error: {0}")]
+    Repository(String),
+    #[error("disk_info signature invalid: {0}")]
+    SignatureInvalid(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiskInfo {
+    pub protocol: ProtocolInfo,
+    pub disk: DiskIdentity,
+    pub center: CenterInfo,
+    pub edge: Option<EdgeSealInfo>,
+    pub manifest: Option<ManifestInfo>,
+    pub security: SecurityInfo,
+    pub status: DiskStatus,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProtocolInfo {
+    pub version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiskIdentity {
+    pub disk_id: Uuid,
+    pub sn: Option<String>,
+    pub capacity_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CenterInfo {
+    pub center_id: Uuid,
+    pub center_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EdgeSealInfo {
+    pub edge_code: String,
+    pub export_job_id: Uuid,
+    pub seal_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManifestInfo {
+    pub manifest_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SecurityInfo {
+    pub center_key_id: Uuid,
+    pub data_key_id: Uuid,
+    pub encryption_alg: String,
+    pub signature_alg: String,
+    pub center_signature: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiskStatus {
+    pub code: DiskStatusCode,
+    pub sealed: bool,
+    pub imported: bool,
+    pub reusable: bool,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DiskStatusCode {
+    Unregistered,
+    Registered,
+    Initialized,
+    EdgeCopying,
+    Sealed,
+    CenterImporting,
+    Imported,
+    Error,
+}
+
+impl DiskStatusCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unregistered => "UNREGISTERED",
+            Self::Registered => "REGISTERED",
+            Self::Initialized => "INITIALIZED",
+            Self::EdgeCopying => "EDGE_COPYING",
+            Self::Sealed => "SEALED",
+            Self::CenterImporting => "CENTER_IMPORTING",
+            Self::Imported => "IMPORTED",
+            Self::Error => "ERROR",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[derive(Default)]
+    struct MemoryRepo {
+        completed_import: Option<CompletedImport>,
+        runtime: Vec<(RuntimeStatus, Option<String>)>,
+        staged_key: Option<Uuid>,
+        active_key: Option<Uuid>,
+        retired_key: Option<Uuid>,
+        fail_stage: bool,
+        fail_activate: bool,
+    }
+
+    impl PostImportRepository for RefCell<MemoryRepo> {
+        fn completed_import(
+            &mut self,
+            disk_id: Uuid,
+            seal_id: Uuid,
+        ) -> Result<Option<CompletedImport>, ReinitializeError> {
+            Ok(self
+                .borrow()
+                .completed_import
+                .clone()
+                .filter(|job| job.disk_id == disk_id && job.seal_id == seal_id))
+        }
+
+        fn set_runtime(
+            &mut self,
+            _disk_id: Uuid,
+            runtime_status: RuntimeStatus,
+            last_error_code: Option<&str>,
+            _error_message: Option<&str>,
+        ) -> Result<(), ReinitializeError> {
+            self.borrow_mut()
+                .runtime
+                .push((runtime_status, last_error_code.map(ToOwned::to_owned)));
+            Ok(())
+        }
+
+        fn stage_new_data_key(
+            &mut self,
+            _disk_id: Uuid,
+            data_key: &NewDataKey,
+        ) -> Result<(), ReinitializeError> {
+            if self.borrow().fail_stage {
+                return Err(ReinitializeError::Repository("stage failed".to_string()));
+            }
+            self.borrow_mut().staged_key = Some(data_key.data_key_id);
+            Ok(())
+        }
+
+        fn abort_staged_data_key(&mut self, data_key_id: Uuid) -> Result<(), ReinitializeError> {
+            let mut repo = self.borrow_mut();
+            if repo.staged_key == Some(data_key_id) {
+                repo.staged_key = None;
+            }
+            Ok(())
+        }
+
+        fn activate_new_key_and_retire_old_key(
+            &mut self,
+            _disk_id: Uuid,
+            new_data_key_id: Uuid,
+            old_data_key_id: Uuid,
+        ) -> Result<(), ReinitializeError> {
+            if self.borrow().fail_activate {
+                return Err(ReinitializeError::Repository("activate failed".to_string()));
+            }
+            let mut repo = self.borrow_mut();
+            repo.active_key = Some(new_data_key_id);
+            repo.retired_key = Some(old_data_key_id);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn success_cleans_payload_and_marks_initialized_after_runtime_steps() {
+        let temp = TempDisk::new();
+        let disk_id = Uuid::new_v4();
+        let seal_id = Uuid::new_v4();
+        let old_key = Uuid::new_v4();
+        write_disk_info(
+            &temp.path,
+            &imported_disk_info(disk_id, seal_id, old_key, &security()),
+        )
+        .unwrap();
+        fs::create_dir_all(temp.root().join("data")).unwrap();
+        fs::write(temp.root().join("data/object.bin"), b"sealed").unwrap();
+        fs::create_dir_all(temp.root().join("manifests")).unwrap();
+        fs::write(temp.root().join("manifests/export_manifest.json"), b"{}").unwrap();
+
+        let repo = RefCell::new(MemoryRepo {
+            completed_import: Some(CompletedImport {
+                import_job_id: Uuid::new_v4(),
+                disk_id,
+                seal_id,
+                old_data_key_id: old_key,
+            }),
+            ..Default::default()
+        });
+        let mut service = PostImportReinitializer::new(repo, template(), security());
+
+        let output = service
+            .reinitialize_imported_disk(&temp.path, disk_id, seal_id)
+            .unwrap();
+
+        let disk_info = read_disk_info(&temp.path).unwrap();
+        assert_eq!(disk_info.status.code, DiskStatusCode::Initialized);
+        assert!(disk_info.status.reusable);
+        assert_eq!(disk_info.edge, None);
+        assert_eq!(disk_info.manifest, None);
+        assert_ne!(disk_info.security.data_key_id, old_key);
+        assert_eq!(output.old_data_key_id, old_key);
+        assert!(!temp.root().join("data/object.bin").exists());
+        assert!(temp.root().join("quarantine/partial").is_dir());
+
+        let repo = service.repo.borrow();
+        assert_eq!(
+            repo.runtime,
+            vec![
+                (RuntimeStatus::Cleaning, None),
+                (RuntimeStatus::Reinitializing, None),
+                (RuntimeStatus::Done, None),
+            ]
+        );
+        assert_eq!(repo.active_key, Some(output.new_data_key_id));
+        assert_eq!(repo.retired_key, Some(old_key));
+    }
+
+    #[test]
+    fn cleanup_failure_preserves_import_done_boundary_and_imported_disk_info() {
+        let temp = TempDisk::new();
+        let disk_id = Uuid::new_v4();
+        let seal_id = Uuid::new_v4();
+        let old_key = Uuid::new_v4();
+        let original = imported_disk_info(disk_id, seal_id, old_key, &security());
+        write_disk_info(&temp.path, &original).unwrap();
+        fs::write(temp.root().join("data"), b"not a directory").unwrap();
+
+        let repo = RefCell::new(MemoryRepo {
+            completed_import: Some(CompletedImport {
+                import_job_id: Uuid::new_v4(),
+                disk_id,
+                seal_id,
+                old_data_key_id: old_key,
+            }),
+            ..Default::default()
+        });
+        let mut service = PostImportReinitializer::new(repo, template(), security());
+
+        let error = service
+            .reinitialize_imported_disk(&temp.path, disk_id, seal_id)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("remove"));
+        let disk_info = read_disk_info(&temp.path).unwrap();
+        assert_eq!(disk_info.status.code, DiskStatusCode::Imported);
+        assert_eq!(disk_info.security.data_key_id, old_key);
+
+        let repo = service.repo.borrow();
+        assert_eq!(repo.staged_key, None);
+        assert_eq!(repo.active_key, None);
+        assert_eq!(repo.retired_key, None);
+        assert_eq!(
+            repo.runtime,
+            vec![
+                (RuntimeStatus::Cleaning, None),
+                (RuntimeStatus::Error, Some(REINIT_FAILED.to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn activation_failure_aborts_new_key_and_restores_imported_disk_info() {
+        let temp = TempDisk::new();
+        let disk_id = Uuid::new_v4();
+        let seal_id = Uuid::new_v4();
+        let old_key = Uuid::new_v4();
+        write_disk_info(
+            &temp.path,
+            &imported_disk_info(disk_id, seal_id, old_key, &security()),
+        )
+        .unwrap();
+
+        let repo = RefCell::new(MemoryRepo {
+            completed_import: Some(CompletedImport {
+                import_job_id: Uuid::new_v4(),
+                disk_id,
+                seal_id,
+                old_data_key_id: old_key,
+            }),
+            fail_activate: true,
+            ..Default::default()
+        });
+        let mut service = PostImportReinitializer::new(repo, template(), security());
+
+        let error = service
+            .reinitialize_imported_disk(&temp.path, disk_id, seal_id)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("activate failed"));
+        let disk_info = read_disk_info(&temp.path).unwrap();
+        assert_eq!(disk_info.status.code, DiskStatusCode::Imported);
+        assert_eq!(disk_info.security.data_key_id, old_key);
+
+        let repo = service.repo.borrow();
+        assert_eq!(repo.staged_key, None);
+        assert_eq!(repo.active_key, None);
+        assert_eq!(repo.retired_key, None);
+        assert!(repo
+            .runtime
+            .contains(&(RuntimeStatus::Error, Some(REINIT_FAILED.to_string()))));
+    }
+
+    #[test]
+    fn tampered_imported_disk_info_blocks_reinitialization() {
+        let temp = TempDisk::new();
+        let disk_id = Uuid::new_v4();
+        let seal_id = Uuid::new_v4();
+        let old_key = Uuid::new_v4();
+        let mut disk_info = imported_disk_info(disk_id, seal_id, old_key, &security());
+        disk_info.security.data_key_id = Uuid::new_v4();
+        write_disk_info(&temp.path, &disk_info).unwrap();
+
+        let repo = RefCell::new(MemoryRepo {
+            completed_import: Some(CompletedImport {
+                import_job_id: Uuid::new_v4(),
+                disk_id,
+                seal_id,
+                old_data_key_id: old_key,
+            }),
+            ..Default::default()
+        });
+        let mut service = PostImportReinitializer::new(repo, template(), security());
+
+        let error = service
+            .reinitialize_imported_disk(&temp.path, disk_id, seal_id)
+            .unwrap_err();
+
+        assert!(matches!(error, ReinitializeError::SignatureInvalid(_)));
+        assert!(temp.root().join("data").exists() || temp.root().exists());
+    }
+
+    #[test]
+    fn done_import_blocks_reimport_even_when_reinit_failed() {
+        let repo = RefCell::new(MemoryRepo {
+            completed_import: Some(CompletedImport {
+                import_job_id: Uuid::new_v4(),
+                disk_id: Uuid::new_v4(),
+                seal_id: Uuid::new_v4(),
+                old_data_key_id: Uuid::new_v4(),
+            }),
+            ..Default::default()
+        });
+        let mut service = PostImportReinitializer::new(repo, template(), security());
+        let disk_id = Uuid::new_v4();
+        let seal_id = Uuid::new_v4();
+
+        let error = service
+            .reinitialize_imported_disk(Path::new("unused"), disk_id, seal_id)
+            .unwrap_err();
+
+        assert!(matches!(error, ReinitializeError::ImportNotDone { .. }));
+    }
+
+    fn template() -> DiskInfoTemplate {
+        DiskInfoTemplate {
+            protocol_version: "1.0".to_string(),
+            center_id: Uuid::new_v4(),
+            center_name: Some("center".to_string()),
+            center_key_id: security().center_key_id(),
+            signature_alg: crate::center_security::SIGNATURE_ALG_HMAC_SHA256.to_string(),
+        }
+    }
+
+    fn imported_disk_info(
+        disk_id: Uuid,
+        seal_id: Uuid,
+        data_key_id: Uuid,
+        security: &CenterSecurity,
+    ) -> DiskInfo {
+        let mut disk_info = DiskInfo {
+            protocol: ProtocolInfo {
+                version: "1.0".to_string(),
+            },
+            disk: DiskIdentity {
+                disk_id,
+                sn: Some("SN001".to_string()),
+                capacity_bytes: 1024,
+            },
+            center: CenterInfo {
+                center_id: Uuid::new_v4(),
+                center_name: Some("center".to_string()),
+            },
+            edge: Some(EdgeSealInfo {
+                edge_code: "edge-a".to_string(),
+                export_job_id: Uuid::new_v4(),
+                seal_id: Some(seal_id),
+            }),
+            manifest: Some(ManifestInfo {
+                manifest_sha256: "manifest-sha".to_string(),
+            }),
+            security: SecurityInfo {
+                center_key_id: security.center_key_id(),
+                data_key_id,
+                encryption_alg: ENCRYPTION_ALG_AES_256_GCM.to_string(),
+                signature_alg: crate::center_security::SIGNATURE_ALG_HMAC_SHA256.to_string(),
+                center_signature: String::new(),
+            },
+            status: DiskStatus {
+                code: DiskStatusCode::Imported,
+                sealed: true,
+                imported: true,
+                reusable: false,
+                last_error: None,
+            },
+            updated_at: Utc::now(),
+        };
+        disk_info.security.center_signature = security.sign_disk_info(&disk_info).unwrap();
+        disk_info
+    }
+
+    fn security() -> CenterSecurity {
+        CenterSecurity::test()
+    }
+
+    struct TempDisk {
+        path: PathBuf,
+    }
+
+    impl TempDisk {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("rustfs-center-test-{}", Uuid::new_v4()));
+            fs::create_dir_all(path.join(PROTOCOL_ROOT)).unwrap();
+            Self { path }
+        }
+
+        fn root(&self) -> PathBuf {
+            self.path.join(PROTOCOL_ROOT)
+        }
+    }
+
+    impl Drop for TempDisk {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}

@@ -1,0 +1,973 @@
+use crate::{
+    adapters::AdapterBundle,
+    center_client::CenterHmacClient,
+    config::EdgeConfig,
+    control::{
+        missing_control_service, validate_export_job_id, ControlError, CreateExportJobRequest,
+        EdgeControlService, ProductionEdgeControlService, RecoverExportJobRequest,
+        ScanTriggerRequest, StartExportJobRequest,
+    },
+    disk_detection::{
+        ConfiguredMountProbe, EdgeDiskDetector, EdgeDiskDetectorConfig, PgDiskRuntimeLedger,
+    },
+    rescan::{DiskRescanAccepted, DiskRescanCoordinator, DiskRescanTrigger},
+};
+use axum::response::IntoResponse;
+use axum::{
+    extract::ws::{Message, WebSocket},
+    extract::{Path, State, WebSocketUpgrade},
+    http::{HeaderMap, StatusCode},
+    response::Response,
+    routing::{get, post},
+    Json, Router,
+};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tokio::time::{self, Duration};
+use tower_http::trace::TraceLayer;
+use uuid::Uuid;
+
+#[derive(Clone)]
+pub struct AppState {
+    pub config: Arc<EdgeConfig>,
+    pub adapters: AdapterBundle,
+    pub center_client: CenterHmacClient,
+    pub disk_rescan: DiskRescanCoordinator,
+    control: Arc<dyn EdgeControlService>,
+}
+
+impl AppState {
+    pub async fn from_config(config: EdgeConfig) -> anyhow::Result<Self> {
+        let center_client = CenterHmacClient::new(
+            config.center.base_url.clone(),
+            config.center.edge_code.clone(),
+            config.center.auth_key_id.clone(),
+            config.center.edge_auth_secret.clone(),
+        );
+        let adapters = AdapterBundle::from_config(&config).await?;
+        let pg_pool = adapters
+            .pg_pool
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("PostgreSQL pool is required for edge control API"))?;
+        let s3_client = adapters
+            .s3_client
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("RustFS S3 client is required for edge control API"))?;
+        let config = Arc::new(config);
+        let probe = ConfiguredMountProbe::new(
+            config
+                .paths
+                .disk_mount_roots
+                .iter()
+                .map(Into::into)
+                .collect(),
+        );
+        let ledger =
+            PgDiskRuntimeLedger::connect(&config.database.url, config.database.max_connections)
+                .await?;
+        let detector = EdgeDiskDetector::new(
+            EdgeDiskDetectorConfig::new(config.center.edge_code.clone()),
+            probe,
+            center_client.clone(),
+            ledger,
+        );
+        let disk_rescan = DiskRescanCoordinator::new(Arc::new(detector));
+        let control = Arc::new(ProductionEdgeControlService::new(
+            config.clone(),
+            pg_pool,
+            s3_client,
+            center_client.clone(),
+        ));
+
+        Ok(Self {
+            config,
+            adapters,
+            center_client,
+            disk_rescan,
+            control,
+        })
+    }
+
+    pub async fn request_startup_disk_scan(&self) {
+        self.disk_rescan
+            .request_rescan(DiskRescanTrigger::startup())
+            .await;
+    }
+}
+
+pub fn app(state: AppState) -> Router {
+    Router::new()
+        .route("/healthz", get(liveness))
+        .route("/readyz", get(readiness))
+        .route("/internal/disk/rescan", post(request_disk_rescan))
+        .route("/api/edge/summary", get(edge_summary))
+        .route("/ws/edge/copy-progress", get(edge_copy_progress_ws))
+        .route("/ws/edge/progress", get(edge_copy_progress_ws))
+        .route("/api/edge/scan", post(trigger_scan))
+        .route("/api/edge/export-jobs", post(create_export_job))
+        .route("/api/edge/export-jobs/{export_job_id}", get(get_export_job))
+        .route(
+            "/api/edge/export-jobs/{export_job_id}/start",
+            post(start_export_job),
+        )
+        .route(
+            "/api/edge/export-jobs/{export_job_id}/recover",
+            post(recover_export_job),
+        )
+        .with_state(state)
+        .layer(TraceLayer::new_for_http())
+}
+
+async fn liveness(State(state): State<AppState>) -> Json<HealthResponse> {
+    Json(HealthResponse::alive(&state))
+}
+
+async fn request_disk_rescan(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<DiskRescanRequest>,
+) -> (StatusCode, Json<DiskRescanApiResponse>) {
+    let Some(expected_token) = state.config.rescan_token() else {
+        tracing::error!("edge disk rescan endpoint is disabled because no token is configured");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(DiskRescanApiResponse::error(
+                "RESCAN_TOKEN_MISSING",
+                "rescan token is not configured",
+            )),
+        );
+    };
+
+    let provided_token = headers
+        .get("X-Rescan-Token")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim);
+    if provided_token != Some(expected_token) {
+        tracing::warn!(
+            trigger = request.trigger.as_deref(),
+            device = request.device.as_deref(),
+            "rejected unauthorized edge disk rescan request"
+        );
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(DiskRescanApiResponse::error(
+                "UNAUTHORIZED",
+                "invalid rescan token",
+            )),
+        );
+    }
+
+    let trigger = if request.trigger.as_deref() == Some("udev") {
+        DiskRescanTrigger::udev(request.device)
+    } else {
+        DiskRescanTrigger::manual(request.device)
+    };
+    let accepted = state.disk_rescan.request_rescan(trigger).await;
+
+    (
+        StatusCode::ACCEPTED,
+        Json(DiskRescanApiResponse::accepted(accepted)),
+    )
+}
+
+async fn readiness(State(state): State<AppState>) -> (StatusCode, Json<ReadinessResponse>) {
+    let database_ok = state.adapters.database.check().await.is_ok();
+    let rustfs_ok = state.adapters.object_store.check().await.is_ok();
+    let disk_mount_roots = state
+        .adapters
+        .disk
+        .mount_roots()
+        .into_iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+    let ready = database_ok && rustfs_ok && !disk_mount_roots.is_empty();
+    let code = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+
+    (
+        code,
+        Json(ReadinessResponse {
+            ok: ready,
+            service: "rustfs-transfer-edge",
+            edge_code: state.config.center.edge_code.clone(),
+            database_ok,
+            rustfs_ok,
+            disk_mount_roots,
+        }),
+    )
+}
+
+#[derive(Debug, Serialize)]
+struct HealthResponse {
+    ok: bool,
+    service: &'static str,
+    edge_code: String,
+}
+
+impl HealthResponse {
+    fn alive(state: &AppState) -> Self {
+        Self {
+            ok: true,
+            service: "rustfs-transfer-edge",
+            edge_code: state.config.center.edge_code.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ReadinessResponse {
+    ok: bool,
+    service: &'static str,
+    edge_code: String,
+    database_ok: bool,
+    rustfs_ok: bool,
+    disk_mount_roots: Vec<String>,
+}
+
+async fn edge_summary(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<crate::control::EdgeControlSummary>, ApiError> {
+    authorize_control_api(&state, &headers)?;
+    state.control.summary().await.map(Json).map_err(Into::into)
+}
+
+async fn edge_copy_progress_ws(State(state): State<AppState>, ws: WebSocketUpgrade) -> Response {
+    ws.on_upgrade(move |socket| async move {
+        publish_edge_copy_progress(socket, state.control.clone()).await;
+    })
+}
+
+async fn publish_edge_copy_progress(mut socket: WebSocket, control: Arc<dyn EdgeControlService>) {
+    let mut interval = time::interval(Duration::from_secs(1));
+    loop {
+        interval.tick().await;
+        let event = match control.copy_progress_snapshot().await {
+            Ok(Some(event)) => event,
+            Ok(None) => idle_copy_progress_event(),
+            Err(error) => {
+                tracing::warn!(
+                    error_code = error.error_code,
+                    message = error.message,
+                    "failed to load edge copy progress snapshot"
+                );
+                idle_copy_progress_event()
+            }
+        };
+        let Ok(payload) = serde_json::to_string(&event) else {
+            break;
+        };
+        if socket.send(Message::Text(payload.into())).await.is_err() {
+            break;
+        }
+    }
+}
+
+fn idle_copy_progress_event() -> crate::progress::CopyProgressEvent {
+    crate::progress::CopyProgressEvent {
+        event_type: "COPY_PROGRESS".to_string(),
+        event_time: chrono::Utc::now(),
+        source: "edge".to_string(),
+        edge_code: String::new(),
+        export_job_id: String::new(),
+        disk_status_code: "INITIALIZED".to_string(),
+        export_job_status: "PENDING".to_string(),
+        global_progress: crate::progress::GlobalProgressSnapshot {
+            total_bytes: 0,
+            done_bytes: 0,
+            remaining_bytes: 0,
+            speed_bytes_per_sec: 0,
+            object_total: 0,
+            object_done: 0,
+            object_remaining: 0,
+        },
+        disks: Vec::new(),
+        message: "no active edge copy progress snapshot".to_string(),
+    }
+}
+
+async fn trigger_scan(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ScanTriggerRequest>,
+) -> Result<Json<crate::control::ScanTriggerResponse>, ApiError> {
+    authorize_control_api(&state, &headers)?;
+    state
+        .control
+        .scan_once(request)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn create_export_job(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateExportJobRequest>,
+) -> Result<Json<crate::control::ExportJobResponse>, ApiError> {
+    authorize_control_api(&state, &headers)?;
+    state
+        .control
+        .create_export_job(request)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn get_export_job(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(export_job_id): Path<Uuid>,
+) -> Result<Json<crate::control::ExportJobResponse>, ApiError> {
+    authorize_control_api(&state, &headers)?;
+    validate_export_job_id(export_job_id)?;
+    state
+        .control
+        .export_job(export_job_id)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn start_export_job(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(export_job_id): Path<Uuid>,
+    Json(request): Json<StartExportJobRequest>,
+) -> Result<Json<crate::control::StartExportJobResponse>, ApiError> {
+    authorize_control_api(&state, &headers)?;
+    validate_export_job_id(export_job_id)?;
+    state
+        .control
+        .start_export_job(export_job_id, request)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn recover_export_job(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(export_job_id): Path<Uuid>,
+    Json(request): Json<RecoverExportJobRequest>,
+) -> Result<Json<crate::control::RecoverExportJobResponse>, ApiError> {
+    authorize_control_api(&state, &headers)?;
+    validate_export_job_id(export_job_id)?;
+    state
+        .control
+        .recover_export_job(export_job_id, request)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+fn authorize_control_api(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    let configured = state
+        .config
+        .server
+        .control_api_token
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            ApiError(ControlError {
+                http_status: StatusCode::SERVICE_UNAVAILABLE,
+                error_code: "CONTROL_API_DISABLED",
+                message: "edge control API token is not configured".to_string(),
+            })
+        })?;
+    let provided = headers
+        .get("X-Edge-Control-Token")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+
+    if constant_time_eq(configured.as_bytes(), provided.as_bytes()) {
+        Ok(())
+    } else {
+        Err(ApiError(ControlError {
+            http_status: StatusCode::UNAUTHORIZED,
+            error_code: "UNAUTHORIZED",
+            message: "edge control API token is missing or invalid".to_string(),
+        }))
+    }
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right.iter())
+        .fold(0_u8, |acc, (left, right)| acc | (left ^ right))
+        == 0
+}
+
+#[derive(Debug, Deserialize)]
+struct DiskRescanRequest {
+    trigger: Option<String>,
+    device: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DiskRescanApiResponse {
+    accepted: bool,
+    queued: bool,
+    error_code: Option<&'static str>,
+    message: String,
+}
+
+impl DiskRescanApiResponse {
+    fn accepted(accepted: DiskRescanAccepted) -> Self {
+        Self {
+            accepted: accepted.accepted,
+            queued: accepted.queued,
+            error_code: None,
+            message: accepted.message,
+        }
+    }
+
+    fn error(error_code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            accepted: false,
+            queued: false,
+            error_code: Some(error_code),
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ErrorResponse {
+    error_code: &'static str,
+    message: String,
+}
+
+struct ApiError(ControlError);
+
+impl From<ControlError> for ApiError {
+    fn from(value: ControlError) -> Self {
+        Self(value)
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> axum::response::Response {
+        (
+            self.0.http_status,
+            Json(ErrorResponse {
+                error_code: self.0.error_code,
+                message: self.0.message,
+            }),
+        )
+            .into_response()
+    }
+}
+
+impl From<anyhow::Error> for ApiError {
+    fn from(value: anyhow::Error) -> Self {
+        Self(missing_control_service().with_message(value.to_string()))
+    }
+}
+
+trait ControlErrorExt {
+    fn with_message(self, message: String) -> Self;
+}
+
+impl ControlErrorExt for ControlError {
+    fn with_message(mut self, message: String) -> Self {
+        self.message = message;
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        adapters::{
+            Clock, DatabaseAdapter, DiskAdapter, HealthFuture, IdGenerator, ObjectStoreAdapter,
+        },
+        control::{
+            ControlFuture, DiskRuntimeSummary, EdgeControlSummary, EdgeGlobalSummary,
+            ExportJobResponse, ScanTriggerResponse, StartExportJobResponse,
+        },
+        disk_detection::DiskDetectionError,
+        rescan::{DiskRescanRunner, DiskRescanTrigger},
+        scanner::ScanProgressSnapshot,
+    };
+    use axum::{
+        body::{to_bytes, Body},
+        http::{Method, Request},
+    };
+    use chrono::Utc;
+    use std::{
+        collections::BTreeMap,
+        path::PathBuf,
+        sync::{Arc, Mutex},
+    };
+    use tower::ServiceExt;
+
+    #[derive(Default)]
+    struct FakeHealth;
+
+    impl DatabaseAdapter for FakeHealth {
+        fn check<'a>(&'a self) -> HealthFuture<'a> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    impl ObjectStoreAdapter for FakeHealth {
+        fn check<'a>(&'a self) -> HealthFuture<'a> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    impl DiskAdapter for FakeHealth {
+        fn mount_roots(&self) -> Vec<PathBuf> {
+            vec![PathBuf::from("/mnt/rustfs-transfer")]
+        }
+    }
+
+    impl Clock for FakeHealth {
+        fn now_utc(&self) -> chrono::DateTime<Utc> {
+            Utc::now()
+        }
+    }
+
+    impl IdGenerator for FakeHealth {
+        fn new_uuid(&self) -> Uuid {
+            Uuid::new_v4()
+        }
+    }
+
+    #[derive(Default)]
+    struct NoopRescanRunner;
+
+    impl DiskRescanRunner for NoopRescanRunner {
+        fn run_disk_rescan<'a>(
+            &'a self,
+            _trigger: DiskRescanTrigger,
+        ) -> crate::disk_detection::BoxFuture<'a, Result<usize, DiskDetectionError>> {
+            Box::pin(async { Ok(0) })
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeControl {
+        calls: Mutex<Vec<&'static str>>,
+        export_job_id: Uuid,
+    }
+
+    impl EdgeControlService for FakeControl {
+        fn scan_once<'a>(
+            &'a self,
+            _request: ScanTriggerRequest,
+        ) -> ControlFuture<'a, ScanTriggerResponse> {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push("scan_once");
+                Ok(ScanTriggerResponse {
+                    scan_event_type: "SCAN_DONE".to_string(),
+                    scan_status: "DONE".to_string(),
+                    bucket_count: 1,
+                    object_seen: 2,
+                    stable_object_count: 2,
+                    source_changed_count: 0,
+                    total_bytes: 99,
+                    message: "ok".to_string(),
+                })
+            })
+        }
+
+        fn create_export_job<'a>(
+            &'a self,
+            _request: CreateExportJobRequest,
+        ) -> ControlFuture<'a, ExportJobResponse> {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push("create_export_job");
+                Ok(export_job_response(self.export_job_id))
+            })
+        }
+
+        fn start_export_job<'a>(
+            &'a self,
+            export_job_id: Uuid,
+            _request: StartExportJobRequest,
+        ) -> ControlFuture<'a, StartExportJobResponse> {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push("start_export_job");
+                Ok(StartExportJobResponse {
+                    export_job_id,
+                    export_job_status: "COPYING".to_string(),
+                    assigned_object_count: 2,
+                    assigned_bytes: 99,
+                    disk_count: 1,
+                    worker_started_count: 1,
+                    worker_failed_count: 0,
+                    message: "assigned".to_string(),
+                })
+            })
+        }
+
+        fn recover_export_job<'a>(
+            &'a self,
+            export_job_id: Uuid,
+            request: RecoverExportJobRequest,
+        ) -> ControlFuture<'a, crate::control::RecoverExportJobResponse> {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push("recover_export_job");
+                Ok(crate::control::RecoverExportJobResponse {
+                    export_job_id,
+                    export_job_status: "COPYING".to_string(),
+                    recovered_disk_count: 1,
+                    worker_started_count: 1,
+                    worker_failed_count: 0,
+                    recovery_reason: request.recovery_reason,
+                    message: "recovering".to_string(),
+                })
+            })
+        }
+
+        fn export_job<'a>(&'a self, export_job_id: Uuid) -> ControlFuture<'a, ExportJobResponse> {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push("export_job");
+                Ok(export_job_response(export_job_id))
+            })
+        }
+
+        fn summary<'a>(&'a self) -> ControlFuture<'a, EdgeControlSummary> {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push("summary");
+                Ok(EdgeControlSummary {
+                    source: "edge",
+                    edge_code: "edge-a".to_string(),
+                    edge_name: "edge-a".to_string(),
+                    export_job_id: Some(self.export_job_id),
+                    export_job_status: "PENDING".to_string(),
+                    disk_status_code: "INITIALIZED".to_string(),
+                    scan: ScanProgressSnapshot::default(),
+                    global_progress: EdgeGlobalSummary {
+                        total_bytes: 99,
+                        done_bytes: 0,
+                        remaining_bytes: 99,
+                        speed_bytes_per_sec: 0,
+                        object_total: 2,
+                        object_done: 0,
+                        object_remaining: 2,
+                    },
+                    latest_export_job: Some(export_job_response(self.export_job_id)),
+                    disks: vec![DiskRuntimeSummary {
+                        disk_sn: "SN-A".to_string(),
+                        disk_id: Some(Uuid::new_v4()),
+                        device_path: "/dev/sdb1".to_string(),
+                        mount_path: Some("/mnt/rustfs-transfer/disk-a".to_string()),
+                        disk_status_code: "INITIALIZED".to_string(),
+                        runtime_status: "READY".to_string(),
+                        capacity_bytes: 100,
+                        free_bytes: 80,
+                        object_budget_bytes: 64,
+                        last_error_code: None,
+                        error_message: None,
+                    }],
+                    ws_connected: false,
+                    last_http_refresh_at: Utc::now(),
+                    message: "summary".to_string(),
+                })
+            })
+        }
+
+        fn copy_progress_snapshot<'a>(
+            &'a self,
+        ) -> ControlFuture<'a, Option<crate::progress::CopyProgressEvent>> {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push("copy_progress_snapshot");
+                let progress = crate::progress::ProgressAggregator::new(
+                    "edge-a",
+                    self.export_job_id.to_string(),
+                );
+                progress.register_disk(
+                    "11111111-1111-1111-1111-111111111111",
+                    "SN-A",
+                    "/mnt/rustfs-transfer/disk-a",
+                    99,
+                    2,
+                    80,
+                );
+                Ok(Some(progress.snapshot("COPY_PROGRESS", "test snapshot")))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn control_routes_require_local_token() {
+        let router = app(test_state(Arc::new(FakeControl::default())));
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/edge/scan")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn scan_route_triggers_control_workflow() {
+        let control = Arc::new(FakeControl::default());
+        let router = app(test_state(control.clone()));
+
+        let response = router
+            .oneshot(authenticated_json(
+                Method::POST,
+                "/api/edge/scan",
+                r#"{"enqueue_stable_objects":false}"#,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["scan_status"], "DONE");
+        assert!(body.get("status").is_none());
+        assert_eq!(control.calls.lock().unwrap().as_slice(), &["scan_once"]);
+    }
+
+    #[tokio::test]
+    async fn export_job_routes_create_query_and_start() {
+        let export_job_id = Uuid::new_v4();
+        let control = Arc::new(FakeControl {
+            export_job_id,
+            ..Default::default()
+        });
+        let router = app(test_state(control.clone()));
+
+        let create = router
+            .clone()
+            .oneshot(authenticated_json(
+                Method::POST,
+                "/api/edge/export-jobs",
+                r#"{"run_scan":true}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::OK);
+        let create_body = json_body(create).await;
+        assert_eq!(create_body["export_job_status"], "PENDING");
+        assert!(create_body.get("status").is_none());
+
+        let query = router
+            .clone()
+            .oneshot(authenticated_empty(
+                Method::GET,
+                &format!("/api/edge/export-jobs/{export_job_id}"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(query.status(), StatusCode::OK);
+
+        let start = router
+            .oneshot(authenticated_json(
+                Method::POST,
+                &format!("/api/edge/export-jobs/{export_job_id}/start"),
+                "{}",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(start.status(), StatusCode::OK);
+        let start_body = json_body(start).await;
+        assert_eq!(start_body["export_job_status"], "COPYING");
+        assert_eq!(start_body["assigned_object_count"], 2);
+
+        assert_eq!(
+            control.calls.lock().unwrap().as_slice(),
+            &["create_export_job", "export_job", "start_export_job"]
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_export_job_route_requires_token() {
+        let export_job_id = Uuid::new_v4();
+        let control = Arc::new(FakeControl {
+            export_job_id,
+            ..Default::default()
+        });
+        let router = app(test_state(control));
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/edge/export-jobs/{export_job_id}/recover"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"recovery_reason":"acl fixed"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn recover_export_job_route_triggers_control_without_naked_status() {
+        let export_job_id = Uuid::new_v4();
+        let control = Arc::new(FakeControl {
+            export_job_id,
+            ..Default::default()
+        });
+        let router = app(test_state(control.clone()));
+
+        let response = router
+            .oneshot(authenticated_json(
+                Method::POST,
+                &format!("/api/edge/export-jobs/{export_job_id}/recover"),
+                r#"{"recovery_reason":"ACL repaired by operator","admin_confirm_write_before_zero_copy":true,"write_before_failure_code":"WRITE_BEFORE_PERMISSION_DENIED"}"#,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["export_job_status"], "COPYING");
+        assert_eq!(body["recovered_disk_count"], 1);
+        assert!(body.get("status").is_none());
+        assert_eq!(
+            control.calls.lock().unwrap().as_slice(),
+            &["recover_export_job"]
+        );
+    }
+
+    #[tokio::test]
+    async fn copy_progress_ws_requires_upgrade_handshake() {
+        let control = Arc::new(FakeControl::default());
+        let router = app(test_state(control));
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/ws/edge/copy-progress")
+                    .header("host", "localhost")
+                    .header("connection", "upgrade")
+                    .header("upgrade", "websocket")
+                    .header("sec-websocket-version", "13")
+                    .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn copy_progress_snapshot_has_protocol_shape() {
+        let control = FakeControl::default();
+        let event = control
+            .copy_progress_snapshot()
+            .await
+            .unwrap()
+            .expect("fake progress event");
+        let value = serde_json::to_value(event).unwrap();
+
+        assert_eq!(value["event_type"], "COPY_PROGRESS");
+        assert_eq!(value["source"], "edge");
+        assert_eq!(value["disk_status_code"], "EDGE_COPYING");
+        assert_eq!(value["export_job_status"], "COPYING");
+        assert!(value["disks"].is_array());
+        assert!(value.get("status").is_none());
+    }
+
+    fn test_state(control: Arc<dyn EdgeControlService>) -> AppState {
+        let raw = r#"
+            [server]
+            bind = "127.0.0.1:8081"
+            control_api_token = "local-control-token"
+
+            [database]
+            url = "postgres://edge:edge@localhost/edge"
+
+            [center]
+            base_url = "http://center.local:8080"
+            edge_code = "edge-a"
+            auth_key_id = "auth-key"
+            edge_auth_secret = "edge-secret"
+
+            [rustfs]
+            endpoint = "http://127.0.0.1:9000"
+            access_key_id = "edge-access-key"
+            secret_access_key = "edge-secret-key"
+
+            [rescan]
+            token = "local-rescan-token"
+        "#;
+        let config = EdgeConfig::from_toml(raw).unwrap();
+        let fake = Arc::new(FakeHealth);
+        let adapters = AdapterBundle {
+            database: fake.clone(),
+            object_store: fake.clone(),
+            disk: fake.clone(),
+            clock: fake.clone(),
+            ids: fake,
+            pg_pool: None,
+            s3_client: None,
+        };
+        let center_client =
+            CenterHmacClient::new("http://center.local", "edge-a", "auth-key", "edge-secret");
+        AppState {
+            config: Arc::new(config),
+            adapters,
+            center_client,
+            disk_rescan: DiskRescanCoordinator::new(Arc::new(NoopRescanRunner)),
+            control,
+        }
+    }
+
+    fn authenticated_json(method: Method, uri: &str, body: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("X-Edge-Control-Token", "local-control-token")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    fn authenticated_empty(method: Method, uri: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("X-Edge-Control-Token", "local-control-token")
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    async fn json_body(response: axum::response::Response) -> serde_json::Value {
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn export_job_response(export_job_id: Uuid) -> ExportJobResponse {
+        ExportJobResponse {
+            export_job_id,
+            edge_code: "edge-a".to_string(),
+            export_job_status: "PENDING".to_string(),
+            object_count: 2,
+            copied_count: 0,
+            total_bytes: 99,
+            copied_bytes: 0,
+            start_time: None,
+            finish_time: None,
+            error_message: None,
+            object_status_counts: BTreeMap::from([("PENDING".to_string(), 2)]),
+        }
+    }
+}

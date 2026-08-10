@@ -1,5 +1,7 @@
 # deploy/udev
 
-udev 磁盘热插拔规则目录。
+udev disk hotplug rules.
 
-udev 规则只负责触发磁盘变化识别，不得直接执行导出或导入业务逻辑。
+`99-rustfs-transfer-disk.rules` only starts `rustfs-transfer-disk-rescan@.service`.
+
+The rule must not directly run export, import, cleanup, reinitialization, formatting, or mount business logic. The long-running daemon performs startup scans and decides whether a disk can enter a task pool after ext4 and protocol checks.
