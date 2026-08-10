@@ -1928,6 +1928,12 @@ mod tests {
         );
         assert_eq!(disk_info["status"]["code"], "INITIALIZED");
         assert_eq!(disk_info["status"]["reusable"], true);
+        assert!(chrono::DateTime::parse_from_rfc3339(
+            disk_info["updated_at"]
+                .as_str()
+                .expect("initialized disk_info writes updated_at")
+        )
+        .is_ok());
         assert_ne!(
             disk_info["security"]["center_signature"],
             "mock-signature-adapter"

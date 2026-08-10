@@ -113,6 +113,7 @@
 | TASK-S1-P1-CENTER-REINIT-API-001 | Center 受控清理重初始化生产 API | P1 主闭环 | Center | [x] | Day 2 VM 验收修补 | TASK-S1-CENTER-005 |
 | TASK-S1-P1-CENTER-REINIT-FSTYPE-002 | Center reinitialize findmnt 多行 ext4 解析修补 | P1 主闭环 | Center | [x] | Day 2 VM 热修补 | TASK-S1-P1-CENTER-REINIT-API-001 |
 | TASK-S1-P1-CENTER-REINIT-UPDATED-AT-003 | Center reinitialize 兼容旧盘缺 updated_at | P1 主闭环 | Center | [x] | Day 2 VM 热修补 | TASK-S1-P1-CENTER-REINIT-FSTYPE-002 |
+| TASK-S1-P1-CENTER-REINIT-SIGNATURE-004 | Center reinitialize 兼容旧 IMPORTED 签名 canonical | P1 主闭环 | Center | [x] | Day 2 VM 热修补 | TASK-S1-P1-CENTER-REINIT-UPDATED-AT-003 |
 | TASK-S1-WEB-EDGE-001 | 边缘端 DashboardView、HTTP 汇总和 WS 进度展示 | P2 交付增强 | Web / Edge | [x] | Day 1-2 | TASK-S1-TEST-001 |
 | TASK-S1-WEB-CENTER-001 | 中控端 DashboardView、HTTP 汇总和 WS 进度展示 | P2 交付增强 | Web / Center | [x] | Day 1-2 | TASK-S1-TEST-001 |
 | TASK-S1-DASHBOARD-REALTIME-001 | 双端真实 Dashboard HTTP summary 与本端 WebSocket 推送 | P0 解阻塞 | Center / Edge / Web | [x] | Day 2 联调修补 | TASK-S1-WEB-EDGE-001, TASK-S1-WEB-CENTER-001 |
@@ -1213,6 +1214,46 @@
 - [x] 空/非法 `updated_at`、缺少 `security` 等关键字段仍拒绝。
 - [x] 成功 reinitialize 写回 `INITIALIZED` disk_info 含新 `updated_at`。
 - [x] ImportWorker 成功导入写回 `IMPORTED` disk_info 含 `updated_at`。
+- [x] `cargo fmt --all -- --check`、`cargo test -p rustfs-transfer-center`、`cargo test --workspace`、`scripts/check-deploy.ps1` 通过后独立提交。
+
+---
+
+# 开发任务卡片：TASK-S1-P1-CENTER-REINIT-SIGNATURE-004
+
+### 任务基本信息
+
+- **任务 ID**：TASK-S1-P1-CENTER-REINIT-SIGNATURE-004
+- **任务名称**：Center reinitialize 兼容旧 IMPORTED 签名 canonical
+- **所属 Track / 模块**：
+  - [ ] Track 1: Common
+  - [ ] Track 2: Edge
+  - [x] Track 3: Center (`crates/center-backend`)
+  - [ ] Track 4: Web
+- **任务状态**：[x] 开发完成
+- **负责人 / Role**：Codex 串行合入/提交窗口
+- **计划时间**：Day 2 VM 热修补
+- **依赖任务**：TASK-S1-P1-CENTER-REINIT-UPDATED-AT-003
+
+### 任务目标与范围
+
+- **核心目标**：修补真实 VM 中旧 `IMPORTED` 盘因历史 `disk_info.json` 原始字段 canonical 与当前反序列化结构 canonical 不一致，导致受控 reinitialize 在写盘前 HMAC 验签失败的问题。
+- **现场结论**：此前真实 API 调用在写盘前 HTTP 400 安全拒绝，已核验零写盘、零 DB 写入。
+- **对应代码位置**：`crates/center-backend/src/reinitializer.rs`、`crates/center-backend/src/reinitialize_runtime.rs`、`crates/center-backend/src/lib.rs`
+
+### 协议与状态机约束
+
+- 当前 canonical HMAC 验签继续优先执行且必须成功才放行当前格式。
+- 历史兼容仅限原始盘内 JSON 为 `IMPORTED` 且顶层 `updated_at` 缺失的旧形态；兼容路径使用盘上原始 JSON 和同一 Center HMAC key 重新验签。
+- 无签名、错误签名、错 key、非 `IMPORTED`、或带 `updated_at` 的历史签名均拒绝。
+- 新 initialize 写出的 `disk_info.json` 必须继续包含 `updated_at`，并写当前 canonical HMAC 签名，不得写 mock signature。
+
+### 验收与检查清单
+
+- [x] 当前 canonical 签名通过 reinitialize preflight。
+- [x] 旧 `IMPORTED`、缺 `updated_at`、原始 JSON canonical 签名通过 reinitialize preflight。
+- [x] 无签名、错误签名、错 key 拒绝，且仍停在写盘前。
+- [x] 旧签名兼容只限缺 `updated_at` 的 `IMPORTED` 历史形态。
+- [x] 新 initialize 写回 `updated_at` 和当前 HMAC 签名，且不写 mock signature。
 - [x] `cargo fmt --all -- --check`、`cargo test -p rustfs-transfer-center`、`cargo test --workspace`、`scripts/check-deploy.ps1` 通过后独立提交。
 
 ---

@@ -15,7 +15,7 @@ use uuid::Uuid;
 use crate::{
     center_security::{CenterSecurity, SIGNATURE_ALG_HMAC_SHA256},
     reinitializer::{
-        CompletedImport, DiskInfo, DiskInfoTemplate, DiskStatusCode, NewDataKey,
+        CompletedImport, DiskInfo, DiskInfoDocument, DiskInfoTemplate, DiskStatusCode, NewDataKey,
         PostImportReinitializer, PostImportRepository, ReinitializeError, ReinitializedDisk,
         RuntimeStatus, DISK_INFO_FILE, PROTOCOL_ROOT,
     },
@@ -239,7 +239,11 @@ fn validate_reinitialize_preflight(
         ));
     }
 
-    let disk_info = crate::reinitializer::read_disk_info(mount_path)?;
+    let DiskInfoDocument {
+        disk_info,
+        raw_value,
+        has_top_level_updated_at,
+    } = crate::reinitializer::read_disk_info_document(mount_path)?;
     if disk_info.disk.disk_id != disk_id {
         return Err(anyhow!(
             "disk identity mismatch: path disk_id={} request disk_id={disk_id}",
@@ -264,16 +268,18 @@ fn validate_reinitialize_preflight(
             "seal_id mismatch: expected {seal_id}, got {actual_seal_id:?}"
         ));
     }
-    validate_signature_fields(&disk_info)?;
-    security
-        .verify_disk_info(&disk_info)
-        .context("disk_info center_signature verification failed")?;
+    validate_signature_fields(&disk_info, &raw_value, has_top_level_updated_at, security)?;
     validate_manifest_files(mount_path, &disk_info, disk_id, seal_id)?;
     reject_partials(mount_path)?;
     Ok(disk_info)
 }
 
-fn validate_signature_fields(disk_info: &DiskInfo) -> anyhow::Result<()> {
+fn validate_signature_fields(
+    disk_info: &DiskInfo,
+    raw_disk_info: &serde_json::Value,
+    has_top_level_updated_at: bool,
+    security: &CenterSecurity,
+) -> anyhow::Result<()> {
     if disk_info.security.signature_alg != SIGNATURE_ALG_HMAC_SHA256 {
         return Err(anyhow!(
             "disk_info signature_alg must be {SIGNATURE_ALG_HMAC_SHA256}"
@@ -282,7 +288,24 @@ fn validate_signature_fields(disk_info: &DiskInfo) -> anyhow::Result<()> {
     if disk_info.security.center_signature.trim().is_empty() {
         return Err(anyhow!("disk_info center_signature is missing"));
     }
-    Ok(())
+    if security.verify_disk_info(disk_info).is_ok() {
+        return Ok(());
+    }
+    if !has_top_level_updated_at && is_legacy_imported_disk_info(raw_disk_info) {
+        security
+            .verify_disk_info(raw_disk_info)
+            .context("disk_info legacy center_signature verification failed")?;
+        return Ok(());
+    }
+    Err(anyhow!("disk_info center_signature verification failed"))
+}
+
+fn is_legacy_imported_disk_info(raw_disk_info: &serde_json::Value) -> bool {
+    raw_disk_info.get("updated_at").is_none()
+        && raw_disk_info
+            .pointer("/status/code")
+            .and_then(serde_json::Value::as_str)
+            == Some("IMPORTED")
 }
 
 fn validate_manifest_files(
@@ -731,6 +754,151 @@ mod tests {
     }
 
     #[test]
+    fn current_center_signature_allows_reinitialize_preflight() {
+        let temp = TempDisk::new();
+        let disk_id = Uuid::new_v4();
+        let seal_id = Uuid::new_v4();
+        let old_key = Uuid::new_v4();
+        write_imported_disk(&temp, disk_id, seal_id, old_key);
+
+        validate_reinitialize_preflight(
+            &temp.path,
+            disk_id,
+            seal_id,
+            DiskStatusCode::Imported,
+            "ext4",
+            &security(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn legacy_raw_imported_signature_without_updated_at_allows_reinitialize_preflight() {
+        let temp = TempDisk::new();
+        let disk_id = Uuid::new_v4();
+        let seal_id = Uuid::new_v4();
+        let old_key = Uuid::new_v4();
+        write_imported_disk(&temp, disk_id, seal_id, old_key);
+        write_legacy_raw_imported_missing_updated_at_signature(&temp);
+
+        validate_reinitialize_preflight(
+            &temp.path,
+            disk_id,
+            seal_id,
+            DiskStatusCode::Imported,
+            "ext4",
+            &security(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn signature_rejects_missing_wrong_signature_and_wrong_key_before_writing() {
+        let temp = TempDisk::new();
+        let disk_id = Uuid::new_v4();
+        let seal_id = Uuid::new_v4();
+        let old_key = Uuid::new_v4();
+        write_imported_disk(&temp, disk_id, seal_id, old_key);
+        let disk_info_path = temp.root().join(DISK_INFO_FILE);
+        let original: serde_json::Value =
+            serde_json::from_slice(&fs::read(&disk_info_path).unwrap()).unwrap();
+
+        for signature in ["", "wrong-signature"] {
+            let mut value = original.clone();
+            value["security"]["center_signature"] =
+                serde_json::Value::String(signature.to_string());
+            fs::write(&disk_info_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+            let error = validate_reinitialize_preflight(
+                &temp.path,
+                disk_id,
+                seal_id,
+                DiskStatusCode::Imported,
+                "ext4",
+                &security(),
+            )
+            .unwrap_err();
+
+            assert!(error.to_string().contains("center_signature"));
+            assert_eq!(
+                crate::reinitializer::read_disk_info(&temp.path)
+                    .unwrap()
+                    .status
+                    .code,
+                DiskStatusCode::Imported
+            );
+        }
+
+        let mut value = original.clone();
+        let stale_signature = value["security"]["center_signature"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        value["security"]["center_key_id"] = serde_json::Value::String(Uuid::new_v4().to_string());
+        value["security"]["center_signature"] = serde_json::Value::String(stale_signature);
+        fs::write(&disk_info_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+        let error = validate_reinitialize_preflight(
+            &temp.path,
+            disk_id,
+            seal_id,
+            DiskStatusCode::Imported,
+            "ext4",
+            &security(),
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("center_signature verification failed"));
+    }
+
+    #[test]
+    fn legacy_signature_requires_imported_shape_and_missing_updated_at() {
+        let temp = TempDisk::new();
+        let disk_id = Uuid::new_v4();
+        let seal_id = Uuid::new_v4();
+        let old_key = Uuid::new_v4();
+        write_imported_disk(&temp, disk_id, seal_id, old_key);
+        let legacy_value = write_legacy_raw_imported_missing_updated_at_signature(&temp);
+        let disk_info_path = temp.root().join(DISK_INFO_FILE);
+
+        let mut with_updated_at = legacy_value.clone();
+        with_updated_at["updated_at"] = serde_json::Value::String(Utc::now().to_rfc3339());
+        fs::write(
+            &disk_info_path,
+            serde_json::to_vec_pretty(&with_updated_at).unwrap(),
+        )
+        .unwrap();
+        let error = validate_reinitialize_preflight(
+            &temp.path,
+            disk_id,
+            seal_id,
+            DiskStatusCode::Imported,
+            "ext4",
+            &security(),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("center_signature verification failed"));
+
+        let mut sealed = legacy_value;
+        sealed["status"]["code"] = serde_json::Value::String("SEALED".to_string());
+        fs::write(&disk_info_path, serde_json::to_vec_pretty(&sealed).unwrap()).unwrap();
+        let error = validate_reinitialize_preflight(
+            &temp.path,
+            disk_id,
+            seal_id,
+            DiskStatusCode::Imported,
+            "ext4",
+            &security(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("updated_at") || error.to_string().contains("json"));
+    }
+
+    #[test]
     fn successful_cleanup_reinitialize_cleans_payload_and_rotates_key() {
         let temp = TempDisk::new();
         let disk_id = Uuid::new_v4();
@@ -804,7 +972,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_missing_updated_at_reaches_later_signature_guard_without_writing() {
+    fn legacy_missing_updated_at_reaches_later_manifest_guard_without_writing() {
         let temp = TempDisk::new();
         let disk_id = Uuid::new_v4();
         let seal_id = Uuid::new_v4();
@@ -812,11 +980,8 @@ mod tests {
         write_imported_disk(&temp, disk_id, seal_id, old_key);
 
         let disk_info_path = temp.root().join(DISK_INFO_FILE);
-        let mut value: serde_json::Value =
-            serde_json::from_slice(&fs::read(&disk_info_path).unwrap()).unwrap();
-        value.as_object_mut().unwrap().remove("updated_at");
-        value["security"]["center_signature"] = serde_json::Value::String(String::new());
-        fs::write(&disk_info_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        write_legacy_raw_imported_missing_updated_at_signature(&temp);
+        fs::write(temp.root().join(EXPORT_MANIFEST_SHA256), "tampered-sidecar").unwrap();
 
         let error = validate_reinitialize_preflight(
             &temp.path,
@@ -828,7 +993,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(error.to_string().contains("center_signature"));
+        assert!(error.to_string().contains("manifest"));
         let current: serde_json::Value =
             serde_json::from_slice(&fs::read(&disk_info_path).unwrap()).unwrap();
         assert_eq!(current["status"]["code"], "IMPORTED");
@@ -871,7 +1036,7 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("center_signature"));
 
-        disk_info.security.center_signature = "old-signature".to_string();
+        disk_info.security.center_signature = security().sign_disk_info(&disk_info).unwrap();
         crate::reinitializer::write_disk_info(&temp.path, &disk_info).unwrap();
         write_manifest(&temp, disk_id, seal_id, "tampered-sidecar");
         let error = validate_reinitialize_preflight(
@@ -1005,6 +1170,22 @@ mod tests {
         disk_info.security.center_signature = String::new();
         disk_info.security.center_signature = security().sign_disk_info(&disk_info).unwrap();
         crate::reinitializer::write_disk_info(&temp.path, &disk_info).unwrap();
+    }
+
+    fn write_legacy_raw_imported_missing_updated_at_signature(
+        temp: &TempDisk,
+    ) -> serde_json::Value {
+        let disk_info_path = temp.root().join(DISK_INFO_FILE);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&disk_info_path).unwrap()).unwrap();
+        value["protocol"]["name"] =
+            serde_json::Value::String("rustfs-offline-transfer".to_string());
+        value.as_object_mut().unwrap().remove("updated_at");
+        value["security"]["center_signature"] = serde_json::Value::String(String::new());
+        value["security"]["center_signature"] =
+            serde_json::Value::String(security().sign_disk_info(&value).unwrap());
+        fs::write(&disk_info_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        value
     }
 
     fn template() -> DiskInfoTemplate {

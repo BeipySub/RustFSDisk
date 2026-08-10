@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -330,27 +331,44 @@ fn count_partial_files(path: &Path, count: &mut usize) -> Result<(), Reinitializ
 }
 
 pub fn read_disk_info(mount_path: &Path) -> Result<DiskInfo, ReinitializeError> {
+    Ok(read_disk_info_document(mount_path)?.disk_info)
+}
+
+#[derive(Debug, Clone)]
+pub struct DiskInfoDocument {
+    pub disk_info: DiskInfo,
+    pub raw_value: Value,
+    pub has_top_level_updated_at: bool,
+}
+
+pub fn read_disk_info_document(mount_path: &Path) -> Result<DiskInfoDocument, ReinitializeError> {
     let path = protocol_root(mount_path).join(DISK_INFO_FILE);
     let bytes = fs::read(&path).map_err(|source| ReinitializeError::Fs {
         action: format!("read {}", path.display()),
         source,
     })?;
-    let mut value: serde_json::Value =
-        serde_json::from_slice(&bytes).map_err(ReinitializeError::Json)?;
-    if value.get("updated_at").is_none()
-        && value
-            .pointer("/status/code")
-            .and_then(serde_json::Value::as_str)
-            == Some("IMPORTED")
+    let value: Value = serde_json::from_slice(&bytes).map_err(ReinitializeError::Json)?;
+    let has_top_level_updated_at = value
+        .as_object()
+        .map(|object| object.contains_key("updated_at"))
+        .unwrap_or(false);
+    let mut parse_value = value.clone();
+    if !has_top_level_updated_at
+        && value.pointer("/status/code").and_then(Value::as_str) == Some("IMPORTED")
     {
-        if let serde_json::Value::Object(fields) = &mut value {
+        if let Value::Object(fields) = &mut parse_value {
             fields.insert(
                 "updated_at".to_string(),
-                serde_json::Value::String(legacy_missing_updated_at().to_rfc3339()),
+                Value::String(legacy_missing_updated_at().to_rfc3339()),
             );
         }
     }
-    serde_json::from_value(value).map_err(ReinitializeError::Json)
+    let disk_info = serde_json::from_value(parse_value).map_err(ReinitializeError::Json)?;
+    Ok(DiskInfoDocument {
+        disk_info,
+        raw_value: value,
+        has_top_level_updated_at,
+    })
 }
 
 pub fn write_disk_info(mount_path: &Path, disk_info: &DiskInfo) -> Result<(), ReinitializeError> {
