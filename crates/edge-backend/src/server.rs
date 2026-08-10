@@ -4,8 +4,8 @@ use crate::{
     config::EdgeConfig,
     control::{
         missing_control_service, validate_export_job_id, ControlError, CreateExportJobRequest,
-        EdgeControlService, ProductionEdgeControlService, RecoverExportJobRequest,
-        ScanTriggerRequest, StartExportJobRequest,
+        EdgeControlService, ExportJobRecordsRequest, ProductionEdgeControlService,
+        RecoverExportJobRequest, ScanTriggerRequest, StartExportJobRequest,
     },
     disk_detection::{
         ConfiguredMountProbe, EdgeDiskDetector, EdgeDiskDetectorConfig, PgDiskRuntimeLedger,
@@ -15,7 +15,7 @@ use crate::{
 use axum::response::IntoResponse;
 use axum::{
     extract::ws::{Message, WebSocket},
-    extract::{Path, State, WebSocketUpgrade},
+    extract::{Path, Query, State, WebSocketUpgrade},
     http::{HeaderMap, StatusCode},
     response::Response,
     routing::{get, post},
@@ -100,6 +100,15 @@ pub fn app(state: AppState) -> Router {
         .route("/healthz", get(liveness))
         .route("/readyz", get(readiness))
         .route("/internal/disk/rescan", post(request_disk_rescan))
+        .route("/api/edge/dashboard/summary", get(edge_dashboard_summary))
+        .route(
+            "/api/edge/dashboard/export-jobs",
+            get(edge_dashboard_export_jobs),
+        )
+        .route(
+            "/api/edge/dashboard/export-jobs/{export_job_id}",
+            get(edge_dashboard_get_export_job),
+        )
         .route("/api/edge/summary", get(edge_summary))
         .route("/ws/edge/copy-progress", get(edge_copy_progress_ws))
         .route("/ws/edge/progress", get(edge_copy_progress_ws))
@@ -233,6 +242,54 @@ async fn edge_summary(
 ) -> Result<Json<crate::control::EdgeControlSummary>, ApiError> {
     authorize_control_api(&state, &headers)?;
     state.control.summary().await.map(Json).map_err(Into::into)
+}
+
+async fn edge_dashboard_summary(
+    State(state): State<AppState>,
+) -> Result<Json<crate::control::EdgeControlSummary>, ApiError> {
+    state
+        .control
+        .summary()
+        .await
+        .map(browser_safe_summary)
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn edge_dashboard_export_jobs(
+    State(state): State<AppState>,
+    Query(request): Query<ExportJobRecordsRequest>,
+) -> Result<Json<crate::control::ExportJobRecordsResponse>, ApiError> {
+    state
+        .control
+        .export_jobs(request)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn edge_dashboard_get_export_job(
+    State(state): State<AppState>,
+    Path(export_job_id): Path<Uuid>,
+) -> Result<Json<crate::control::ExportJobResponse>, ApiError> {
+    validate_export_job_id(export_job_id)?;
+    state
+        .control
+        .export_job(export_job_id)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+fn browser_safe_summary(
+    mut summary: crate::control::EdgeControlSummary,
+) -> crate::control::EdgeControlSummary {
+    for disk in &mut summary.disks {
+        if disk.disk_status_code == "IMPORTED" {
+            disk.disk_status_code = "ERROR".to_string();
+        }
+    }
+    summary
 }
 
 async fn edge_copy_progress_ws(State(state): State<AppState>, ws: WebSocketUpgrade) -> Response {
@@ -636,6 +693,34 @@ mod tests {
             })
         }
 
+        fn export_jobs<'a>(
+            &'a self,
+            request: ExportJobRecordsRequest,
+        ) -> ControlFuture<'a, crate::control::ExportJobRecordsResponse> {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push("export_jobs");
+                Ok(crate::control::ExportJobRecordsResponse {
+                    page: request.page.max(1),
+                    page_size: request.page_size.clamp(1, 100),
+                    total_count: 1,
+                    records: vec![crate::control::ExportJobRecord {
+                        export_job_id: self.export_job_id,
+                        edge_code: "edge-a".to_string(),
+                        export_job_status: request
+                            .export_job_status
+                            .unwrap_or_else(|| "SEALED".to_string()),
+                        object_count: 2,
+                        copied_count: 2,
+                        total_bytes: 99,
+                        copied_bytes: 99,
+                        start_time: None,
+                        finish_time: None,
+                        error_message: None,
+                    }],
+                })
+            })
+        }
+
         fn summary<'a>(&'a self) -> ControlFuture<'a, EdgeControlSummary> {
             Box::pin(async move {
                 self.calls.lock().unwrap().push("summary");
@@ -662,7 +747,7 @@ mod tests {
                         disk_id: Some(Uuid::new_v4()),
                         device_path: "/dev/sdb1".to_string(),
                         mount_path: Some("/mnt/rustfs-transfer/disk-a".to_string()),
-                        disk_status_code: "INITIALIZED".to_string(),
+                        disk_status_code: "IMPORTED".to_string(),
                         runtime_status: "READY".to_string(),
                         capacity_bytes: 100,
                         free_bytes: 80,
@@ -716,6 +801,92 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn controlled_summary_requires_token_but_dashboard_summary_is_public_readonly() {
+        let control = Arc::new(FakeControl::default());
+        let router = app(test_state(control.clone()));
+
+        let controlled = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/edge/summary")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(controlled.status(), StatusCode::UNAUTHORIZED);
+
+        let dashboard = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/edge/dashboard/summary")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(dashboard.status(), StatusCode::OK);
+        let body = json_body(dashboard).await;
+        assert_eq!(body["source"], "edge");
+        assert_eq!(body["disks"][0]["disk_status_code"], "ERROR");
+        assert_ne!(body["disks"][0]["disk_status_code"], "IMPORTED");
+        assert!(body.get("status").is_none());
+        assert!(body.get("disk_data_key").is_none());
+        assert_eq!(control.calls.lock().unwrap().as_slice(), &["summary"]);
+    }
+
+    #[tokio::test]
+    async fn dashboard_export_records_are_public_readonly_without_control_token() {
+        let export_job_id = Uuid::new_v4();
+        let control = Arc::new(FakeControl {
+            export_job_id,
+            ..Default::default()
+        });
+        let router = app(test_state(control.clone()));
+
+        let list = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/edge/dashboard/export-jobs?page=1&page_size=20&export_job_status=SEALED")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list.status(), StatusCode::OK);
+        let list_body = json_body(list).await;
+        assert_eq!(list_body["records"][0]["export_job_status"], "SEALED");
+        assert!(list_body.get("status").is_none());
+        assert!(list_body.get("disk_data_key").is_none());
+
+        let detail = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/edge/dashboard/export-jobs/{export_job_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(detail.status(), StatusCode::OK);
+        let detail_body = json_body(detail).await;
+        assert_eq!(detail_body["export_job_id"], export_job_id.to_string());
+        assert!(detail_body.get("status").is_none());
+        assert!(detail_body.get("disk_data_key").is_none());
+        assert_eq!(
+            control.calls.lock().unwrap().as_slice(),
+            &["export_jobs", "export_job"]
+        );
     }
 
     #[tokio::test]

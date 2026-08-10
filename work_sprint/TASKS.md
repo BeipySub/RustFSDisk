@@ -120,6 +120,7 @@
 | TASK-S1-WEB-EDGE-001 | 边缘端 DashboardView、HTTP 汇总和 WS 进度展示 | P2 交付增强 | Web / Edge | [x] | Day 1-2 | TASK-S1-TEST-001 |
 | TASK-S1-WEB-CENTER-001 | 中控端 DashboardView、HTTP 汇总和 WS 进度展示 | P2 交付增强 | Web / Center | [x] | Day 1-2 | TASK-S1-TEST-001 |
 | TASK-S1-DASHBOARD-REALTIME-001 | 双端真实 Dashboard HTTP summary 与本端 WebSocket 推送 | P0 解阻塞 | Center / Edge / Web | [x] | Day 2 联调修补 | TASK-S1-WEB-EDGE-001, TASK-S1-WEB-CENTER-001 |
+| TASK-S1-P1-EDGE-WEB-CONTRACT-001 | Edge Web 浏览器安全只读契约补齐 | P1 主闭环 | Edge / Web contract | [x] | Day 2 审计修补 | TASK-S1-DASHBOARD-REALTIME-001, TASK-S1-WEB-EDGE-001 |
 | TASK-S1-DEPLOY-001 | systemd、udev、配置示例和本地联调脚本 | P2 交付增强 | Deploy | [x] | Day 1-2 | TASK-S1-CENTER-001, TASK-S1-EDGE-001 |
 | TASK-S1-INTEGRATION-001 | 主闭环联调、验收、风险登记和交付检查 | P2 交付增强 | Integration | [~] | Day 2 下午 | Day 2 主闭环任务 |
 
@@ -1558,6 +1559,52 @@
 - [x] `cargo test -p rustfs-transfer-edge` 通过。
 - [x] 双端前端 typecheck/build 通过。
 - [x] 部署静态检查通过。
+
+---
+
+# 开发任务卡片：TASK-S1-P1-EDGE-WEB-CONTRACT-001
+
+### 任务基本信息
+
+- **任务 ID**：TASK-S1-P1-EDGE-WEB-CONTRACT-001
+- **任务名称**：Edge Web 浏览器安全只读契约补齐
+- **所属 Track / 模块**：
+  - [ ] Track 1: Common
+  - [x] Track 2: Edge (`crates/edge-backend`)
+  - [ ] Track 3: Center
+  - [x] Track 4: Web contract
+- **任务状态**：[x] 开发完成
+- **负责人 / Role**：Codex 串行合入执行窗口
+- **计划时间**：Day 2 审计修补
+- **依赖任务**：TASK-S1-DASHBOARD-REALTIME-001, TASK-S1-WEB-EDGE-001
+
+### 任务目标与范围
+
+- **核心目标**：补齐 Edge Web 页面可直接调用的浏览器公开只读接口，避免 Dashboard 和导出记录页依赖 `X-Edge-Control-Token`。
+- **对应代码位置**：`crates/edge-backend/src/control.rs`、`crates/edge-backend/src/server.rs`
+
+### 协议与数据结构约束
+
+- 新增公开只读路径：`GET /api/edge/dashboard/summary`、`GET /api/edge/dashboard/export-jobs`、`GET /api/edge/dashboard/export-jobs/{export_job_id}`。
+- 原受控运维路径保持不变：`GET /api/edge/summary`、scan、导出创建、启动、恢复等控制接口继续要求 `X-Edge-Control-Token`。
+- 浏览器只读响应不得暴露控制 token、`disk_data_key`、`authorization_key`、nonce、tag 或 `data_key_id`。
+- 浏览器 summary 不展示 `IMPORTED` 运输盘生命周期；如底层出现该状态，面向浏览器降级为错误展示。
+
+### 安全与状态机边界
+
+- 用户已明确授权 Edge Dashboard/导出记录浏览器只读接口对所有可访问浏览器公开，不做本机限制、登录、代理认证或 token。
+- 本任务不新增扫描、导出创建、启动、恢复、初始化、清理、格式化、导入或任意写盘/写库路径。
+- WebSocket 仍只用于本端前端展示，不用于 Center/Edge 在线同步。
+
+### 验收与检查清单
+
+- [x] `/api/edge/dashboard/summary` 无控制 token 可读。
+- [x] `/api/edge/dashboard/export-jobs` 与详情接口无控制 token 可读。
+- [x] `/api/edge/summary` 与控制 POST 路径仍要求控制 token。
+- [x] 响应字段无裸 `status` 混用。
+- [x] `cargo fmt --all -- --check` 通过。
+- [x] `cargo test -p rustfs-transfer-edge` 通过。
+- [x] 未修改、未暂存 `docs/v1.0冻结/`。
 
 ---
 

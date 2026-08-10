@@ -44,6 +44,11 @@ pub trait EdgeControlService: Send + Sync {
 
     fn export_job<'a>(&'a self, export_job_id: Uuid) -> ControlFuture<'a, ExportJobResponse>;
 
+    fn export_jobs<'a>(
+        &'a self,
+        request: ExportJobRecordsRequest,
+    ) -> ControlFuture<'a, ExportJobRecordsResponse>;
+
     fn summary<'a>(&'a self) -> ControlFuture<'a, EdgeControlSummary>;
 
     fn copy_progress_snapshot<'a>(&'a self) -> ControlFuture<'a, Option<CopyProgressEvent>>;
@@ -134,6 +139,44 @@ pub struct ExportJobResponse {
     pub finish_time: Option<DateTime<Utc>>,
     pub error_message: Option<String>,
     pub object_status_counts: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExportJobRecordsRequest {
+    #[serde(default = "default_page")]
+    pub page: u32,
+    #[serde(default = "default_page_size")]
+    pub page_size: u32,
+    #[serde(default)]
+    pub export_job_status: Option<String>,
+    #[serde(default)]
+    pub started_from: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub started_to: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub q: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ExportJobRecordsResponse {
+    pub page: u32,
+    pub page_size: u32,
+    pub total_count: u64,
+    pub records: Vec<ExportJobRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ExportJobRecord {
+    pub export_job_id: Uuid,
+    pub edge_code: String,
+    pub export_job_status: String,
+    pub object_count: u64,
+    pub copied_count: u64,
+    pub total_bytes: u64,
+    pub copied_bytes: u64,
+    pub start_time: Option<DateTime<Utc>>,
+    pub finish_time: Option<DateTime<Utc>>,
+    pub error_message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -518,6 +561,13 @@ impl EdgeControlService for ProductionEdgeControlService {
         Box::pin(async move { load_export_job(&self.pool, export_job_id).await })
     }
 
+    fn export_jobs<'a>(
+        &'a self,
+        request: ExportJobRecordsRequest,
+    ) -> ControlFuture<'a, ExportJobRecordsResponse> {
+        Box::pin(async move { load_export_jobs(&self.pool, request).await })
+    }
+
     fn summary<'a>(&'a self) -> ControlFuture<'a, EdgeControlSummary> {
         Box::pin(async move {
             let latest_export_job_id: Option<Uuid> =
@@ -606,6 +656,98 @@ async fn load_export_job(
         finish_time: naive_utc(row.get("finish_time")),
         error_message: row.get("error_message"),
         object_status_counts: load_object_status_counts(pool, export_job_id).await?,
+    })
+}
+
+async fn load_export_jobs(
+    pool: &PgPool,
+    request: ExportJobRecordsRequest,
+) -> Result<ExportJobRecordsResponse, ControlError> {
+    let page = request.page.max(1);
+    let page_size = request.page_size.clamp(1, 100);
+    let offset = ((page - 1) * page_size) as i64;
+    let status = request
+        .export_job_status
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if status
+        .as_deref()
+        .is_some_and(|value| !is_valid_export_job_status(value))
+    {
+        return Err(ControlError::bad_request(
+            "INVALID_REQUEST",
+            "export_job_status filter is not valid",
+        ));
+    }
+    let q = request
+        .q
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("%{value}%"));
+
+    let total_count: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM export_job
+        WHERE ($1::text IS NULL OR status = $1)
+          AND ($2::timestamp IS NULL OR start_time >= $2)
+          AND ($3::timestamp IS NULL OR start_time <= $3)
+          AND ($4::text IS NULL OR export_job_id::text ILIKE $4 OR edge_code ILIKE $4)
+        "#,
+    )
+    .bind(status.as_deref())
+    .bind(request.started_from.map(|value| value.naive_utc()))
+    .bind(request.started_to.map(|value| value.naive_utc()))
+    .bind(q.as_deref())
+    .fetch_one(pool)
+    .await
+    .context("count export job records")?;
+
+    let rows = sqlx::query(
+        r#"
+        SELECT export_job_id, edge_code, status, object_count, copied_count,
+               total_bytes, copied_bytes, start_time, finish_time, error_message
+        FROM export_job
+        WHERE ($1::text IS NULL OR status = $1)
+          AND ($2::timestamp IS NULL OR start_time >= $2)
+          AND ($3::timestamp IS NULL OR start_time <= $3)
+          AND ($4::text IS NULL OR export_job_id::text ILIKE $4 OR edge_code ILIKE $4)
+        ORDER BY id DESC
+        LIMIT $5 OFFSET $6
+        "#,
+    )
+    .bind(status.as_deref())
+    .bind(request.started_from.map(|value| value.naive_utc()))
+    .bind(request.started_to.map(|value| value.naive_utc()))
+    .bind(q.as_deref())
+    .bind(page_size as i64)
+    .bind(offset)
+    .fetch_all(pool)
+    .await
+    .context("load export job records")?;
+
+    Ok(ExportJobRecordsResponse {
+        page,
+        page_size,
+        total_count: total_count.max(0) as u64,
+        records: rows
+            .into_iter()
+            .map(|row| ExportJobRecord {
+                export_job_id: row.get("export_job_id"),
+                edge_code: row.get("edge_code"),
+                export_job_status: row.get("status"),
+                object_count: row.get::<i64, _>("object_count").max(0) as u64,
+                copied_count: row.get::<i64, _>("copied_count").max(0) as u64,
+                total_bytes: row.get::<i64, _>("total_bytes").max(0) as u64,
+                copied_bytes: row.get::<i64, _>("copied_bytes").max(0) as u64,
+                start_time: naive_utc(row.get("start_time")),
+                finish_time: naive_utc(row.get("finish_time")),
+                error_message: row.get("error_message"),
+            })
+            .collect(),
     })
 }
 
@@ -1225,6 +1367,21 @@ fn naive_utc(value: Option<NaiveDateTime>) -> Option<DateTime<Utc>> {
     value.map(|value| DateTime::from_naive_utc_and_offset(value, Utc))
 }
 
+fn is_valid_export_job_status(value: &str) -> bool {
+    matches!(
+        value,
+        "PENDING" | "SCANNING" | "COPYING" | "SEALED" | "FAILED" | "CANCELLED"
+    )
+}
+
+fn default_page() -> u32 {
+    1
+}
+
+fn default_page_size() -> u32 {
+    20
+}
+
 fn default_record_source_changed_objects() -> bool {
     true
 }
@@ -1277,6 +1434,13 @@ where
 
     fn export_job<'a>(&'a self, export_job_id: Uuid) -> ControlFuture<'a, ExportJobResponse> {
         (**self).export_job(export_job_id)
+    }
+
+    fn export_jobs<'a>(
+        &'a self,
+        request: ExportJobRecordsRequest,
+    ) -> ControlFuture<'a, ExportJobRecordsResponse> {
+        (**self).export_jobs(request)
     }
 
     fn summary<'a>(&'a self) -> ControlFuture<'a, EdgeControlSummary> {
