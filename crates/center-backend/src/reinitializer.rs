@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::center_security::{CenterSecurity, ENCRYPTION_ALG_AES_256_GCM};
+use crate::center_security::{
+    CenterSecurity, ENCRYPTION_ALG_AES_256_GCM, SIGNATURE_ALG_HMAC_SHA256,
+};
 
 pub const PROTOCOL_ROOT: &str = "rustfs-transfer";
 pub const DISK_INFO_FILE: &str = "disk_info.json";
@@ -121,11 +123,20 @@ where
         disk_id: Uuid,
         seal_id: Uuid,
     ) -> Result<ReinitializedDisk, ReinitializeError> {
-        let previous_disk_info = read_disk_info(mount_path)?;
+        let document = read_disk_info_document(mount_path)?;
+        self.reinitialize_imported_disk_from_document(mount_path, disk_id, seal_id, document)
+    }
+
+    pub(crate) fn reinitialize_imported_disk_from_document(
+        &mut self,
+        mount_path: &Path,
+        disk_id: Uuid,
+        seal_id: Uuid,
+        document: DiskInfoDocument,
+    ) -> Result<ReinitializedDisk, ReinitializeError> {
+        validate_center_signature_for_reinitialize(&document, &self.security)?;
+        let previous_disk_info = document.disk_info;
         validate_imported_disk_info(&previous_disk_info, disk_id, seal_id)?;
-        self.security
-            .verify_disk_info(&previous_disk_info)
-            .map_err(|error| ReinitializeError::SignatureInvalid(error.to_string()))?;
         let old_data_key_id = previous_disk_info.security.data_key_id;
         let import = self
             .repo
@@ -369,6 +380,44 @@ pub fn read_disk_info_document(mount_path: &Path) -> Result<DiskInfoDocument, Re
         raw_value: value,
         has_top_level_updated_at,
     })
+}
+
+pub(crate) fn validate_center_signature_for_reinitialize(
+    document: &DiskInfoDocument,
+    security: &CenterSecurity,
+) -> Result<(), ReinitializeError> {
+    let disk_info = &document.disk_info;
+    if disk_info.security.signature_alg != SIGNATURE_ALG_HMAC_SHA256 {
+        return Err(ReinitializeError::SignatureInvalid(format!(
+            "disk_info signature_alg must be {SIGNATURE_ALG_HMAC_SHA256}"
+        )));
+    }
+    if disk_info.security.center_signature.trim().is_empty() {
+        return Err(ReinitializeError::SignatureInvalid(
+            "disk_info center_signature is missing".to_string(),
+        ));
+    }
+    if security.verify_disk_info(disk_info).is_ok() {
+        return Ok(());
+    }
+    if !document.has_top_level_updated_at && is_legacy_imported_disk_info(&document.raw_value) {
+        return security.verify_disk_info(&document.raw_value).map_err(|_| {
+            ReinitializeError::SignatureInvalid(
+                "disk_info center_signature verification failed".to_string(),
+            )
+        });
+    }
+    Err(ReinitializeError::SignatureInvalid(
+        "disk_info center_signature verification failed".to_string(),
+    ))
+}
+
+fn is_legacy_imported_disk_info(raw_disk_info: &Value) -> bool {
+    raw_disk_info.get("updated_at").is_none()
+        && raw_disk_info
+            .pointer("/status/code")
+            .and_then(Value::as_str)
+            == Some("IMPORTED")
 }
 
 pub fn write_disk_info(mount_path: &Path, disk_info: &DiskInfo) -> Result<(), ReinitializeError> {

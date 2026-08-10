@@ -13,11 +13,12 @@ use tokio::{runtime::Handle, task};
 use uuid::Uuid;
 
 use crate::{
-    center_security::{CenterSecurity, SIGNATURE_ALG_HMAC_SHA256},
+    center_security::CenterSecurity,
     reinitializer::{
-        CompletedImport, DiskInfo, DiskInfoDocument, DiskInfoTemplate, DiskStatusCode, NewDataKey,
-        PostImportReinitializer, PostImportRepository, ReinitializeError, ReinitializedDisk,
-        RuntimeStatus, DISK_INFO_FILE, PROTOCOL_ROOT,
+        validate_center_signature_for_reinitialize, CompletedImport, DiskInfo, DiskInfoDocument,
+        DiskInfoTemplate, DiskStatusCode, NewDataKey, PostImportReinitializer,
+        PostImportRepository, ReinitializeError, ReinitializedDisk, RuntimeStatus, DISK_INFO_FILE,
+        PROTOCOL_ROOT,
     },
 };
 
@@ -199,7 +200,7 @@ fn run_reinitialize_with_repo<R>(
 where
     R: PostImportRepository,
 {
-    validate_reinitialize_preflight(
+    let disk_info_document = validate_reinitialize_preflight(
         &mount_path,
         disk_id,
         request.seal_id,
@@ -209,7 +210,12 @@ where
     )?;
 
     let mut reinitializer = PostImportReinitializer::new(repo, template, security);
-    let output = reinitializer.reinitialize_imported_disk(&mount_path, disk_id, request.seal_id)?;
+    let output = reinitializer.reinitialize_imported_disk_from_document(
+        &mount_path,
+        disk_id,
+        request.seal_id,
+        disk_info_document,
+    )?;
     Ok(response_from_output(output))
 }
 
@@ -232,18 +238,15 @@ fn validate_reinitialize_preflight(
     expected_status_code: DiskStatusCode,
     filesystem_type: &str,
     security: &CenterSecurity,
-) -> anyhow::Result<DiskInfo> {
+) -> anyhow::Result<DiskInfoDocument> {
     if filesystem_type != "ext4" {
         return Err(anyhow!(
             "filesystem unsupported for cleanup/reinitialize: expected ext4, got {filesystem_type}"
         ));
     }
 
-    let DiskInfoDocument {
-        disk_info,
-        raw_value,
-        has_top_level_updated_at,
-    } = crate::reinitializer::read_disk_info_document(mount_path)?;
+    let disk_info_document = crate::reinitializer::read_disk_info_document(mount_path)?;
+    let disk_info = &disk_info_document.disk_info;
     if disk_info.disk.disk_id != disk_id {
         return Err(anyhow!(
             "disk identity mismatch: path disk_id={} request disk_id={disk_id}",
@@ -268,44 +271,10 @@ fn validate_reinitialize_preflight(
             "seal_id mismatch: expected {seal_id}, got {actual_seal_id:?}"
         ));
     }
-    validate_signature_fields(&disk_info, &raw_value, has_top_level_updated_at, security)?;
-    validate_manifest_files(mount_path, &disk_info, disk_id, seal_id)?;
+    validate_center_signature_for_reinitialize(&disk_info_document, security)?;
+    validate_manifest_files(mount_path, disk_info, disk_id, seal_id)?;
     reject_partials(mount_path)?;
-    Ok(disk_info)
-}
-
-fn validate_signature_fields(
-    disk_info: &DiskInfo,
-    raw_disk_info: &serde_json::Value,
-    has_top_level_updated_at: bool,
-    security: &CenterSecurity,
-) -> anyhow::Result<()> {
-    if disk_info.security.signature_alg != SIGNATURE_ALG_HMAC_SHA256 {
-        return Err(anyhow!(
-            "disk_info signature_alg must be {SIGNATURE_ALG_HMAC_SHA256}"
-        ));
-    }
-    if disk_info.security.center_signature.trim().is_empty() {
-        return Err(anyhow!("disk_info center_signature is missing"));
-    }
-    if security.verify_disk_info(disk_info).is_ok() {
-        return Ok(());
-    }
-    if !has_top_level_updated_at && is_legacy_imported_disk_info(raw_disk_info) {
-        security
-            .verify_disk_info(raw_disk_info)
-            .context("disk_info legacy center_signature verification failed")?;
-        return Ok(());
-    }
-    Err(anyhow!("disk_info center_signature verification failed"))
-}
-
-fn is_legacy_imported_disk_info(raw_disk_info: &serde_json::Value) -> bool {
-    raw_disk_info.get("updated_at").is_none()
-        && raw_disk_info
-            .pointer("/status/code")
-            .and_then(serde_json::Value::as_str)
-            == Some("IMPORTED")
+    Ok(disk_info_document)
 }
 
 fn validate_manifest_files(
@@ -608,6 +577,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::center_security::SIGNATURE_ALG_HMAC_SHA256;
     use crate::reinitializer::{
         CenterInfo, DiskIdentity, DiskInfo, EdgeSealInfo, ManifestInfo, ProtocolInfo, SecurityInfo,
     };
@@ -944,6 +914,107 @@ mod tests {
         assert_eq!(guard.active_key, Some(response.new_data_key_id));
         let staged = guard.staged_keys.get(&response.new_data_key_id).unwrap();
         assert!(staged.encrypted_key.starts_with("local-master-key:v1:"));
+    }
+
+    #[test]
+    fn legacy_missing_updated_at_signature_reinitializes_through_runtime_and_core() {
+        let temp = TempDisk::new();
+        let disk_id = Uuid::new_v4();
+        let seal_id = Uuid::new_v4();
+        let old_key = Uuid::new_v4();
+        write_imported_disk(&temp, disk_id, seal_id, old_key);
+        write_legacy_raw_imported_missing_updated_at_signature(&temp);
+        fs::create_dir_all(temp.root().join("data")).unwrap();
+        fs::write(temp.root().join("data/object.enc"), b"ciphertext").unwrap();
+
+        let repo = SharedRepo::default();
+        repo.0.lock().unwrap().completed_import = Some(CompletedImport {
+            import_job_id: Uuid::new_v4(),
+            disk_id,
+            seal_id,
+            old_data_key_id: old_key,
+        });
+
+        let response = run_reinitialize_with_repo(
+            repo.clone(),
+            template(),
+            security(),
+            disk_id,
+            request(&temp.path, seal_id),
+            temp.path.clone(),
+            "ext4".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(response.disk_status_code, DiskStatusCode::Initialized);
+        let disk_info = crate::reinitializer::read_disk_info(&temp.path).unwrap();
+        assert_eq!(disk_info.status.code, DiskStatusCode::Initialized);
+        assert!(security().verify_disk_info(&disk_info).is_ok());
+        let raw: serde_json::Value =
+            serde_json::from_slice(&fs::read(temp.root().join(DISK_INFO_FILE)).unwrap()).unwrap();
+        assert!(raw.get("updated_at").is_some());
+        assert!(!temp.root().join("data/object.enc").exists());
+
+        let guard = repo.0.lock().unwrap();
+        assert_eq!(
+            guard.runtime,
+            vec![
+                RuntimeStatus::Cleaning,
+                RuntimeStatus::Reinitializing,
+                RuntimeStatus::Done,
+            ]
+        );
+        assert_eq!(guard.retired_key, Some(old_key));
+        assert_eq!(guard.active_key, Some(response.new_data_key_id));
+    }
+
+    #[test]
+    fn runtime_bad_signature_rejects_before_core_writes_or_repo_updates() {
+        let temp = TempDisk::new();
+        let disk_id = Uuid::new_v4();
+        let seal_id = Uuid::new_v4();
+        let old_key = Uuid::new_v4();
+        write_imported_disk(&temp, disk_id, seal_id, old_key);
+        fs::create_dir_all(temp.root().join("data")).unwrap();
+        fs::write(temp.root().join("data/object.enc"), b"ciphertext").unwrap();
+
+        let disk_info_path = temp.root().join(DISK_INFO_FILE);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&disk_info_path).unwrap()).unwrap();
+        value["security"]["center_signature"] =
+            serde_json::Value::String("wrong-signature".to_string());
+        fs::write(&disk_info_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        let original_disk_info_bytes = fs::read(&disk_info_path).unwrap();
+
+        let repo = SharedRepo::default();
+        repo.0.lock().unwrap().completed_import = Some(CompletedImport {
+            import_job_id: Uuid::new_v4(),
+            disk_id,
+            seal_id,
+            old_data_key_id: old_key,
+        });
+
+        let error = run_reinitialize_with_repo(
+            repo.clone(),
+            template(),
+            security(),
+            disk_id,
+            request(&temp.path, seal_id),
+            temp.path.clone(),
+            "ext4".to_string(),
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("center_signature verification failed"));
+        assert_eq!(fs::read(&disk_info_path).unwrap(), original_disk_info_bytes);
+        assert!(temp.root().join("data/object.enc").exists());
+        let guard = repo.0.lock().unwrap();
+        assert!(guard.runtime.is_empty());
+        assert!(guard.staged_keys.is_empty());
+        assert_eq!(guard.active_key, None);
+        assert_eq!(guard.retired_key, None);
     }
 
     #[test]

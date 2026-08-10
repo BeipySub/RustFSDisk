@@ -114,6 +114,7 @@
 | TASK-S1-P1-CENTER-REINIT-FSTYPE-002 | Center reinitialize findmnt 多行 ext4 解析修补 | P1 主闭环 | Center | [x] | Day 2 VM 热修补 | TASK-S1-P1-CENTER-REINIT-API-001 |
 | TASK-S1-P1-CENTER-REINIT-UPDATED-AT-003 | Center reinitialize 兼容旧盘缺 updated_at | P1 主闭环 | Center | [x] | Day 2 VM 热修补 | TASK-S1-P1-CENTER-REINIT-FSTYPE-002 |
 | TASK-S1-P1-CENTER-REINIT-SIGNATURE-004 | Center reinitialize 兼容旧 IMPORTED 签名 canonical | P1 主闭环 | Center | [x] | Day 2 VM 热修补 | TASK-S1-P1-CENTER-REINIT-UPDATED-AT-003 |
+| TASK-S1-P1-CENTER-REINIT-SIGNATURE-005 | Center reinitialize 统一内外层 center_signature 验签 | P1 主闭环 | Center | [x] | Day 2 VM 热修补 | TASK-S1-P1-CENTER-REINIT-SIGNATURE-004 |
 | TASK-S1-WEB-EDGE-001 | 边缘端 DashboardView、HTTP 汇总和 WS 进度展示 | P2 交付增强 | Web / Edge | [x] | Day 1-2 | TASK-S1-TEST-001 |
 | TASK-S1-WEB-CENTER-001 | 中控端 DashboardView、HTTP 汇总和 WS 进度展示 | P2 交付增强 | Web / Center | [x] | Day 1-2 | TASK-S1-TEST-001 |
 | TASK-S1-DASHBOARD-REALTIME-001 | 双端真实 Dashboard HTTP summary 与本端 WebSocket 推送 | P0 解阻塞 | Center / Edge / Web | [x] | Day 2 联调修补 | TASK-S1-WEB-EDGE-001, TASK-S1-WEB-CENTER-001 |
@@ -1255,6 +1256,48 @@
 - [x] 旧签名兼容只限缺 `updated_at` 的 `IMPORTED` 历史形态。
 - [x] 新 initialize 写回 `updated_at` 和当前 HMAC 签名，且不写 mock signature。
 - [x] `cargo fmt --all -- --check`、`cargo test -p rustfs-transfer-center`、`cargo test --workspace`、`scripts/check-deploy.ps1` 通过后独立提交。
+
+---
+
+# 开发任务卡片：TASK-S1-P1-CENTER-REINIT-SIGNATURE-005
+
+### 任务基本信息
+
+- **任务 ID**：TASK-S1-P1-CENTER-REINIT-SIGNATURE-005
+- **任务名称**：Center reinitialize 统一内外层 center_signature 验签
+- **所属 Track / 模块**：
+  - [ ] Track 1: Common
+  - [ ] Track 2: Edge
+  - [x] Track 3: Center (`crates/center-backend`)
+  - [ ] Track 4: Web / Deploy
+- **任务状态**：[x] 开发完成
+- **负责人 / Role**：Codex 串行合入/提交窗口
+- **计划时间**：Day 2 VM 热修补
+- **依赖任务**：TASK-S1-P1-CENTER-REINIT-SIGNATURE-004
+
+### 任务目标与范围
+
+- **核心目标**：修补真实 VM 第四次受控 reinitialize 发现的内外层验签不一致：外层 preflight 已按旧盘 raw canonical 验证缺 `updated_at` 的 `IMPORTED` 盘，但 `PostImportReinitializer` 内部重新读取补值后的结构并按 current-only canonical 再验签，导致写盘前 HTTP 400。
+- **对应代码位置**：`crates/center-backend/src/reinitializer.rs`、`crates/center-backend/src/reinitialize_runtime.rs`
+
+### 协议与安全边界
+
+- 不修改 `docs/v1.0冻结/`，不新增迁移，不修改协议语义。
+- `validate_reinitialize_preflight` 返回同一份 `DiskInfoDocument`，runtime 和 `PostImportReinitializer` 都使用该 raw-context document。
+- 外层与核心层共用 `validate_center_signature_for_reinitialize`；不得用裸布尔值跳过核心层验签。
+- 当前 canonical 和旧 `IMPORTED`/缺 top-level `updated_at` raw canonical 均必须通过真实 Center HMAC 验签；错误签名、错 key、非 `IMPORTED`、带 `updated_at` 的历史签名仍在写入前拒绝。
+- 核心 reinitializer 仍保留 identity、`IMPORTED`、seal、DONE import、old data key、`.partial=0`、key staging/activation/retire 等防线。
+
+### 验收与检查清单
+
+- [x] `legacy_missing_updated_at_signature_reinitializes_through_runtime_and_core` 覆盖旧 `IMPORTED` 盘从 runtime 到核心层成功清理并写回 `INITIALIZED`。
+- [x] `runtime_bad_signature_rejects_before_core_writes_or_repo_updates` 覆盖错误签名在写盘和 repo 更新前拒绝，保留原盘内文件和 payload。
+- [x] 既有 current 签名、历史签名范围、错签名/错 key、manifest、partial、非 ext4、非 `IMPORTED` 测试继续通过。
+- [x] `cargo fmt --all -- --check` 通过。
+- [x] `cargo test -p rustfs-transfer-center` 通过。
+- [x] `cargo test --workspace` 通过。
+- [x] `powershell -ExecutionPolicy Bypass -File scripts\check-deploy.ps1` 通过。
+- [x] 该补丁尚未部署真实 VM 验收，不得宣称 `FUSTFS-TST-A` 已完成 cleanup/reinitialize。
 
 ---
 
