@@ -335,7 +335,22 @@ pub fn read_disk_info(mount_path: &Path) -> Result<DiskInfo, ReinitializeError> 
         action: format!("read {}", path.display()),
         source,
     })?;
-    serde_json::from_slice(&bytes).map_err(ReinitializeError::Json)
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(ReinitializeError::Json)?;
+    if value.get("updated_at").is_none()
+        && value
+            .pointer("/status/code")
+            .and_then(serde_json::Value::as_str)
+            == Some("IMPORTED")
+    {
+        if let serde_json::Value::Object(fields) = &mut value {
+            fields.insert(
+                "updated_at".to_string(),
+                serde_json::Value::String(legacy_missing_updated_at().to_rfc3339()),
+            );
+        }
+    }
+    serde_json::from_value(value).map_err(ReinitializeError::Json)
 }
 
 pub fn write_disk_info(mount_path: &Path, disk_info: &DiskInfo) -> Result<(), ReinitializeError> {
@@ -426,6 +441,10 @@ pub struct DiskInfo {
     pub security: SecurityInfo,
     pub status: DiskStatus,
     pub updated_at: DateTime<Utc>,
+}
+
+fn legacy_missing_updated_at() -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp(0, 0).expect("unix epoch is a valid UTC timestamp")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -619,6 +638,7 @@ mod tests {
         assert!(disk_info.status.reusable);
         assert_eq!(disk_info.edge, None);
         assert_eq!(disk_info.manifest, None);
+        assert!(disk_info.updated_at > legacy_missing_updated_at());
         assert_ne!(disk_info.security.data_key_id, old_key);
         assert_eq!(output.old_data_key_id, old_key);
         assert!(!temp.root().join("data/object.bin").exists());
@@ -720,6 +740,97 @@ mod tests {
         assert!(repo
             .runtime
             .contains(&(RuntimeStatus::Error, Some(REINIT_FAILED.to_string()))));
+    }
+
+    #[test]
+    fn legacy_imported_disk_info_without_updated_at_is_accepted_with_audit_sentinel() {
+        let temp = TempDisk::new();
+        let disk_id = Uuid::new_v4();
+        let seal_id = Uuid::new_v4();
+        let old_key = Uuid::new_v4();
+        let mut value =
+            serde_json::to_value(imported_disk_info(disk_id, seal_id, old_key, &security()))
+                .unwrap();
+        value.as_object_mut().unwrap().remove("updated_at");
+        fs::write(
+            temp.root().join(DISK_INFO_FILE),
+            serde_json::to_vec_pretty(&value).unwrap(),
+        )
+        .unwrap();
+
+        let disk_info = read_disk_info(&temp.path).unwrap();
+
+        assert_eq!(disk_info.disk.disk_id, disk_id);
+        assert_eq!(disk_info.status.code, DiskStatusCode::Imported);
+        assert_eq!(disk_info.updated_at, legacy_missing_updated_at());
+    }
+
+    #[test]
+    fn missing_updated_at_is_only_accepted_for_legacy_imported_disk_info() {
+        for status_code in [DiskStatusCode::Initialized, DiskStatusCode::Sealed] {
+            let temp = TempDisk::new();
+            let disk_id = Uuid::new_v4();
+            let seal_id = Uuid::new_v4();
+            let old_key = Uuid::new_v4();
+            let mut value =
+                serde_json::to_value(imported_disk_info(disk_id, seal_id, old_key, &security()))
+                    .unwrap();
+            value["status"]["code"] = serde_json::Value::String(status_code.as_str().to_string());
+            value.as_object_mut().unwrap().remove("updated_at");
+            fs::write(
+                temp.root().join(DISK_INFO_FILE),
+                serde_json::to_vec_pretty(&value).unwrap(),
+            )
+            .unwrap();
+
+            let error = read_disk_info(&temp.path).unwrap_err();
+
+            assert!(matches!(error, ReinitializeError::Json(_)));
+        }
+    }
+
+    #[test]
+    fn empty_or_invalid_updated_at_is_rejected() {
+        for updated_at in ["", "not-a-timestamp"] {
+            let temp = TempDisk::new();
+            let disk_id = Uuid::new_v4();
+            let seal_id = Uuid::new_v4();
+            let old_key = Uuid::new_v4();
+            let mut value =
+                serde_json::to_value(imported_disk_info(disk_id, seal_id, old_key, &security()))
+                    .unwrap();
+            value["updated_at"] = serde_json::Value::String(updated_at.to_string());
+            fs::write(
+                temp.root().join(DISK_INFO_FILE),
+                serde_json::to_vec_pretty(&value).unwrap(),
+            )
+            .unwrap();
+
+            let error = read_disk_info(&temp.path).unwrap_err();
+
+            assert!(matches!(error, ReinitializeError::Json(_)));
+        }
+    }
+
+    #[test]
+    fn missing_critical_disk_info_fields_still_reject() {
+        let temp = TempDisk::new();
+        let disk_id = Uuid::new_v4();
+        let seal_id = Uuid::new_v4();
+        let old_key = Uuid::new_v4();
+        let mut value =
+            serde_json::to_value(imported_disk_info(disk_id, seal_id, old_key, &security()))
+                .unwrap();
+        value.as_object_mut().unwrap().remove("security");
+        fs::write(
+            temp.root().join(DISK_INFO_FILE),
+            serde_json::to_vec_pretty(&value).unwrap(),
+        )
+        .unwrap();
+
+        let error = read_disk_info(&temp.path).unwrap_err();
+
+        assert!(matches!(error, ReinitializeError::Json(_)));
     }
 
     #[test]

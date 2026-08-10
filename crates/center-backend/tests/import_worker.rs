@@ -46,6 +46,12 @@ fn imports_fixture_sealed_disk() {
     let disk_info: Value =
         serde_json::from_slice(&fs::read(fixture.root.join("disk_info.json")).unwrap()).unwrap();
     assert_eq!(disk_info["status"]["code"], "IMPORTED");
+    assert!(chrono::DateTime::parse_from_rfc3339(
+        disk_info["updated_at"]
+            .as_str()
+            .expect("imported disk_info writes updated_at")
+    )
+    .is_ok());
 }
 
 #[test]

@@ -112,6 +112,7 @@
 | TASK-S1-CENTER-005 | 导入后清理、重新初始化、密钥退役和失败恢复 | P1 主闭环 | Center | [x] | Day 2 下午 | TASK-S1-CENTER-004 |
 | TASK-S1-P1-CENTER-REINIT-API-001 | Center 受控清理重初始化生产 API | P1 主闭环 | Center | [x] | Day 2 VM 验收修补 | TASK-S1-CENTER-005 |
 | TASK-S1-P1-CENTER-REINIT-FSTYPE-002 | Center reinitialize findmnt 多行 ext4 解析修补 | P1 主闭环 | Center | [x] | Day 2 VM 热修补 | TASK-S1-P1-CENTER-REINIT-API-001 |
+| TASK-S1-P1-CENTER-REINIT-UPDATED-AT-003 | Center reinitialize 兼容旧盘缺 updated_at | P1 主闭环 | Center | [x] | Day 2 VM 热修补 | TASK-S1-P1-CENTER-REINIT-FSTYPE-002 |
 | TASK-S1-WEB-EDGE-001 | 边缘端 DashboardView、HTTP 汇总和 WS 进度展示 | P2 交付增强 | Web / Edge | [x] | Day 1-2 | TASK-S1-TEST-001 |
 | TASK-S1-WEB-CENTER-001 | 中控端 DashboardView、HTTP 汇总和 WS 进度展示 | P2 交付增强 | Web / Center | [x] | Day 1-2 | TASK-S1-TEST-001 |
 | TASK-S1-DASHBOARD-REALTIME-001 | 双端真实 Dashboard HTTP summary 与本端 WebSocket 推送 | P0 解阻塞 | Center / Edge / Web | [x] | Day 2 联调修补 | TASK-S1-WEB-EDGE-001, TASK-S1-WEB-CENTER-001 |
@@ -1171,6 +1172,47 @@
 - [x] 单测覆盖单行 `ext4`、重复 `ext4`、多行空白 `ext4`。
 - [x] 单测覆盖混合 `ext4+xfs`、空输出、命令失败拒绝。
 - [x] 拒绝路径仍在 `PostImportReinitializer` 写盘前。
+- [x] `cargo fmt --all -- --check`、`cargo test -p rustfs-transfer-center`、`cargo test --workspace`、`scripts/check-deploy.ps1` 通过后独立提交。
+
+---
+
+# 开发任务卡片：TASK-S1-P1-CENTER-REINIT-UPDATED-AT-003
+
+### 任务基本信息
+
+- **任务 ID**：TASK-S1-P1-CENTER-REINIT-UPDATED-AT-003
+- **任务名称**：Center reinitialize 兼容旧盘缺 updated_at
+- **所属 Track / 模块**：
+  - [ ] Track 1: Common
+  - [ ] Track 2: Edge
+  - [x] Track 3: Center (`crates/center-backend`)
+  - [ ] Track 4: Web
+- **任务状态**：[x] 开发完成
+- **负责人 / Role**：Codex 串行合入/提交窗口
+- **计划时间**：Day 2 VM 热修补
+- **依赖任务**：TASK-S1-P1-CENTER-REINIT-FSTYPE-002
+
+### 任务目标与范围
+
+- **核心目标**：修补真实 VM 中旧导入路径生成的 `IMPORTED` 盘缺少顶层 `updated_at`，导致受控 reinitialize 在任何写入前反序列化失败的问题。
+- **现场结论**：此前真实 API 调用在写盘前 HTTP 400 安全拒绝，已核验零写盘、零 DB 写入。
+- **对应代码位置**：`crates/center-backend/src/reinitializer.rs`、`crates/center-backend/src/reinitialize_runtime.rs`、`crates/center-backend/src/import_worker.rs`、`crates/center-backend/tests/import_worker.rs`
+
+### 协议与状态机约束
+
+- 兼容范围限于 Center reinitialize 读取旧 `IMPORTED` 盘 `disk_info.json` 时缺少 `updated_at`；缺失时使用 Unix epoch sentinel 作为可审计兼容语义。
+- 空字符串、非法 timestamp、缺少其他关键字段、非 `IMPORTED` 生命周期缺少 `updated_at` 仍拒绝。
+- 新写出的 `INITIALIZED` disk_info 必须包含标准 `updated_at`。
+- 新 ImportWorker 成功标记 `IMPORTED` 时同步写顶层 `updated_at`，避免继续产生旧格式盘。
+
+### 验收与检查清单
+
+- [x] 旧 `IMPORTED` disk_info 缺 `updated_at` 可解析为 sentinel。
+- [x] 非 `IMPORTED` 盘缺 `updated_at` 仍拒绝。
+- [x] 缺 `updated_at` 能进入后续签名/manifest/status/identity guard，而不是在 JSON 解析层失败。
+- [x] 空/非法 `updated_at`、缺少 `security` 等关键字段仍拒绝。
+- [x] 成功 reinitialize 写回 `INITIALIZED` disk_info 含新 `updated_at`。
+- [x] ImportWorker 成功导入写回 `IMPORTED` disk_info 含 `updated_at`。
 - [x] `cargo fmt --all -- --check`、`cargo test -p rustfs-transfer-center`、`cargo test --workspace`、`scripts/check-deploy.ps1` 通过后独立提交。
 
 ---

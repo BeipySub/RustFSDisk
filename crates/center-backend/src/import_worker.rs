@@ -588,6 +588,8 @@ struct DiskInfo {
     center: DiskCenter,
     manifest: DiskManifestRef,
     security: DiskSecurity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    updated_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1017,12 +1019,14 @@ fn mark_disk_imported(
     import_job_id: Uuid,
     center_signature_key: &[u8],
 ) -> ImportResult<()> {
+    let now = Utc::now().to_rfc3339();
     disk_info.status.code = "IMPORTED".to_string();
     disk_info.status.sealed = true;
     disk_info.status.imported = true;
     disk_info.status.reusable = true;
     disk_info.center.import_job_id = import_job_id.to_string();
-    disk_info.center.import_finished_at = Utc::now().to_rfc3339();
+    disk_info.center.import_finished_at = now.clone();
+    disk_info.updated_at = Some(now);
     disk_info.security.center_signature = String::new();
     disk_info.security.center_signature = sign_disk_info_with_key(&disk_info, center_signature_key)
         .map_err(|err| {

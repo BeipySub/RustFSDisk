@@ -804,6 +804,38 @@ mod tests {
     }
 
     #[test]
+    fn legacy_missing_updated_at_reaches_later_signature_guard_without_writing() {
+        let temp = TempDisk::new();
+        let disk_id = Uuid::new_v4();
+        let seal_id = Uuid::new_v4();
+        let old_key = Uuid::new_v4();
+        write_imported_disk(&temp, disk_id, seal_id, old_key);
+
+        let disk_info_path = temp.root().join(DISK_INFO_FILE);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&disk_info_path).unwrap()).unwrap();
+        value.as_object_mut().unwrap().remove("updated_at");
+        value["security"]["center_signature"] = serde_json::Value::String(String::new());
+        fs::write(&disk_info_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+        let error = validate_reinitialize_preflight(
+            &temp.path,
+            disk_id,
+            seal_id,
+            DiskStatusCode::Imported,
+            "ext4",
+            &security(),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("center_signature"));
+        let current: serde_json::Value =
+            serde_json::from_slice(&fs::read(&disk_info_path).unwrap()).unwrap();
+        assert_eq!(current["status"]["code"], "IMPORTED");
+        assert!(current.get("updated_at").is_none());
+    }
+
+    #[test]
     fn invalid_status_and_signature_and_manifest_are_rejected() {
         let temp = TempDisk::new();
         let disk_id = Uuid::new_v4();
