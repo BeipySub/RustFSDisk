@@ -92,6 +92,22 @@ pub struct ImportJobStart {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportedDataKeyBinding {
+    pub disk_id: Uuid,
+    pub data_key_id: Uuid,
+    pub export_job_id: Uuid,
+    pub seal_id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportCompletion {
+    pub import_job_id: Uuid,
+    pub imported_count: u64,
+    pub imported_bytes: u64,
+    pub data_key: ImportedDataKeyBinding,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LedgerIdentity {
     pub edge_code: String,
     pub source_bucket: String,
@@ -133,7 +149,11 @@ pub struct ChunkPartRecord {
 
 pub trait ImportRepository {
     fn begin_import(&mut self, start: ImportJobStart) -> ImportResult<ImportClaim>;
-    fn complete_import(&mut self, import_job_id: Uuid, imported_count: u64, imported_bytes: u64);
+    fn complete_import(&mut self, completion: ImportCompletion) -> ImportResult<()>;
+    fn ensure_imported_data_key_sealed(
+        &mut self,
+        data_key: &ImportedDataKeyBinding,
+    ) -> ImportResult<()>;
     fn fail_import(&mut self, import_job_id: Uuid, code: ImportErrorCode, message: &str);
     fn disk_registered(&self, disk_id: Uuid) -> bool;
     fn disk_enabled(&self, disk_id: Uuid) -> bool;
@@ -304,6 +324,8 @@ where
         let import_job_id = match claim {
             ImportClaim::Acquired { import_job_id } => import_job_id,
             ImportClaim::AlreadyDone { import_job_id } => {
+                self.repo
+                    .ensure_imported_data_key_sealed(&checked.data_key_binding())?;
                 return Ok(ImportOutcome::SkippedAlreadyDone { import_job_id });
             }
             ImportClaim::AlreadyImporting { import_job_id } => {
@@ -336,7 +358,12 @@ where
             &checked,
         ) {
             Ok((count, bytes)) => {
-                self.repo.complete_import(import_job_id, count, bytes);
+                self.repo.complete_import(ImportCompletion {
+                    import_job_id,
+                    imported_count: count,
+                    imported_bytes: bytes,
+                    data_key: checked.data_key_binding(),
+                })?;
                 self.progress.finish();
                 mark_disk_imported(
                     protocol_root,
@@ -731,9 +758,21 @@ struct CheckedManifest {
     disk_id: Uuid,
     seal_id: Uuid,
     export_job_id: Uuid,
+    data_key_id: Uuid,
     edge_code: String,
     object_count: u64,
     total_bytes: u64,
+}
+
+impl CheckedManifest {
+    fn data_key_binding(&self) -> ImportedDataKeyBinding {
+        ImportedDataKeyBinding {
+            disk_id: self.disk_id,
+            data_key_id: self.data_key_id,
+            export_job_id: self.export_job_id,
+            seal_id: self.seal_id,
+        }
+    }
 }
 
 fn one() -> u32 {
@@ -820,6 +859,7 @@ fn validate_manifest(
     let disk_id = parse_uuid("disk.disk_id", &disk_info.disk.disk_id)?;
     let seal_id = parse_uuid("edge.seal_id", &disk_info.edge.seal_id)?;
     let export_job_id = parse_uuid("edge.export_job_id", &disk_info.edge.export_job_id)?;
+    let data_key_id = parse_uuid("security.data_key_id", &disk_info.security.data_key_id)?;
     if manifest.disk_id != disk_id
         || manifest.seal_id != seal_id
         || manifest.export_job_id != export_job_id
@@ -834,6 +874,16 @@ fn validate_manifest(
         return Err(ImportError::new(
             ImportErrorCode::ChecksumMismatch,
             "manifest sha256 mismatch",
+        ));
+    }
+    if manifest
+        .objects
+        .iter()
+        .any(|object| object.data_key_id != data_key_id)
+    {
+        return Err(ImportError::new(
+            ImportErrorCode::ManifestInvalid,
+            "manifest object data_key_id does not match disk_info security.data_key_id",
         ));
     }
     validate_objects(&manifest.objects)?;
@@ -856,6 +906,7 @@ fn validate_manifest(
         disk_id,
         seal_id,
         export_job_id,
+        data_key_id,
         edge_code: manifest.edge_code.clone(),
         object_count,
         total_bytes,
@@ -1124,16 +1175,38 @@ pub struct MemoryImportJob {
     pub import_job_id: Uuid,
     pub disk_id: Uuid,
     pub seal_id: Uuid,
+    pub export_job_id: Uuid,
     pub manifest_sha256: String,
     pub status: String,
     pub error_code: Option<String>,
+}
+
+pub const DATA_KEY_STATUS_ACTIVE: &str = "ACTIVE";
+pub const DATA_KEY_STATUS_ISSUED: &str = "ISSUED";
+pub const DATA_KEY_STATUS_SEALED_READONLY: &str = "SEALED_READONLY";
+pub const DATA_KEY_STATUS_RETIRED: &str = "RETIRED";
+pub const DATA_KEY_STATUS_REVOKED: &str = "REVOKED";
+
+#[derive(Debug, Clone)]
+struct MemoryDataKey {
+    key: Vec<u8>,
+    status: String,
+    export_job_id: Option<Uuid>,
+    seal_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryDataKeyState {
+    pub status: String,
+    pub export_job_id: Option<Uuid>,
+    pub seal_id: Option<Uuid>,
 }
 
 #[derive(Debug, Default)]
 pub struct MemoryRepository {
     registered_disks: HashSet<Uuid>,
     disabled_disks: HashSet<Uuid>,
-    data_keys: HashMap<(Uuid, Uuid), Vec<u8>>,
+    data_keys: HashMap<(Uuid, Uuid), MemoryDataKey>,
     jobs: HashMap<(Uuid, Uuid), MemoryImportJob>,
     ledger: Vec<LedgerRecord>,
     chunks: HashMap<(Uuid, u32), ChunkPartRecord>,
@@ -1145,7 +1218,51 @@ impl MemoryRepository {
     }
 
     pub fn put_data_key(&mut self, disk_id: Uuid, data_key_id: Uuid, key: Vec<u8>) {
-        self.data_keys.insert((disk_id, data_key_id), key);
+        self.put_issued_data_key(disk_id, data_key_id, Uuid::nil(), key);
+        if let Some(stored) = self.data_keys.get_mut(&(disk_id, data_key_id)) {
+            stored.export_job_id = None;
+        }
+    }
+
+    pub fn put_issued_data_key(
+        &mut self,
+        disk_id: Uuid,
+        data_key_id: Uuid,
+        export_job_id: Uuid,
+        key: Vec<u8>,
+    ) {
+        self.data_keys.insert(
+            (disk_id, data_key_id),
+            MemoryDataKey {
+                key,
+                status: DATA_KEY_STATUS_ISSUED.to_string(),
+                export_job_id: Some(export_job_id),
+                seal_id: None,
+            },
+        );
+    }
+
+    pub fn data_key_state(&self, disk_id: Uuid, data_key_id: Uuid) -> Option<MemoryDataKeyState> {
+        self.data_keys
+            .get(&(disk_id, data_key_id))
+            .map(|key| MemoryDataKeyState {
+                status: key.status.clone(),
+                export_job_id: key.export_job_id,
+                seal_id: key.seal_id,
+            })
+    }
+
+    pub fn set_data_key_lifecycle_for_test(
+        &mut self,
+        disk_id: Uuid,
+        data_key_id: Uuid,
+        status: impl Into<String>,
+        seal_id: Option<Uuid>,
+    ) {
+        if let Some(key) = self.data_keys.get_mut(&(disk_id, data_key_id)) {
+            key.status = status.into();
+            key.seal_id = seal_id;
+        }
     }
 
     pub fn ledger(&self) -> &[LedgerRecord] {
@@ -1154,6 +1271,60 @@ impl MemoryRepository {
 
     pub fn jobs(&self) -> Vec<MemoryImportJob> {
         self.jobs.values().cloned().collect()
+    }
+
+    fn validate_data_key_binding(&self, data_key: &ImportedDataKeyBinding) -> ImportResult<()> {
+        let Some(key) = self
+            .data_keys
+            .get(&(data_key.disk_id, data_key.data_key_id))
+        else {
+            return Err(ImportError::new(
+                ImportErrorCode::DecryptFailed,
+                "data key for imported disk was not found",
+            ));
+        };
+        if let Some(export_job_id) = key.export_job_id {
+            if export_job_id != data_key.export_job_id {
+                return Err(ImportError::new(
+                    ImportErrorCode::ManifestInvalid,
+                    "data key export_job_id does not match imported manifest",
+                ));
+            }
+        }
+        if let Some(seal_id) = key.seal_id {
+            if seal_id != data_key.seal_id {
+                return Err(ImportError::new(
+                    ImportErrorCode::ManifestInvalid,
+                    "data key seal_id does not match imported manifest",
+                ));
+            }
+        }
+        match key.status.as_str() {
+            DATA_KEY_STATUS_ACTIVE
+            | DATA_KEY_STATUS_ISSUED
+            | DATA_KEY_STATUS_SEALED_READONLY
+            | DATA_KEY_STATUS_RETIRED => Ok(()),
+            DATA_KEY_STATUS_REVOKED => Err(ImportError::new(
+                ImportErrorCode::DecryptFailed,
+                "revoked data key cannot be finalized for import",
+            )),
+            _ => Err(ImportError::new(
+                ImportErrorCode::ManifestInvalid,
+                "data key has unsupported lifecycle status",
+            )),
+        }
+    }
+
+    fn bind_imported_data_key(&mut self, data_key: &ImportedDataKeyBinding) {
+        let key = self
+            .data_keys
+            .get_mut(&(data_key.disk_id, data_key.data_key_id))
+            .expect("binding validated before mutation");
+        key.export_job_id = Some(data_key.export_job_id);
+        key.seal_id = Some(data_key.seal_id);
+        if key.status != DATA_KEY_STATUS_RETIRED {
+            key.status = DATA_KEY_STATUS_SEALED_READONLY.to_string();
+        }
     }
 }
 
@@ -1184,6 +1355,7 @@ impl ImportRepository for MemoryRepository {
                 import_job_id,
                 disk_id: start.disk_id,
                 seal_id: start.seal_id,
+                export_job_id: start.export_job_id,
                 manifest_sha256: start.manifest_sha256,
                 status: "IMPORTING".to_string(),
                 error_code: None,
@@ -1192,14 +1364,64 @@ impl ImportRepository for MemoryRepository {
         Ok(ImportClaim::Acquired { import_job_id })
     }
 
-    fn complete_import(&mut self, import_job_id: Uuid, _imported_count: u64, _imported_bytes: u64) {
-        if let Some(job) = self
+    fn complete_import(&mut self, completion: ImportCompletion) -> ImportResult<()> {
+        let Some(job_key) = self
             .jobs
-            .values_mut()
-            .find(|job| job.import_job_id == import_job_id)
+            .iter()
+            .find_map(|(key, job)| (job.import_job_id == completion.import_job_id).then_some(*key))
+        else {
+            return Err(ImportError::new(
+                ImportErrorCode::ManifestInvalid,
+                "import job was not found for completion",
+            ));
+        };
+        let job = self
+            .jobs
+            .get(&job_key)
+            .expect("job key was selected from jobs");
+        if job.disk_id != completion.data_key.disk_id
+            || job.seal_id != completion.data_key.seal_id
+            || job.export_job_id != completion.data_key.export_job_id
         {
-            job.status = "DONE".to_string();
+            return Err(ImportError::new(
+                ImportErrorCode::ManifestInvalid,
+                "import job does not match imported data key binding",
+            ));
         }
+        if !matches!(job.status.as_str(), "IMPORTING" | "DONE") {
+            return Err(ImportError::new(
+                ImportErrorCode::ManifestInvalid,
+                "import job is not in a completable state",
+            ));
+        }
+        self.validate_data_key_binding(&completion.data_key)?;
+        self.bind_imported_data_key(&completion.data_key);
+        self.jobs
+            .get_mut(&job_key)
+            .expect("job key was validated before mutation")
+            .status = "DONE".to_string();
+        Ok(())
+    }
+
+    fn ensure_imported_data_key_sealed(
+        &mut self,
+        data_key: &ImportedDataKeyBinding,
+    ) -> ImportResult<()> {
+        let done = self.jobs.values().any(|job| {
+            job.disk_id == data_key.disk_id
+                && job.seal_id == data_key.seal_id
+                && job.export_job_id == data_key.export_job_id
+                && job.status == "DONE"
+        });
+        if !done {
+            return Err(ImportError::new(
+                ImportErrorCode::ManifestInvalid,
+                "completed import job was not found for data key sealing",
+            ));
+        }
+        self.validate_data_key_binding(data_key)?;
+        self.bind_imported_data_key(data_key);
+        Ok(())
     }
 
     fn fail_import(&mut self, import_job_id: Uuid, code: ImportErrorCode, _message: &str) {
@@ -1222,7 +1444,10 @@ impl ImportRepository for MemoryRepository {
     }
 
     fn data_key(&self, disk_id: Uuid, data_key_id: Uuid) -> Option<Vec<u8>> {
-        self.data_keys.get(&(disk_id, data_key_id)).cloned()
+        self.data_keys
+            .get(&(disk_id, data_key_id))
+            .filter(|key| key.status != DATA_KEY_STATUS_REVOKED)
+            .map(|key| key.key.clone())
     }
 
     fn identity_imported(&self, identity: &LedgerIdentity) -> bool {

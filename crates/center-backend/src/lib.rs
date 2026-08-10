@@ -2184,31 +2184,60 @@ mod tests {
         assert!(value.get("status").is_none());
     }
 
-    #[tokio::test]
-    async fn controlled_import_route_triggers_import_service() {
-        #[derive(Default)]
-        struct FakeImportControl {
-            calls: Mutex<Vec<PathBuf>>,
-        }
+    #[derive(Default)]
+    struct FakeImportControl {
+        calls: Mutex<Vec<PathBuf>>,
+        fail: bool,
+    }
 
-        impl import_runtime::CenterImportControlService for FakeImportControl {
-            fn import_disk<'a>(
-                &'a self,
-                request: import_runtime::CenterImportRequest,
-            ) -> import_runtime::CenterImportFuture<'a> {
-                Box::pin(async move {
-                    self.calls.lock().unwrap().push(request.mount_path);
-                    Ok(import_runtime::CenterImportResponse {
-                        import_job_id: Some(Uuid::new_v4()),
-                        import_job_status: "DONE".to_string(),
-                        outcome: "IMPORTED".to_string(),
-                        progress: import_worker::ImportProgressSnapshot::default(),
-                        message: "ok".to_string(),
-                    })
+    impl import_runtime::CenterImportControlService for FakeImportControl {
+        fn import_disk<'a>(
+            &'a self,
+            request: import_runtime::CenterImportRequest,
+        ) -> import_runtime::CenterImportFuture<'a> {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push(request.mount_path);
+                if self.fail {
+                    anyhow::bail!("simulated import failure");
+                }
+                Ok(import_runtime::CenterImportResponse {
+                    import_job_id: Some(Uuid::new_v4()),
+                    import_job_status: "DONE".to_string(),
+                    outcome: "IMPORTED".to_string(),
+                    progress: import_worker::ImportProgressSnapshot::default(),
+                    message: "ok".to_string(),
                 })
-            }
+            })
         }
+    }
 
+    #[tokio::test]
+    async fn controlled_import_route_rejects_missing_token_without_calling_service() {
+        let control = Arc::new(FakeImportControl::default());
+        let app = router(
+            AppState::new(memory_service())
+                .with_control_api_token(Some("center-control-token".to_string()))
+                .with_import_control(control.clone()),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/center/import-jobs/start")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"mount_path":"C:\\transport\\disk-a"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(control.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn controlled_import_route_triggers_import_service_with_token() {
         let control = Arc::new(FakeImportControl::default());
         let app = router(
             AppState::new(memory_service())
@@ -2233,6 +2262,35 @@ mod tests {
         let body = json_body(response).await;
         assert_eq!(body["import_job_status"], "DONE");
         assert!(body.get("status").is_none());
+        assert_eq!(control.calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn controlled_import_route_propagates_failure_without_success_response() {
+        let control = Arc::new(FakeImportControl {
+            calls: Mutex::new(Vec::new()),
+            fail: true,
+        });
+        let app = router(
+            AppState::new(memory_service())
+                .with_control_api_token(Some("center-control-token".to_string()))
+                .with_import_control(control.clone()),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/center/import-jobs/start")
+                    .header("content-type", "application/json")
+                    .header("X-Center-Control-Token", "center-control-token")
+                    .body(Body::from(r#"{"mount_path":"C:\\transport\\disk-a"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(control.calls.lock().unwrap().len(), 1);
     }
 

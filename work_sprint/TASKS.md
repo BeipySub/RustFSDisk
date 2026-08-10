@@ -117,6 +117,7 @@
 | TASK-S1-P1-CENTER-REINIT-SIGNATURE-005 | Center reinitialize 统一内外层 center_signature 验签 | P1 主闭环 | Center | [x] | Day 2 VM 热修补 | TASK-S1-P1-CENTER-REINIT-SIGNATURE-004 |
 | TASK-S1-P1-CENTER-REINIT-ADMISSION-006 | Center reinitialize 最小生命周期准入 | P1 主闭环 | Center | [x] | Day 2 VM 热修补 | TASK-S1-P1-CENTER-REINIT-SIGNATURE-005 |
 | TASK-S1-CENTER-HOTFIX-004 | Center reinitialize disk_info 失败原子性修补 | P0 解阻塞 | Center / Security | [x] | Day 2 VM 故障修补 | TASK-S1-P1-CENTER-REINIT-ADMISSION-006 |
+| TASK-S1-CENTER-HOTFIX-005 | Center 导入成功后 data_key 封盘生命周期绑定 | P0 解阻塞 | Center / DB | [x] | Day 2 真实导入修补 | TASK-S1-CENTER-004, TASK-S1-CENTER-005 |
 | TASK-S1-WEB-EDGE-001 | 边缘端 DashboardView、HTTP 汇总和 WS 进度展示 | P2 交付增强 | Web / Edge | [x] | Day 1-2 | TASK-S1-TEST-001 |
 | TASK-S1-WEB-CENTER-001 | 中控端 DashboardView、HTTP 汇总和 WS 进度展示 | P2 交付增强 | Web / Center | [x] | Day 1-2 | TASK-S1-TEST-001 |
 | TASK-S1-DASHBOARD-REALTIME-001 | 双端真实 Dashboard HTTP summary 与本端 WebSocket 推送 | P0 解阻塞 | Center / Edge / Web | [x] | Day 2 联调修补 | TASK-S1-WEB-EDGE-001, TASK-S1-WEB-CENTER-001 |
@@ -1394,6 +1395,54 @@
 - [x] `cargo test --workspace` 通过。
 - [x] `powershell -ExecutionPolicy Bypass -File scripts\check-deploy.ps1` 通过。
 - [x] 该 failure-atomicity 补丁尚未部署真实 VM 复验，不得宣称 `FUSTFS-TST-A` 已完成 cleanup/reinitialize。
+
+---
+
+# 开发任务卡片：TASK-S1-CENTER-HOTFIX-005
+
+### 任务基本信息
+
+- **任务 ID**：TASK-S1-CENTER-HOTFIX-005
+- **任务名称**：Center 导入成功后 data_key 封盘生命周期绑定
+- **所属 Track / 模块**：
+  - [ ] Track 1: Common
+  - [ ] Track 2: Edge
+  - [x] Track 3: Center (`crates/center-backend`)
+  - [x] Track 5: DB / Security
+- **任务状态**：[x] 开发完成
+- **负责人 / Role**：Codex 串行合入/提交窗口
+- **计划时间**：Day 2 真实导入修补
+- **依赖任务**：TASK-S1-CENTER-004, TASK-S1-CENTER-005
+
+### 任务目标与范围
+
+- **核心目标**：修补真实导入后当前 `data_key` 仍停留在 `ISSUED` 且缺少 `seal_id` 绑定的缺口，确保本次导入完成与同一 `data_key` 封为只读在同一完成动作内提交。
+- **对应代码位置**：`crates/center-backend/src/import_worker.rs`、`crates/center-backend/src/import_runtime.rs`、`crates/center-backend/src/lib.rs`、`crates/center-backend/tests/import_worker.rs`
+
+### 协议与数据结构约束
+
+- `disk_data_key` 仍只允许中控导入解密使用，不写入运输盘、前端响应或日志。
+- 导入成功后仅把本次 `disk_id + data_key_id + export_job_id + seal_id` 对应 key 置为 `SEALED_READONLY` 并补齐绑定。
+- 旧 key 退役仍属于重新初始化成功路径，本任务不得在导入完成时把 key 置为 `RETIRED`。
+
+### 安全与状态机边界
+
+- 导入失败、解密失败、manifest 与 `disk_info.security.data_key_id` 不一致时，不得更新任意 `data_key` 生命周期。
+- 重复插入已 DONE 的同一封盘批次时，仅允许幂等补齐同一导入绑定，不得更新其他盘、其他 key 或其他导出任务。
+- 生产 PG 路径必须在事务中完成 `import_job` 完成状态与 `data_key` 封盘绑定；绑定失败则不得把任务误标为 DONE。
+- 本任务只补运行时事务和测试，不新增迁移；既有中心迁移已包含 `data_key.seal_id`、`sealed_time` 与 `SEALED_READONLY` 状态。
+
+### 验收与检查清单
+
+- [x] 导入成功后内存仓库 key 状态变为 `SEALED_READONLY`，并绑定同一 `export_job_id + seal_id`。
+- [x] 重复 DONE 导入可幂等补齐旧 `ISSUED` key 的 seal 绑定。
+- [x] 目标 key 缺失时不会误更新其他盘同名 key。
+- [x] PG SQL 使用 `disk_id + data_key_id + export_job_id + seal_id` 严格谓词。
+- [x] 受控导入路由覆盖缺失 token 不调用服务、有 token 调用服务、服务失败不返回成功。
+- [x] f86c 来源任务原 ID 与主线 reinitialize 原子性任务冲突，本合入改用 `TASK-S1-CENTER-HOTFIX-005` 记录。
+- [x] `cargo fmt --all -- --check` 通过。
+- [x] `cargo test -p rustfs-transfer-center` 通过。
+- [x] 未修改 `docs/v1.0冻结/`，未部署、未调用真实 API、未操作硬盘或生产 SQL。
 
 ---
 

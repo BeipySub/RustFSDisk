@@ -14,9 +14,9 @@ use uuid::Uuid;
 use crate::{
     center_security::CenterSecurity,
     import_worker::{
-        ArchiveStorage, ChunkPartRecord, ImportClaim, ImportError, ImportErrorCode, ImportJobStart,
-        ImportOutcome, ImportProgressSnapshot, ImportRepository, ImportWorker, LedgerIdentity,
-        LedgerRecord, ProgressAggregator,
+        ArchiveStorage, ChunkPartRecord, ImportClaim, ImportCompletion, ImportError,
+        ImportErrorCode, ImportJobStart, ImportOutcome, ImportProgressSnapshot, ImportRepository,
+        ImportWorker, ImportedDataKeyBinding, LedgerIdentity, LedgerRecord, ProgressAggregator,
     },
 };
 
@@ -152,6 +152,30 @@ impl PgImportRepository {
     }
 }
 
+const SEAL_IMPORTED_DATA_KEY_SQL: &str = r#"
+UPDATE data_key
+SET status = CASE WHEN status = 'RETIRED' THEN status ELSE 'SEALED_READONLY' END,
+    export_job_id = COALESCE(export_job_id, $3),
+    seal_id = COALESCE(seal_id, $4),
+    sealed_time = COALESCE(sealed_time, NOW() AT TIME ZONE 'UTC'),
+    last_use_time = (NOW() AT TIME ZONE 'UTC')
+WHERE disk_id = $1
+  AND data_key_id = $2
+  AND (export_job_id IS NULL OR export_job_id = $3)
+  AND (seal_id IS NULL OR seal_id = $4)
+  AND status IN ('ACTIVE', 'ISSUED', 'SEALED_READONLY', 'RETIRED')
+"#;
+
+const COMPLETE_IMPORT_JOB_SQL: &str = r#"
+UPDATE import_job
+SET status = 'DONE',
+    imported_count = $2,
+    imported_bytes = $3,
+    finish_time = COALESCE(finish_time, NOW() AT TIME ZONE 'UTC')
+WHERE import_job_id = $1
+  AND status IN ('IMPORTING', 'DONE')
+"#;
+
 impl ImportRepository for PgImportRepository {
     fn begin_import(&mut self, start: ImportJobStart) -> Result<ImportClaim, ImportError> {
         self.handle.block_on(async {
@@ -186,17 +210,89 @@ impl ImportRepository for PgImportRepository {
         })
     }
 
-    fn complete_import(&mut self, import_job_id: Uuid, imported_count: u64, imported_bytes: u64) {
-        let _ = self.handle.block_on(async {
-            sqlx::query(
-                "UPDATE import_job SET status = 'DONE', imported_count = $2, imported_bytes = $3, finish_time = NOW() AT TIME ZONE 'UTC' WHERE import_job_id = $1",
+    fn complete_import(&mut self, completion: ImportCompletion) -> Result<(), ImportError> {
+        self.handle.block_on(async {
+            let mut tx = self.pool.begin().await.map_err(repo_err)?;
+            let row = sqlx::query(
+                r#"
+                SELECT disk_id, seal_id, export_job_id, status
+                FROM import_job
+                WHERE import_job_id = $1
+                FOR UPDATE
+                "#,
             )
-            .bind(import_job_id)
-            .bind(imported_count as i64)
-            .bind(imported_bytes as i64)
-            .execute(&self.pool)
+            .bind(completion.import_job_id)
+            .fetch_optional(&mut *tx)
             .await
-        });
+            .map_err(repo_err)?
+            .ok_or_else(|| repo_invalid("import job was not found for completion"))?;
+
+            let job_disk_id: Uuid = row.get("disk_id");
+            let job_seal_id: Uuid = row.get("seal_id");
+            let job_export_job_id: Uuid = row.get("export_job_id");
+            let job_status: String = row.get("status");
+            if job_disk_id != completion.data_key.disk_id
+                || job_seal_id != completion.data_key.seal_id
+                || job_export_job_id != completion.data_key.export_job_id
+            {
+                return Err(repo_invalid(
+                    "import job does not match imported data key binding",
+                ));
+            }
+            if !matches!(job_status.as_str(), "IMPORTING" | "DONE") {
+                return Err(repo_invalid("import job is not in a completable state"));
+            }
+
+            seal_imported_data_key(&mut tx, &completion.data_key).await?;
+            let updated = sqlx::query(COMPLETE_IMPORT_JOB_SQL)
+                .bind(completion.import_job_id)
+                .bind(completion.imported_count as i64)
+                .bind(completion.imported_bytes as i64)
+                .execute(&mut *tx)
+                .await
+                .map_err(repo_err)?;
+            if updated.rows_affected() != 1 {
+                return Err(repo_invalid("import job was not completed"));
+            }
+            tx.commit().await.map_err(repo_err)?;
+            Ok(())
+        })
+    }
+
+    fn ensure_imported_data_key_sealed(
+        &mut self,
+        data_key: &ImportedDataKeyBinding,
+    ) -> Result<(), ImportError> {
+        self.handle.block_on(async {
+            let mut tx = self.pool.begin().await.map_err(repo_err)?;
+            let done_job = sqlx::query_scalar::<_, Uuid>(
+                r#"
+                SELECT import_job_id
+                FROM import_job
+                WHERE disk_id = $1
+                  AND seal_id = $2
+                  AND export_job_id = $3
+                  AND status = 'DONE'
+                ORDER BY id DESC
+                LIMIT 1
+                FOR UPDATE
+                "#,
+            )
+            .bind(data_key.disk_id)
+            .bind(data_key.seal_id)
+            .bind(data_key.export_job_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(repo_err)?;
+            if done_job.is_none() {
+                return Err(repo_invalid(
+                    "completed import job was not found for data key sealing",
+                ));
+            }
+            seal_imported_data_key(&mut tx, data_key).await?;
+            tx.commit().await.map_err(repo_err)?;
+            Ok(())
+        })
     }
 
     fn fail_import(&mut self, import_job_id: Uuid, code: ImportErrorCode, message: &str) {
@@ -383,6 +479,26 @@ impl ImportRepository for PgImportRepository {
     }
 }
 
+async fn seal_imported_data_key(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    data_key: &ImportedDataKeyBinding,
+) -> Result<(), ImportError> {
+    let updated = sqlx::query(SEAL_IMPORTED_DATA_KEY_SQL)
+        .bind(data_key.disk_id)
+        .bind(data_key.data_key_id)
+        .bind(data_key.export_job_id)
+        .bind(data_key.seal_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(repo_err)?;
+    if updated.rows_affected() != 1 {
+        return Err(repo_invalid(
+            "imported data key did not match disk_id, data_key_id, export_job_id and seal_id",
+        ));
+    }
+    Ok(())
+}
+
 async fn existing_import_claim(
     pool: &PgPool,
     start: &ImportJobStart,
@@ -401,10 +517,7 @@ async fn existing_import_claim(
     .fetch_optional(pool)
     .await
     .map_err(repo_err)?
-    .ok_or_else(|| ImportError {
-        code: ImportErrorCode::ManifestInvalid,
-        message: "import claim conflict but no active import_job was found".to_string(),
-    })?;
+    .ok_or_else(|| repo_invalid("import claim conflict but no active import_job was found"))?;
     let manifest_sha256: String = row.get("manifest_sha256");
     if manifest_sha256 != start.manifest_sha256 {
         return Err(ImportError {
@@ -483,6 +596,13 @@ fn repo_err(err: sqlx::Error) -> ImportError {
     }
 }
 
+fn repo_invalid(message: impl Into<String>) -> ImportError {
+    ImportError {
+        code: ImportErrorCode::ManifestInvalid,
+        message: message.into(),
+    }
+}
+
 fn parse_db_time(value: &str) -> anyhow::Result<NaiveDateTime> {
     Ok(DateTime::parse_from_rfc3339(value)?
         .with_timezone(&Utc)
@@ -510,5 +630,16 @@ mod tests {
 
         assert_eq!(value["import_job_status"], "DONE");
         assert!(value.get("status").is_none());
+    }
+
+    #[test]
+    fn pg_data_key_seal_sql_is_strict_to_current_import_binding() {
+        assert!(SEAL_IMPORTED_DATA_KEY_SQL.contains("WHERE disk_id = $1"));
+        assert!(SEAL_IMPORTED_DATA_KEY_SQL.contains("AND data_key_id = $2"));
+        assert!(SEAL_IMPORTED_DATA_KEY_SQL.contains("export_job_id IS NULL OR export_job_id = $3"));
+        assert!(SEAL_IMPORTED_DATA_KEY_SQL.contains("seal_id IS NULL OR seal_id = $4"));
+        assert!(SEAL_IMPORTED_DATA_KEY_SQL
+            .contains("status IN ('ACTIVE', 'ISSUED', 'SEALED_READONLY', 'RETIRED')"));
+        assert!(SEAL_IMPORTED_DATA_KEY_SQL.contains("SEALED_READONLY"));
     }
 }

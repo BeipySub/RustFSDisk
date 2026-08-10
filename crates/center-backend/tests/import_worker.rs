@@ -10,7 +10,7 @@ use rustfs_transfer_center::center_security::{
 };
 use rustfs_transfer_center::import_worker::{
     ImportErrorCode, ImportOutcome, ImportWorker, MemoryArchiveStorage, MemoryRepository,
-    ProgressAggregator,
+    ProgressAggregator, DATA_KEY_STATUS_ISSUED, DATA_KEY_STATUS_SEALED_READONLY,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -42,6 +42,12 @@ fn imports_fixture_sealed_disk() {
         b"hello archive"
     );
     assert_eq!(progress.snapshot().import_job_status, "DONE");
+    let data_key = repo
+        .data_key_state(fixture.disk_id, fixture.data_key_id)
+        .expect("fixture key state");
+    assert_eq!(data_key.status, DATA_KEY_STATUS_SEALED_READONLY);
+    assert_eq!(data_key.export_job_id, Some(fixture.export_job_id));
+    assert_eq!(data_key.seal_id, Some(fixture.seal_id));
 
     let disk_info: Value =
         serde_json::from_slice(&fs::read(fixture.root.join("disk_info.json")).unwrap()).unwrap();
@@ -79,6 +85,47 @@ fn skips_same_seal_when_done_with_same_manifest_sha256() {
     .expect("same seal skips");
 
     assert!(matches!(outcome, ImportOutcome::SkippedAlreadyDone { .. }));
+    assert_eq!(repo.ledger().len(), 1);
+}
+
+#[test]
+fn repeated_done_import_backfills_legacy_issued_key_binding() {
+    let fixture = SealedDiskFixture::new_plain("alpha.txt", b"hello archive".to_vec());
+    let mut repo = fixture.repository();
+    let mut storage = MemoryArchiveStorage::default();
+    let mut progress = ProgressAggregator::default();
+
+    ImportWorker::new(
+        &mut repo,
+        &mut storage,
+        &mut progress,
+        fixture.signature_key.clone(),
+    )
+    .import_sealed_disk(&fixture.root)
+    .expect("first import succeeds");
+    repo.set_data_key_lifecycle_for_test(
+        fixture.disk_id,
+        fixture.data_key_id,
+        DATA_KEY_STATUS_ISSUED,
+        None,
+    );
+
+    let outcome = ImportWorker::new(
+        &mut repo,
+        &mut storage,
+        &mut progress,
+        fixture.signature_key.clone(),
+    )
+    .import_sealed_disk(&fixture.root)
+    .expect("repeat import backfills key binding");
+
+    assert!(matches!(outcome, ImportOutcome::SkippedAlreadyDone { .. }));
+    let data_key = repo
+        .data_key_state(fixture.disk_id, fixture.data_key_id)
+        .expect("fixture key state");
+    assert_eq!(data_key.status, DATA_KEY_STATUS_SEALED_READONLY);
+    assert_eq!(data_key.export_job_id, Some(fixture.export_job_id));
+    assert_eq!(data_key.seal_id, Some(fixture.seal_id));
     assert_eq!(repo.ledger().len(), 1);
 }
 
@@ -203,9 +250,46 @@ fn decrypt_failure_marks_job_failed_and_keeps_disk_unimported() {
 
     assert_eq!(err.code, ImportErrorCode::DecryptFailed);
     assert!(repo.ledger().is_empty());
+    let data_key = repo
+        .data_key_state(fixture.disk_id, fixture.data_key_id)
+        .expect("fixture key state");
+    assert_eq!(data_key.status, DATA_KEY_STATUS_ISSUED);
+    assert_eq!(data_key.seal_id, None);
     let disk_info: Value =
         serde_json::from_slice(&fs::read(fixture.root.join("disk_info.json")).unwrap()).unwrap();
     assert_eq!(disk_info["status"]["code"], "SEALED");
+}
+
+#[test]
+fn missing_target_key_does_not_update_other_disk_key() {
+    let fixture = SealedDiskFixture::new_plain("alpha.txt", b"hello archive".to_vec());
+    let wrong_disk_id = Uuid::new_v4();
+    let mut repo = MemoryRepository::default();
+    repo.register_disk(fixture.disk_id);
+    repo.put_issued_data_key(
+        wrong_disk_id,
+        fixture.data_key_id,
+        fixture.export_job_id,
+        fixture.key.clone(),
+    );
+    let mut storage = MemoryArchiveStorage::default();
+    let mut progress = ProgressAggregator::default();
+
+    let err = ImportWorker::new(
+        &mut repo,
+        &mut storage,
+        &mut progress,
+        fixture.signature_key.clone(),
+    )
+    .import_sealed_disk(&fixture.root)
+    .expect_err("target disk key is missing");
+
+    assert_eq!(err.code, ImportErrorCode::DecryptFailed);
+    let data_key = repo
+        .data_key_state(wrong_disk_id, fixture.data_key_id)
+        .expect("wrong disk key state");
+    assert_eq!(data_key.status, DATA_KEY_STATUS_ISSUED);
+    assert_eq!(data_key.seal_id, None);
 }
 
 #[test]
@@ -239,6 +323,8 @@ fn tampered_disk_info_signature_is_rejected_before_import_claim() {
 struct SealedDiskFixture {
     root: PathBuf,
     disk_id: Uuid,
+    seal_id: Uuid,
+    export_job_id: Uuid,
     data_key_id: Uuid,
     key: Vec<u8>,
     signature_key: Vec<u8>,
@@ -393,6 +479,8 @@ impl SealedDiskFixture {
         Self {
             root,
             disk_id,
+            seal_id,
+            export_job_id,
             data_key_id,
             key: key_bytes,
             signature_key,
