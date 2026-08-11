@@ -2,6 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
+use super::ScanReport;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanProgressSnapshot {
     pub event_type: &'static str,
@@ -119,6 +121,27 @@ impl ProgressAggregator {
             snapshot.current_bucket = None;
             snapshot.current_object_key = None;
             snapshot.message = Some("RustFS scan completed".to_owned());
+        });
+    }
+
+    pub fn reuse_recent_scan(&self, report: &ScanReport) {
+        self.update(|snapshot| {
+            *snapshot = ScanProgressSnapshot {
+                event_type: "SCAN_DONE",
+                event_time: Utc::now(),
+                source: "edge",
+                scan_phase: "DONE",
+                bucket_total: report.bucket_count,
+                bucket_done: report.bucket_count,
+                object_seen: report.object_seen,
+                stable_object_count: report.stable_object_count,
+                source_changed_count: report.source_changed_count,
+                total_bytes: report.total_bytes,
+                current_bucket: None,
+                current_object_key: None,
+                last_error_code: None,
+                message: Some("Reused completed RustFS scan within daily window".to_owned()),
+            };
         });
     }
 

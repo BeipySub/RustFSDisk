@@ -1,5 +1,6 @@
 use crate::disk_detection::{
-    BoxFuture, DiskDetectionError, DiskProbe, DiskRuntimeLedger, EdgeDiskDetector,
+    BoxFuture, DiskDetectionError, DiskProbe, DiskRuntimeEventPublisher, DiskRuntimeLedger,
+    EdgeDiskDetector,
 };
 use serde::Serialize;
 use std::sync::Arc;
@@ -12,11 +13,12 @@ pub trait DiskRescanRunner: Send + Sync + 'static {
     ) -> BoxFuture<'a, Result<usize, DiskDetectionError>>;
 }
 
-impl<P, V, L> DiskRescanRunner for EdgeDiskDetector<P, V, L>
+impl<P, V, L, E> DiskRescanRunner for EdgeDiskDetector<P, V, L, E>
 where
     P: DiskProbe + 'static,
     V: crate::disk_detection::CenterDiskVerifier + 'static,
     L: DiskRuntimeLedger + 'static,
+    E: DiskRuntimeEventPublisher,
 {
     fn run_disk_rescan<'a>(
         &'a self,
@@ -25,9 +27,10 @@ where
         Box::pin(async move {
             let records = match trigger.source {
                 DiskRescanSource::Startup => self.scan_existing_transport_disks().await?,
-                DiskRescanSource::Udev | DiskRescanSource::Manual | DiskRescanSource::Queued => {
-                    self.handle_udev_disk_change().await?
-                }
+                DiskRescanSource::Udev
+                | DiskRescanSource::Manual
+                | DiskRescanSource::Queued
+                | DiskRescanSource::ControlRefresh => self.handle_udev_disk_change().await?,
             };
             Ok(records.len())
         })
@@ -40,6 +43,7 @@ pub enum DiskRescanSource {
     Udev,
     Manual,
     Queued,
+    ControlRefresh,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +71,13 @@ impl DiskRescanTrigger {
         Self {
             source: DiskRescanSource::Manual,
             device,
+        }
+    }
+
+    pub fn control_refresh() -> Self {
+        Self {
+            source: DiskRescanSource::ControlRefresh,
+            device: None,
         }
     }
 

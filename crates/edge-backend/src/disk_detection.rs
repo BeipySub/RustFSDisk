@@ -293,6 +293,17 @@ pub trait DiskRuntimeLedger: Send + Sync {
     ) -> BoxFuture<'a, Result<(), DiskDetectionError>>;
 }
 
+pub trait DiskRuntimeEventPublisher: Clone + Send + Sync + 'static {
+    fn publish_disk_runtime(&self, record: &DiskRuntimeRecord);
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NoopDiskRuntimeEventPublisher;
+
+impl DiskRuntimeEventPublisher for NoopDiskRuntimeEventPublisher {
+    fn publish_disk_runtime(&self, _record: &DiskRuntimeRecord) {}
+}
+
 #[derive(Debug, Clone)]
 pub struct EdgeDiskDetectorConfig {
     pub edge_code: String,
@@ -308,11 +319,12 @@ impl EdgeDiskDetectorConfig {
     }
 }
 
-pub struct EdgeDiskDetector<P, V, L> {
+pub struct EdgeDiskDetector<P, V, L, E = NoopDiskRuntimeEventPublisher> {
     config: EdgeDiskDetectorConfig,
     probe: P,
     verifier: V,
     ledger: L,
+    event_publisher: E,
 }
 
 #[derive(Debug, Clone)]
@@ -538,11 +550,36 @@ where
     L: DiskRuntimeLedger,
 {
     pub fn new(config: EdgeDiskDetectorConfig, probe: P, verifier: V, ledger: L) -> Self {
+        Self::new_with_event_publisher(
+            config,
+            probe,
+            verifier,
+            ledger,
+            NoopDiskRuntimeEventPublisher,
+        )
+    }
+}
+
+impl<P, V, L, E> EdgeDiskDetector<P, V, L, E>
+where
+    P: DiskProbe,
+    V: CenterDiskVerifier,
+    L: DiskRuntimeLedger,
+    E: DiskRuntimeEventPublisher,
+{
+    pub fn new_with_event_publisher(
+        config: EdgeDiskDetectorConfig,
+        probe: P,
+        verifier: V,
+        ledger: L,
+        event_publisher: E,
+    ) -> Self {
         Self {
             config,
             probe,
             verifier,
             ledger,
+            event_publisher,
         }
     }
 
@@ -553,8 +590,11 @@ where
         let mut records = Vec::with_capacity(disks.len());
 
         for disk in disks {
+            let detected = base_record(&disk);
+            self.event_publisher.publish_disk_runtime(&detected);
             let record = self.evaluate_disk(disk).await?;
             self.ledger.record_disk_runtime(record.clone()).await?;
+            self.event_publisher.publish_disk_runtime(&record);
             records.push(record);
         }
 
@@ -587,6 +627,7 @@ where
         }
 
         record.runtime_status = RuntimeStatus::Checking.as_db_value().to_string();
+        self.event_publisher.publish_disk_runtime(&record);
 
         let protocol_root = disk.mount_path.join(PROTOCOL_ROOT);
         let disk_info_path = protocol_root.join(DISK_INFO_FILE);
@@ -998,6 +1039,20 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct MockEventPublisher {
+        runtime_statuses: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl DiskRuntimeEventPublisher for MockEventPublisher {
+        fn publish_disk_runtime(&self, record: &DiskRuntimeRecord) {
+            self.runtime_statuses
+                .lock()
+                .expect("runtime status mutex poisoned")
+                .push(record.runtime_status.clone());
+        }
+    }
+
     #[tokio::test]
     async fn rejects_non_ext4_before_center_verify() {
         let mount = temp_mount("non-ext4");
@@ -1108,6 +1163,35 @@ mod tests {
             Some("11111111-1111-1111-1111-111111111111")
         );
         assert_eq!(persisted.runtime_status, "READY");
+        fs::remove_dir_all(mount).ok();
+    }
+
+    #[tokio::test]
+    async fn publishes_detected_checking_and_ready_runtime_events() {
+        let mount = temp_mount("runtime-events-ready");
+        write_disk_info(&mount, "INITIALIZED");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let publisher = MockEventPublisher::default();
+        let detector = EdgeDiskDetector::new_with_event_publisher(
+            EdgeDiskDetectorConfig::new("edge-a"),
+            MockProbe {
+                disks: vec![disk(&mount, "ext4")],
+            },
+            MockVerifier {
+                response: verifier_response(true),
+                requests,
+            },
+            MockLedger::default(),
+            publisher.clone(),
+        );
+
+        let records = detector.scan_existing_transport_disks().await.unwrap();
+
+        assert_eq!(records[0].runtime_status, "READY");
+        assert_eq!(
+            publisher.runtime_statuses.lock().unwrap().as_slice(),
+            &["DETECTED", "CHECKING", "READY"]
+        );
         fs::remove_dir_all(mount).ok();
     }
 

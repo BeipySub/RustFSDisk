@@ -26,6 +26,7 @@ export type ExportJobStatus =
   | "PENDING"
   | "SCANNING"
   | "COPYING"
+  | "SEALING"
   | "SEALED"
   | "FAILED"
   | "CANCELLED";
@@ -79,6 +80,8 @@ export interface EdgeDiskProgress {
   object_done: number;
   object_remaining: number;
   current_object: EdgeCurrentObject | null;
+  last_event_type?: string;
+  last_event_time?: string;
   last_error_code?: string;
   error_message?: string;
   message: string;
@@ -169,6 +172,24 @@ export interface EdgeExportJobsResponse {
   items: EdgeExportJobRecord[];
 }
 
+interface EdgeExportJobsWireResponse {
+  page?: number;
+  page_size?: number;
+  total?: number;
+  total_count?: number;
+  items?: EdgeExportJobRecord[];
+  records?: EdgeExportJobRecord[];
+}
+
+export interface EdgeReadiness {
+  ok: boolean;
+  service: string;
+  edge_code: string;
+  database_ok?: boolean;
+  rustfs_ok?: boolean;
+  disk_mount_roots?: string[];
+}
+
 interface EdgeControlScanSnapshot {
   event_type?: string;
   event_time?: string;
@@ -251,6 +272,7 @@ const exportJobStatuses: readonly ExportJobStatus[] = [
   "PENDING",
   "SCANNING",
   "COPYING",
+  "SEALING",
   "SEALED",
   "FAILED",
   "CANCELLED",
@@ -319,6 +341,14 @@ export function edgeExportJobsPath(): string {
   return envValue("VITE_EDGE_EXPORT_JOBS_PATH", "/api/edge/dashboard/export-jobs");
 }
 
+export function edgeReadinessPath(): string {
+  return envValue("VITE_EDGE_READINESS_PATH", "/readyz");
+}
+
+export async function fetchEdgeReadiness(path = edgeReadinessPath()): Promise<EdgeReadiness> {
+  return getJson<EdgeReadiness>(localEdgePath(path, "/readyz"));
+}
+
 export async function fetchEdgeDashboardSummary(
   path = edgeDashboardSummaryPath(),
 ): Promise<EdgeDashboardSummary> {
@@ -332,7 +362,7 @@ export async function fetchEdgeExportJobs(
   query: EdgeExportJobsQuery,
   basePath = edgeExportJobsPath(),
 ): Promise<EdgeExportJobsResponse> {
-  const payload = await getJson<Partial<EdgeExportJobsResponse> | EdgeExportJobRecord[]>(
+  const payload = await getJson<EdgeExportJobsWireResponse | EdgeExportJobRecord[]>(
     buildExportJobsUrl(basePath, query),
   );
   return normalizeExportJobsResponse(payload, query);
@@ -362,7 +392,7 @@ export function buildExportJobsUrl(basePath: string, query: EdgeExportJobsQuery)
 export function normalizeEdgeDashboardSummary(
   payload: EdgeDashboardSummary | EdgeControlSummary,
 ): EdgeDashboardSummary {
-  if ("global_progress" in payload && Array.isArray(payload.disks) && "scan" in payload) {
+  if (isNormalizedDashboardSummary(payload)) {
     const summary = payload as EdgeDashboardSummary;
     return {
       ...summary,
@@ -453,9 +483,17 @@ export function normalizeEdgeDashboardSummary(
   };
 }
 
+function isNormalizedDashboardSummary(
+  payload: EdgeDashboardSummary | EdgeControlSummary,
+): payload is EdgeDashboardSummary {
+  const scan = (payload as { scan?: Partial<EdgeScanSummary> }).scan;
+  return Array.isArray(payload.disks) && scan?.scan_event_type !== undefined;
+}
+
 export function normalizeDiskProgress(disk: EdgeDiskProgress): EdgeDiskProgress {
   return {
     ...disk,
+    disk_id: disk.disk_id || disk.mount_path || disk.disk_sn || "unidentified-disk",
     disk_status_code: visibleDiskStatusCode(disk.disk_status_code),
     runtime_status: runtimeStatus(disk.runtime_status, "DETECTED"),
     current_object: normalizeCurrentObject(disk.current_object),
@@ -474,8 +512,12 @@ export function diskStatusDisplay(value: EdgeVisibleDiskStatusCode | undefined):
   return value ?? "中控侧状态，Edge 不展示";
 }
 
+export function isActiveExportJobStatus(value: ExportJobStatus | undefined): boolean {
+  return value === "SCANNING" || value === "COPYING" || value === "SEALING";
+}
+
 export function normalizeExportJobsResponse(
-  payload: Partial<EdgeExportJobsResponse> | EdgeExportJobRecord[],
+  payload: EdgeExportJobsWireResponse | EdgeExportJobRecord[],
   query: Pick<EdgeExportJobsQuery, "page" | "page_size">,
 ): EdgeExportJobsResponse {
   if (Array.isArray(payload)) {
@@ -490,8 +532,8 @@ export function normalizeExportJobsResponse(
   return {
     page: numberValue(payload.page, query.page),
     page_size: numberValue(payload.page_size, query.page_size),
-    total: numberValue(payload.total),
-    items: (payload.items ?? []).map(normalizeExportJobRecord),
+    total: numberValue(payload.total ?? payload.total_count),
+    items: (payload.items ?? payload.records ?? []).map(normalizeExportJobRecord),
   };
 }
 

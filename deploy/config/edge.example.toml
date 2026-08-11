@@ -25,3 +25,11 @@ transport_mount_root = "/mnt/rustfs-transfer"
 [rescan]
 token_env = "RUSTFS_TRANSFER__RESCAN__TOKEN"
 
+[auto_export]
+# Conservative default: keep automatic scan/export disabled until an Edge
+# deployment window explicitly enables both flags below.
+enabled = false
+start_on_ready = false
+min_ready_disk_count = 1
+cooldown_seconds = 60
+

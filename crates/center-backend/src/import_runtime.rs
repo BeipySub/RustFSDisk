@@ -82,8 +82,7 @@ impl CenterImportControlService for ProductionCenterImportControlService {
                     }
                     Err(err) => {
                         let snapshot = progress.snapshot();
-                        Err(anyhow!("{}: {}", err.code.as_str(), err.message)
-                            .context(format!("import_job_status={}", snapshot.import_job_status)))
+                        Err(anyhow!("{}", import_failure_message(&snapshot, &err)))
                     }
                 }
             })
@@ -133,6 +132,39 @@ fn response_from_outcome(
             message: "same disk_id + seal_id is already importing".to_string(),
         },
     }
+}
+
+fn import_failure_message(snapshot: &ImportProgressSnapshot, err: &ImportError) -> String {
+    format!(
+        "import_job_status={}; {}: {}",
+        import_failure_status(&snapshot.import_job_status),
+        err.code.as_str(),
+        err.message
+    )
+}
+
+fn import_failure_status(status: &str) -> &'static str {
+    if status.is_empty() {
+        "PENDING"
+    } else if is_import_job_status(status) {
+        match status {
+            "PENDING" => "PENDING",
+            "IMPORTING" => "IMPORTING",
+            "DONE" => "DONE",
+            "FAILED" => "FAILED",
+            "CANCELLED" => "CANCELLED",
+            _ => unreachable!("is_import_job_status accepted an unknown status"),
+        }
+    } else {
+        "FAILED"
+    }
+}
+
+fn is_import_job_status(status: &str) -> bool {
+    matches!(
+        status,
+        "PENDING" | "IMPORTING" | "DONE" | "FAILED" | "CANCELLED"
+    )
 }
 
 #[derive(Clone)]
@@ -637,10 +669,10 @@ mod tests {
     #[test]
     fn import_failure_message_keeps_real_error_when_progress_has_not_started() {
         let snapshot = ImportProgressSnapshot::default();
-        let err = ImportError::new(
-            ImportErrorCode::ManifestInvalid,
-            "disk is not registered or enabled",
-        );
+        let err = ImportError {
+            code: ImportErrorCode::ManifestInvalid,
+            message: "disk is not registered or enabled".to_string(),
+        };
 
         let message = import_failure_message(&snapshot, &err);
 

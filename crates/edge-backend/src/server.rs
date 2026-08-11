@@ -1,5 +1,6 @@
 use crate::{
     adapters::AdapterBundle,
+    auto_export::{AutoExportOrchestrator, AutoExportRescanRunner},
     center_client::CenterHmacClient,
     config::EdgeConfig,
     control::{
@@ -10,7 +11,10 @@ use crate::{
     disk_detection::{
         ConfiguredMountProbe, EdgeDiskDetector, EdgeDiskDetectorConfig, PgDiskRuntimeLedger,
     },
+    progress::{CopyProgressEvent, GlobalProgressSnapshot},
+    realtime::EdgeRealtimeHub,
     rescan::{DiskRescanAccepted, DiskRescanCoordinator, DiskRescanTrigger},
+    scanner::ScanProgressSnapshot,
 };
 use axum::response::IntoResponse;
 use axum::{
@@ -34,6 +38,7 @@ pub struct AppState {
     pub center_client: CenterHmacClient,
     pub disk_rescan: DiskRescanCoordinator,
     control: Arc<dyn EdgeControlService>,
+    realtime: EdgeRealtimeHub,
 }
 
 impl AppState {
@@ -65,19 +70,25 @@ impl AppState {
         let ledger =
             PgDiskRuntimeLedger::connect(&config.database.url, config.database.max_connections)
                 .await?;
-        let detector = EdgeDiskDetector::new(
-            EdgeDiskDetectorConfig::new(config.center.edge_code.clone()),
-            probe,
-            center_client.clone(),
-            ledger,
-        );
-        let disk_rescan = DiskRescanCoordinator::new(Arc::new(detector));
         let control = Arc::new(ProductionEdgeControlService::new(
             config.clone(),
             pg_pool,
             s3_client,
             center_client.clone(),
         ));
+        let realtime = EdgeRealtimeHub::new(config.center.edge_code.clone());
+        let auto_export = AutoExportOrchestrator::new(config.auto_export.clone(), control.clone());
+        let detector = EdgeDiskDetector::new_with_event_publisher(
+            EdgeDiskDetectorConfig::new(config.center.edge_code.clone()),
+            probe,
+            center_client.clone(),
+            ledger,
+            realtime.clone(),
+        );
+        let disk_rescan = DiskRescanCoordinator::new(Arc::new(AutoExportRescanRunner::new(
+            Arc::new(detector),
+            auto_export,
+        )));
 
         Ok(Self {
             config,
@@ -85,6 +96,7 @@ impl AppState {
             center_client,
             disk_rescan,
             control,
+            realtime,
         })
     }
 
@@ -306,25 +318,58 @@ fn browser_safe_export_job(
 
 async fn edge_copy_progress_ws(State(state): State<AppState>, ws: WebSocketUpgrade) -> Response {
     ws.on_upgrade(move |socket| async move {
-        publish_edge_copy_progress(socket, state.control.clone()).await;
+        publish_edge_copy_progress(
+            socket,
+            state.control.clone(),
+            state.realtime.clone(),
+            state.config.center.edge_code.clone(),
+        )
+        .await;
     })
 }
 
-async fn publish_edge_copy_progress(mut socket: WebSocket, control: Arc<dyn EdgeControlService>) {
+async fn publish_edge_copy_progress(
+    mut socket: WebSocket,
+    control: Arc<dyn EdgeControlService>,
+    realtime: EdgeRealtimeHub,
+    edge_code: String,
+) {
     let mut interval = time::interval(Duration::from_secs(1));
     loop {
         interval.tick().await;
-        let event = match control.copy_progress_snapshot().await {
-            Ok(Some(event)) => event,
-            Ok(None) => idle_copy_progress_event(),
+        let copy_event = match control.copy_progress_snapshot().await {
+            Ok(event) => event,
             Err(error) => {
                 tracing::warn!(
                     error_code = error.error_code,
                     message = error.message,
                     "failed to load edge copy progress snapshot"
                 );
-                idle_copy_progress_event()
+                None
             }
+        };
+        let scan_event = match control.scan_progress_snapshot().await {
+            Ok(snapshot) if snapshot.scan_phase != "IDLE" => {
+                Some(scan_progress_event(&edge_code, snapshot))
+            }
+            Ok(_) => None,
+            Err(error) => {
+                tracing::warn!(
+                    error_code = error.error_code,
+                    message = error.message,
+                    "failed to load edge scan progress snapshot"
+                );
+                None
+            }
+        };
+        let event = if let Some(event) = copy_event {
+            event
+        } else if let Some(event) = scan_event {
+            event
+        } else if let Some(event) = realtime.latest_disk_event().await {
+            event
+        } else {
+            idle_copy_progress_event(&edge_code)
         };
         let Ok(payload) = serde_json::to_string(&event) else {
             break;
@@ -335,16 +380,48 @@ async fn publish_edge_copy_progress(mut socket: WebSocket, control: Arc<dyn Edge
     }
 }
 
-fn idle_copy_progress_event() -> crate::progress::CopyProgressEvent {
-    crate::progress::CopyProgressEvent {
+fn scan_progress_event(edge_code: &str, snapshot: ScanProgressSnapshot) -> CopyProgressEvent {
+    CopyProgressEvent {
+        event_type: snapshot.event_type.to_string(),
+        event_time: snapshot.event_time,
+        source: snapshot.source.to_string(),
+        edge_code: edge_code.to_string(),
+        export_job_id: String::new(),
+        disk_status_code: "INITIALIZED".to_string(),
+        export_job_status: match snapshot.scan_phase {
+            "SCANNING" => "SCANNING",
+            "ERROR" => "FAILED",
+            _ => "PENDING",
+        }
+        .to_string(),
+        global_progress: GlobalProgressSnapshot {
+            total_bytes: snapshot.total_bytes,
+            done_bytes: 0,
+            remaining_bytes: snapshot.total_bytes,
+            speed_bytes_per_sec: 0,
+            object_total: snapshot.object_seen,
+            object_done: snapshot.stable_object_count,
+            object_remaining: snapshot
+                .object_seen
+                .saturating_sub(snapshot.stable_object_count),
+        },
+        disks: Vec::new(),
+        message: snapshot
+            .message
+            .unwrap_or_else(|| format!("scan_phase={}", snapshot.scan_phase)),
+    }
+}
+
+fn idle_copy_progress_event(edge_code: &str) -> CopyProgressEvent {
+    CopyProgressEvent {
         event_type: "COPY_PROGRESS".to_string(),
         event_time: chrono::Utc::now(),
         source: "edge".to_string(),
-        edge_code: String::new(),
+        edge_code: edge_code.to_string(),
         export_job_id: String::new(),
         disk_status_code: "INITIALIZED".to_string(),
         export_job_status: "PENDING".to_string(),
-        global_progress: crate::progress::GlobalProgressSnapshot {
+        global_progress: GlobalProgressSnapshot {
             total_bytes: 0,
             done_bytes: 0,
             remaining_bytes: 0,
@@ -439,7 +516,7 @@ async fn recover_export_job(
 async fn refresh_transport_runtime_before_control(state: &AppState) -> Result<(), ApiError> {
     state
         .disk_rescan
-        .run_rescan_once(DiskRescanTrigger::manual(None))
+        .run_rescan_once(DiskRescanTrigger::control_refresh())
         .await
         .map(|_| ())
         .map_err(|err| {
@@ -854,6 +931,10 @@ mod tests {
                 Ok(Some(progress.snapshot("COPY_PROGRESS", "test snapshot")))
             })
         }
+
+        fn scan_progress_snapshot<'a>(&'a self) -> ControlFuture<'a, ScanProgressSnapshot> {
+            Box::pin(async move { Ok(ScanProgressSnapshot::default()) })
+        }
     }
 
     #[tokio::test]
@@ -1195,12 +1276,76 @@ mod tests {
             .expect("fake progress event");
         let value = serde_json::to_value(event).unwrap();
 
-        assert_eq!(value["event_type"], "COPY_PROGRESS");
+        assert_eq!(value["event_type"], "COPY_STARTED");
         assert_eq!(value["source"], "edge");
         assert_eq!(value["disk_status_code"], "EDGE_COPYING");
         assert_eq!(value["export_job_status"], "COPYING");
         assert!(value["disks"].is_array());
         assert!(value.get("status").is_none());
+    }
+
+    #[test]
+    fn scan_progress_event_has_protocol_shape_without_naked_status() {
+        let event = scan_progress_event(
+            "edge-a",
+            ScanProgressSnapshot {
+                event_type: "SCAN_STARTED",
+                event_time: Utc::now(),
+                source: "edge",
+                scan_phase: "SCANNING",
+                bucket_total: 2,
+                bucket_done: 0,
+                object_seen: 0,
+                stable_object_count: 0,
+                source_changed_count: 0,
+                total_bytes: 0,
+                current_bucket: None,
+                current_object_key: None,
+                last_error_code: None,
+                message: Some("scan started".to_string()),
+            },
+        );
+        let value = serde_json::to_value(event).unwrap();
+
+        assert_eq!(value["event_type"], "SCAN_STARTED");
+        assert_eq!(value["source"], "edge");
+        assert_eq!(value["edge_code"], "edge-a");
+        assert_eq!(value["export_job_status"], "SCANNING");
+        assert!(value["disks"].as_array().unwrap().is_empty());
+        assert!(value.get("status").is_none());
+    }
+
+    #[test]
+    fn copy_progress_aggregator_reports_copy_done_and_seal_done() {
+        let progress = crate::progress::ProgressAggregator::new(
+            "edge-a",
+            "22222222-2222-2222-2222-222222222222",
+        );
+        progress.register_disk(
+            "11111111-1111-1111-1111-111111111111",
+            "SN-A",
+            "/mnt/rustfs-transfer/disk-a",
+            99,
+            1,
+            80,
+        );
+        progress.start_object(
+            "11111111-1111-1111-1111-111111111111",
+            "bucket-a",
+            "alpha.bin",
+            "data/alpha.bin",
+            99,
+        );
+        progress.complete_object("11111111-1111-1111-1111-111111111111");
+        let copy_done = progress.snapshot("COPY_PROGRESS", "copy done");
+        assert_eq!(copy_done.event_type, "COPY_DONE");
+        assert_eq!(copy_done.export_job_status, "COPYING");
+
+        progress.mark_disk_done("11111111-1111-1111-1111-111111111111");
+        let seal_done = progress.snapshot("COPY_PROGRESS", "seal done");
+        assert_eq!(seal_done.event_type, "SEAL_DONE");
+        assert_eq!(seal_done.disk_status_code, "SEALED");
+        assert_eq!(seal_done.export_job_status, "SEALED");
     }
 
     fn test_state(control: Arc<dyn EdgeControlService>) -> AppState {
@@ -1255,6 +1400,7 @@ mod tests {
             center_client,
             disk_rescan,
             control,
+            realtime: EdgeRealtimeHub::new("edge-a"),
         }
     }
 

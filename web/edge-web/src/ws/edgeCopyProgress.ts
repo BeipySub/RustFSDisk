@@ -3,11 +3,16 @@ import {
   type EdgeDashboardSummary,
   type EdgeDiskProgress,
   type EdgeGlobalProgress,
+  type ScanEventType,
   localEdgePath,
   visibleDiskStatusCode,
-} from "../api/edgeDashboard";
+} from "../api/edgeDashboard.ts";
 
 export type EdgeProgressEventType =
+  | "SCAN_STARTED"
+  | "SCAN_PROGRESS"
+  | "SCAN_DONE"
+  | "COPY_STARTED"
   | "COPY_PROGRESS"
   | "COPY_DONE"
   | "SEAL_DONE"
@@ -41,6 +46,10 @@ export interface EdgeProgressSocket {
 }
 
 const eventTypes: readonly EdgeProgressEventType[] = [
+  "SCAN_STARTED",
+  "SCAN_PROGRESS",
+  "SCAN_DONE",
+  "COPY_STARTED",
   "COPY_PROGRESS",
   "COPY_DONE",
   "SEAL_DONE",
@@ -114,17 +123,92 @@ export function applyCopyProgressEvent(
   summary: EdgeDashboardSummary,
   event: CopyProgressEvent,
 ): EdgeDashboardSummary {
+  const summaryIsTerminal = isTerminalExportJobStatus(summary.export_job_status);
+  const eventIsTerminal = isTerminalExportJobStatus(event.export_job_status);
+  const sameJob = summary.export_job_id === event.export_job_id;
+
+  if (summaryIsTerminal && summary.disks.length === 0 && !eventIsTerminal) {
+    return {
+      ...summary,
+      ws_connected: true,
+      message: summary.message,
+    };
+  }
+
+  if (sameJob && summaryIsTerminal && !eventIsTerminal) {
+    return {
+      ...summary,
+      ws_connected: true,
+      message: summary.message,
+    };
+  }
+
   return {
     ...summary,
     edge_code: event.edge_code,
     export_job_id: event.export_job_id,
     export_job_status: event.export_job_status,
     disk_status_code: visibleDiskStatusCode(event.disk_status_code),
+    scan: mergeScanSummary(summary, event),
     global_progress: event.global_progress,
-    disks: event.disks.map(normalizeDiskProgress),
+    disks: mergeDiskProgress(summary.disks, event),
     ws_connected: true,
     message: event.message,
   };
+}
+
+function mergeScanSummary(
+  summary: EdgeDashboardSummary,
+  event: CopyProgressEvent,
+): EdgeDashboardSummary["scan"] {
+  if (!isScanEventType(event.event_type)) return summary.scan;
+
+  return {
+    ...summary.scan,
+    scan_event_type: event.event_type,
+    scanned_object_count: event.global_progress.object_total,
+    scanned_bytes: event.global_progress.total_bytes,
+    stable_object_count: event.global_progress.object_done,
+    skipped_object_count: event.global_progress.object_remaining,
+    last_scan_at: event.event_time,
+    message: event.message,
+  };
+}
+
+function isScanEventType(eventType: EdgeProgressEventType): eventType is ScanEventType {
+  return eventType === "SCAN_STARTED" || eventType === "SCAN_PROGRESS" || eventType === "SCAN_DONE";
+}
+
+function mergeDiskProgress(
+  currentDisks: EdgeDiskProgress[],
+  event: CopyProgressEvent,
+): EdgeDiskProgress[] {
+  const eventByDiskId = new Map(
+    event.disks.map((disk) => [
+      diskIdentity(disk),
+      normalizeDiskProgress({
+        ...disk,
+        last_event_type: event.event_type,
+        last_event_time: event.event_time,
+      }),
+    ]),
+  );
+  const merged = currentDisks.map((disk) => eventByDiskId.get(diskIdentity(disk)) ?? disk);
+  const knownDiskIds = new Set(currentDisks.map(diskIdentity));
+  for (const disk of eventByDiskId.values()) {
+    if (!knownDiskIds.has(diskIdentity(disk))) merged.push(disk);
+  }
+  return merged;
+}
+
+function diskIdentity(disk: EdgeDiskProgress): string {
+  return disk.disk_id || disk.mount_path || disk.disk_sn;
+}
+
+function isTerminalExportJobStatus(
+  value: EdgeDashboardSummary["export_job_status"],
+): boolean {
+  return value === "SEALED" || value === "FAILED" || value === "CANCELLED";
 }
 
 export function toWebSocketUrl(path: string): string {

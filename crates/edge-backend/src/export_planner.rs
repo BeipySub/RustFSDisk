@@ -176,9 +176,20 @@ pub async fn create_export_plan_from_stable_snapshots(
 
     let snapshots = sqlx::query_as::<_, StableSnapshot>(
         r#"
+        WITH latest_scan AS (
+          SELECT scan_started_at, scan_finished_at
+          FROM edge_scan_run
+          WHERE scan_status = 'DONE'
+            AND scan_finished_at IS NOT NULL
+          ORDER BY scan_finished_at DESC
+          LIMIT 1
+        )
         SELECT bucket, object_key, etag, size_bytes, last_modified
         FROM local_object_snapshot
+        CROSS JOIN latest_scan
         WHERE stable_status = 'STABLE'
+          AND scanned_at >= latest_scan.scan_started_at
+          AND scanned_at <= latest_scan.scan_finished_at
         ORDER BY id ASC
         "#,
     )

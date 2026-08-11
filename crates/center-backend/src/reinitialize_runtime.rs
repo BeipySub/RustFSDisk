@@ -7,7 +7,9 @@ use std::{
 use anyhow::{anyhow, Context};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
+use std::path::Component;
 use tokio::{runtime::Handle, task};
 use uuid::Uuid;
 
@@ -39,6 +41,8 @@ pub struct CenterReinitializeRequest {
     pub expected_status_code: DiskStatusCode,
     pub operator_reason: String,
     pub confirm_reinitialize: bool,
+    #[serde(default)]
+    pub confirm_discard_sealed_export: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -54,6 +58,12 @@ pub struct CenterReinitializeResponse {
 
 pub trait FileSystemProbe: Send + Sync {
     fn filesystem_type(&self, mount_path: &Path) -> anyhow::Result<String>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReinitializeMode {
+    ImportedCleanup,
+    DiscardSealedExport,
 }
 
 #[derive(Debug, Default)]
@@ -169,19 +179,35 @@ impl CenterReinitializeControlService for ProductionCenterReinitializeControlSer
     }
 }
 
-fn validate_request(request: &CenterReinitializeRequest) -> anyhow::Result<()> {
-    if request.expected_status_code != DiskStatusCode::Imported {
-        return Err(anyhow!(
-            "expected_status_code must be IMPORTED for cleanup/reinitialize"
-        ));
-    }
+fn validate_request(request: &CenterReinitializeRequest) -> anyhow::Result<ReinitializeMode> {
     if !request.confirm_reinitialize {
         return Err(anyhow!("confirm_reinitialize must be true"));
     }
     if request.operator_reason.trim().is_empty() {
         return Err(anyhow!("operator_reason is required for audit"));
     }
-    Ok(())
+    match request.expected_status_code {
+        DiskStatusCode::Imported => {
+            if request.confirm_discard_sealed_export {
+                return Err(anyhow!(
+                    "confirm_discard_sealed_export is only valid with expected_status_code=SEALED"
+                ));
+            }
+            Ok(ReinitializeMode::ImportedCleanup)
+        }
+        DiskStatusCode::Sealed => {
+            if !request.confirm_discard_sealed_export {
+                return Err(anyhow!(
+                    "confirm_discard_sealed_export must be true to discard SEALED export payload"
+                ));
+            }
+            Ok(ReinitializeMode::DiscardSealedExport)
+        }
+        other => Err(anyhow!(
+            "expected_status_code must be IMPORTED or SEALED for cleanup/reinitialize, got {}",
+            other.as_str()
+        )),
+    }
 }
 
 fn run_reinitialize_with_repo<R>(
@@ -196,6 +222,7 @@ fn run_reinitialize_with_repo<R>(
 where
     R: PostImportRepository,
 {
+    let mode = validate_request(&request)?;
     let disk_info_document = validate_reinitialize_preflight(
         &mount_path,
         disk_id,
@@ -203,15 +230,26 @@ where
         request.expected_status_code,
         &filesystem_type,
         &security,
+        mode,
     )?;
 
     let mut reinitializer = PostImportReinitializer::new(repo, template, security);
-    let output = reinitializer.reinitialize_imported_disk_from_document(
-        &mount_path,
-        disk_id,
-        request.seal_id,
-        disk_info_document,
-    )?;
+    let output = match mode {
+        ReinitializeMode::ImportedCleanup => reinitializer
+            .reinitialize_imported_disk_from_document(
+                &mount_path,
+                disk_id,
+                request.seal_id,
+                disk_info_document,
+            )?,
+        ReinitializeMode::DiscardSealedExport => reinitializer
+            .discard_sealed_export_and_reinitialize_from_document(
+                &mount_path,
+                disk_id,
+                request.seal_id,
+                disk_info_document,
+            )?,
+    };
     Ok(response_from_output(output))
 }
 
@@ -234,6 +272,7 @@ fn validate_reinitialize_preflight(
     expected_status_code: DiskStatusCode,
     filesystem_type: &str,
     security: &CenterSecurity,
+    mode: ReinitializeMode,
 ) -> anyhow::Result<DiskInfoDocument> {
     if filesystem_type != "ext4" {
         return Err(anyhow!(
@@ -256,12 +295,25 @@ fn validate_reinitialize_preflight(
             disk_info.status.code.as_str()
         ));
     }
-    if disk_info.status.code != DiskStatusCode::Imported {
-        return Err(anyhow!(
-            "disk_status_code must be IMPORTED before cleanup/reinitialize"
-        ));
+    match mode {
+        ReinitializeMode::ImportedCleanup if disk_info.status.code != DiskStatusCode::Imported => {
+            return Err(anyhow!(
+                "disk_status_code must be IMPORTED before cleanup/reinitialize"
+            ));
+        }
+        ReinitializeMode::DiscardSealedExport
+            if disk_info.status.code != DiskStatusCode::Sealed =>
+        {
+            return Err(anyhow!(
+                "disk_status_code must be SEALED before discarding sealed export"
+            ));
+        }
+        _ => {}
     }
-    let actual_seal_id = disk_info.edge.as_ref().and_then(|edge| edge.seal_id);
+    let actual_seal_id = disk_info
+        .edge
+        .as_ref()
+        .and_then(crate::reinitializer::EdgeSealInfo::seal_id_uuid);
     if actual_seal_id != Some(seal_id) {
         return Err(anyhow!(
             "seal_id mismatch: expected {seal_id}, got {actual_seal_id:?}"
@@ -269,7 +321,127 @@ fn validate_reinitialize_preflight(
     }
     validate_center_signature_for_reinitialize(&disk_info_document, security)?;
     reject_partials(mount_path)?;
+    if mode == ReinitializeMode::DiscardSealedExport {
+        validate_sealed_payload_self_consistent(mount_path, disk_info)?;
+    }
     Ok(disk_info_document)
+}
+
+fn validate_sealed_payload_self_consistent(
+    mount_path: &Path,
+    disk_info: &crate::reinitializer::DiskInfo,
+) -> anyhow::Result<()> {
+    if !disk_info.status.sealed || disk_info.status.imported || disk_info.status.reusable {
+        return Err(anyhow!(
+            "sealed discard requires SEALED lifecycle flags sealed=true imported=false reusable=false"
+        ));
+    }
+    let manifest_ref = disk_info
+        .manifest
+        .as_ref()
+        .ok_or_else(|| anyhow!("sealed discard requires disk_info manifest reference"))?;
+    let edge = disk_info
+        .edge
+        .as_ref()
+        .ok_or_else(|| anyhow!("sealed discard requires disk_info edge seal reference"))?;
+    let protocol_root = mount_path.join(PROTOCOL_ROOT);
+    let manifest_path = checked_protocol_path(&protocol_root, &manifest_ref.manifest_path)?;
+    let manifest_sha_path =
+        checked_protocol_path(&protocol_root, &manifest_ref.manifest_sha256_path)?;
+    let manifest_bytes = std::fs::read(&manifest_path)
+        .with_context(|| format!("read manifest {}", manifest_path.display()))?;
+    let actual_manifest_sha = hex::encode(Sha256::digest(&manifest_bytes));
+    let sidecar_sha = std::fs::read_to_string(&manifest_sha_path)
+        .with_context(|| format!("read manifest sha256 {}", manifest_sha_path.display()))?
+        .trim()
+        .to_string();
+    if sidecar_sha != actual_manifest_sha || manifest_ref.manifest_sha256 != actual_manifest_sha {
+        return Err(anyhow!(
+            "sealed discard manifest sha256 must match disk_info and sidecar"
+        ));
+    }
+    let manifest: SealedExportManifest = serde_json::from_slice(&manifest_bytes)
+        .context("parse sealed export manifest for discard gate")?;
+    if manifest.manifest_version != "1.0.0"
+        || manifest.disk_id != disk_info.disk.disk_id
+        || manifest.seal_id.to_string() != edge.seal_id
+        || manifest.export_job_id.to_string() != edge.export_job_id
+        || manifest.edge_code != edge.edge_code
+    {
+        return Err(anyhow!(
+            "sealed discard manifest identity fields must match disk_info"
+        ));
+    }
+    let total_bytes = manifest
+        .objects
+        .iter()
+        .map(SealedManifestObject::progress_bytes)
+        .sum::<u64>();
+    if manifest.objects.len() as u64 != manifest_ref.object_count
+        || total_bytes != manifest_ref.total_bytes
+    {
+        return Err(anyhow!(
+            "sealed discard manifest counters must match disk_info"
+        ));
+    }
+    for object in &manifest.objects {
+        checked_protocol_path(&protocol_root, &object.relative_data_path)?
+            .try_exists()
+            .with_context(|| format!("check data path {}", object.relative_data_path))?
+            .then_some(())
+            .ok_or_else(|| anyhow!("sealed discard manifest data path is missing"))?;
+        checked_protocol_path(&protocol_root, &object.relative_meta_path)?
+            .try_exists()
+            .with_context(|| format!("check meta path {}", object.relative_meta_path))?
+            .then_some(())
+            .ok_or_else(|| anyhow!("sealed discard manifest meta path is missing"))?;
+    }
+    Ok(())
+}
+
+fn checked_protocol_path(root: &Path, relative: &str) -> anyhow::Result<PathBuf> {
+    let path = Path::new(relative);
+    if path.is_absolute() {
+        return Err(anyhow!("protocol path must be relative"));
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+    {
+        return Err(anyhow!("protocol path must stay inside protocol root"));
+    }
+    Ok(root.join(path))
+}
+
+#[derive(Debug, Deserialize)]
+struct SealedExportManifest {
+    manifest_version: String,
+    seal_id: Uuid,
+    export_job_id: Uuid,
+    disk_id: Uuid,
+    edge_code: String,
+    objects: Vec<SealedManifestObject>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SealedManifestObject {
+    relative_data_path: String,
+    #[serde(default)]
+    chunked: bool,
+    #[serde(default)]
+    chunk_size_bytes: u64,
+    size_bytes: u64,
+    relative_meta_path: String,
+}
+
+impl SealedManifestObject {
+    fn progress_bytes(&self) -> u64 {
+        if self.chunked {
+            self.chunk_size_bytes
+        } else {
+            self.size_bytes
+        }
+    }
 }
 
 fn reject_partials(mount_path: &Path) -> anyhow::Result<()> {
@@ -573,6 +745,7 @@ mod tests {
         staged_keys: HashMap<Uuid, NewDataKey>,
         active_key: Option<Uuid>,
         retired_key: Option<Uuid>,
+        fail_activate: bool,
         fail_retire_old_key: bool,
     }
 
@@ -627,6 +800,9 @@ mod tests {
             _disk_id: Uuid,
             new_data_key_id: Uuid,
         ) -> Result<(), ReinitializeError> {
+            if self.0.lock().unwrap().fail_activate {
+                return Err(ReinitializeError::Repository("activate failed".to_string()));
+            }
             let mut guard = self.0.lock().unwrap();
             guard.active_key = Some(new_data_key_id);
             Ok(())
@@ -735,6 +911,7 @@ mod tests {
             DiskStatusCode::Imported,
             "ext4",
             &security(),
+            ReinitializeMode::ImportedCleanup,
         )
         .unwrap();
     }
@@ -755,6 +932,7 @@ mod tests {
             DiskStatusCode::Imported,
             "ext4",
             &security(),
+            ReinitializeMode::ImportedCleanup,
         )
         .unwrap();
     }
@@ -779,6 +957,7 @@ mod tests {
             DiskStatusCode::Imported,
             "ext4",
             &security(),
+            ReinitializeMode::ImportedCleanup,
         )
         .unwrap();
     }
@@ -807,6 +986,7 @@ mod tests {
                 DiskStatusCode::Imported,
                 "ext4",
                 &security(),
+                ReinitializeMode::ImportedCleanup,
             )
             .unwrap_err();
 
@@ -836,6 +1016,7 @@ mod tests {
             DiskStatusCode::Imported,
             "ext4",
             &security(),
+            ReinitializeMode::ImportedCleanup,
         )
         .unwrap_err();
 
@@ -868,6 +1049,7 @@ mod tests {
             DiskStatusCode::Imported,
             "ext4",
             &security(),
+            ReinitializeMode::ImportedCleanup,
         )
         .unwrap();
 
@@ -881,6 +1063,7 @@ mod tests {
             DiskStatusCode::Imported,
             "ext4",
             &security(),
+            ReinitializeMode::ImportedCleanup,
         )
         .unwrap_err();
         assert!(error.to_string().contains("updated_at") || error.to_string().contains("json"));
@@ -916,8 +1099,18 @@ mod tests {
         assert_eq!(response.runtime_status, "DONE");
         let disk_info = crate::reinitializer::read_disk_info(&temp.path).unwrap();
         assert_eq!(disk_info.status.code, DiskStatusCode::Initialized);
-        assert!(disk_info.edge.is_none());
-        assert!(disk_info.manifest.is_none());
+        let edge = disk_info
+            .edge
+            .as_ref()
+            .expect("initialized disk_info uses full edge object");
+        assert!(edge.seal_id.is_empty());
+        assert!(edge.export_job_id.is_empty());
+        let manifest = disk_info
+            .manifest
+            .as_ref()
+            .expect("initialized disk_info uses full manifest object");
+        assert_eq!(manifest.object_count, 0);
+        assert_eq!(manifest.total_bytes, 0);
         assert!(!temp.root().join("data/object.enc").exists());
         assert!(!temp.root().join("meta/object.json").exists());
         assert!(temp.root().join("quarantine/partial").is_dir());
@@ -957,7 +1150,14 @@ mod tests {
         assert_eq!(response.disk_status_code, DiskStatusCode::Initialized);
         let disk_info = crate::reinitializer::read_disk_info(&temp.path).unwrap();
         assert_eq!(disk_info.status.code, DiskStatusCode::Initialized);
-        assert!(disk_info.manifest.is_none());
+        assert_eq!(
+            disk_info
+                .manifest
+                .as_ref()
+                .expect("initialized disk_info uses full manifest object")
+                .object_count,
+            0
+        );
         assert!(!temp.root().join("data/object.enc").exists());
         let guard = repo.0.lock().unwrap();
         assert_eq!(guard.active_key, Some(response.new_data_key_id));
@@ -1031,11 +1231,18 @@ mod tests {
         disk_info.security.center_signature = security().sign_disk_info(&disk_info).unwrap();
 
         disk_info.edge = Some(EdgeSealInfo {
+            edge_name: "edge-a".to_string(),
             edge_code: "edge-a".to_string(),
-            export_job_id: Uuid::new_v4(),
-            seal_id: Some(seal_id),
+            seal_id: seal_id.to_string(),
+            export_job_id: Uuid::new_v4().to_string(),
+            export_started_at: "2026-08-11T00:00:00Z".to_string(),
+            export_finished_at: "2026-08-11T00:01:00Z".to_string(),
         });
         disk_info.manifest = Some(ManifestInfo {
+            manifest_path: EXPORT_MANIFEST.to_string(),
+            manifest_sha256_path: EXPORT_MANIFEST_SHA256.to_string(),
+            object_count: 1,
+            total_bytes: 1024,
             manifest_sha256: "manifest-after-import".to_string(),
         });
         disk_info.status = crate::reinitializer::DiskStatus {
@@ -1056,6 +1263,7 @@ mod tests {
             DiskStatusCode::Imported,
             "ext4",
             &security(),
+            ReinitializeMode::ImportedCleanup,
         )
         .unwrap();
 
@@ -1140,6 +1348,7 @@ mod tests {
             DiskStatusCode::Imported,
             "ext4",
             &security(),
+            ReinitializeMode::ImportedCleanup,
         )
         .unwrap_err();
 
@@ -1167,6 +1376,7 @@ mod tests {
             DiskStatusCode::Imported,
             "ext4",
             &security(),
+            ReinitializeMode::ImportedCleanup,
         )
         .unwrap();
 
@@ -1194,6 +1404,7 @@ mod tests {
             DiskStatusCode::Imported,
             "ext4",
             &security(),
+            ReinitializeMode::ImportedCleanup,
         )
         .unwrap_err();
         assert!(error.to_string().contains("disk_status_code"));
@@ -1208,6 +1419,7 @@ mod tests {
             DiskStatusCode::Imported,
             "ext4",
             &security(),
+            ReinitializeMode::ImportedCleanup,
         )
         .unwrap_err();
         assert!(error.to_string().contains("center_signature"));
@@ -1228,6 +1440,7 @@ mod tests {
             DiskStatusCode::Imported,
             "xfs",
             &security(),
+            ReinitializeMode::ImportedCleanup,
         )
         .unwrap_err();
 
@@ -1256,6 +1469,7 @@ mod tests {
             DiskStatusCode::Imported,
             "ext4",
             &security(),
+            ReinitializeMode::ImportedCleanup,
         )
         .unwrap_err();
 
@@ -1325,6 +1539,215 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sealed_discard_requires_explicit_confirmation() {
+        let temp = TempDisk::new();
+        let disk_id = Uuid::new_v4();
+        let seal_id = Uuid::new_v4();
+        let old_key = Uuid::new_v4();
+        write_sealed_disk(&temp, disk_id, seal_id, old_key);
+        let before = fs::read(temp.root().join(DISK_INFO_FILE)).unwrap();
+
+        let mut req = sealed_discard_request(&temp.path, seal_id);
+        req.confirm_discard_sealed_export = false;
+        let repo = SharedRepo::default();
+        repo.0.lock().unwrap().registered_disk = Some(registered_disk(disk_id));
+
+        let error = run_reinitialize_with_repo(
+            repo.clone(),
+            template(),
+            security(),
+            disk_id,
+            req,
+            temp.path.clone(),
+            "ext4".to_string(),
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("confirm_discard_sealed_export must be true"));
+        assert_eq!(fs::read(temp.root().join(DISK_INFO_FILE)).unwrap(), before);
+        assert!(temp.root().join("data/object.enc").exists());
+        assert!(repo.0.lock().unwrap().runtime.is_empty());
+    }
+
+    #[test]
+    fn sealed_discard_reinitializes_after_manifest_gate() {
+        let temp = TempDisk::new();
+        let disk_id = Uuid::new_v4();
+        let seal_id = Uuid::new_v4();
+        let old_key = Uuid::new_v4();
+        write_sealed_disk(&temp, disk_id, seal_id, old_key);
+
+        validate_reinitialize_preflight(
+            &temp.path,
+            disk_id,
+            seal_id,
+            DiskStatusCode::Sealed,
+            "ext4",
+            &security(),
+            ReinitializeMode::DiscardSealedExport,
+        )
+        .unwrap();
+
+        let repo = SharedRepo::default();
+        repo.0.lock().unwrap().registered_disk = Some(registered_disk(disk_id));
+
+        let response = run_reinitialize_with_repo(
+            repo.clone(),
+            template(),
+            security(),
+            disk_id,
+            sealed_discard_request(&temp.path, seal_id),
+            temp.path.clone(),
+            "ext4".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(response.disk_status_code, DiskStatusCode::Initialized);
+        let disk_info = crate::reinitializer::read_disk_info(&temp.path).unwrap();
+        assert_eq!(disk_info.status.code, DiskStatusCode::Initialized);
+        assert!(security().verify_disk_info(&disk_info).is_ok());
+        assert_eq!(
+            disk_info
+                .manifest
+                .as_ref()
+                .expect("initialized disk_info has manifest")
+                .object_count,
+            0
+        );
+        assert!(!temp.root().join("data/object.enc").exists());
+        assert!(!temp.root().join("meta/object.json").exists());
+        assert!(!temp.root().join("manifests/export_manifest.json").exists());
+        assert!(temp.root().join("quarantine/partial").is_dir());
+
+        let guard = repo.0.lock().unwrap();
+        assert_eq!(
+            guard.runtime,
+            vec![
+                RuntimeStatus::Cleaning,
+                RuntimeStatus::Reinitializing,
+                RuntimeStatus::Done,
+            ]
+        );
+        assert_eq!(guard.active_key, Some(response.new_data_key_id));
+        assert_eq!(guard.retired_key, Some(old_key));
+    }
+
+    #[test]
+    fn sealed_discard_manifest_mismatch_rejects_before_runtime_or_payload_writes() {
+        let temp = TempDisk::new();
+        let disk_id = Uuid::new_v4();
+        let seal_id = Uuid::new_v4();
+        let old_key = Uuid::new_v4();
+        write_sealed_disk(&temp, disk_id, seal_id, old_key);
+        fs::write(temp.root().join(EXPORT_MANIFEST_SHA256), "tampered").unwrap();
+        let before = fs::read(temp.root().join(DISK_INFO_FILE)).unwrap();
+
+        let repo = SharedRepo::default();
+        repo.0.lock().unwrap().registered_disk = Some(registered_disk(disk_id));
+        let error = run_reinitialize_with_repo(
+            repo.clone(),
+            template(),
+            security(),
+            disk_id,
+            sealed_discard_request(&temp.path, seal_id),
+            temp.path.clone(),
+            "ext4".to_string(),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("manifest sha256"));
+        assert_eq!(fs::read(temp.root().join(DISK_INFO_FILE)).unwrap(), before);
+        assert!(temp.root().join("data/object.enc").exists());
+        assert!(repo.0.lock().unwrap().runtime.is_empty());
+    }
+
+    #[test]
+    fn sealed_discard_accepts_legacy_missing_protocol_name_with_raw_signature() {
+        let temp = TempDisk::new();
+        let disk_id = Uuid::new_v4();
+        let seal_id = Uuid::new_v4();
+        let old_key = Uuid::new_v4();
+        write_sealed_disk(&temp, disk_id, seal_id, old_key);
+        let disk_info_path = temp.root().join(DISK_INFO_FILE);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&disk_info_path).unwrap()).unwrap();
+        value["protocol"].as_object_mut().unwrap().remove("name");
+        value["security"]["center_signature"] = serde_json::Value::String(String::new());
+        value["security"]["center_signature"] =
+            serde_json::Value::String(security().sign_disk_info(&value).unwrap());
+        fs::write(&disk_info_path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+        let repo = SharedRepo::default();
+        repo.0.lock().unwrap().registered_disk = Some(registered_disk(disk_id));
+        let response = run_reinitialize_with_repo(
+            repo,
+            template(),
+            security(),
+            disk_id,
+            sealed_discard_request(&temp.path, seal_id),
+            temp.path.clone(),
+            "ext4".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(response.disk_status_code, DiskStatusCode::Initialized);
+        let disk_info = crate::reinitializer::read_disk_info(&temp.path).unwrap();
+        assert_eq!(disk_info.status.code, DiskStatusCode::Initialized);
+        assert_eq!(
+            disk_info.protocol.name,
+            crate::disk_info_document::PROTOCOL_NAME
+        );
+        assert!(security().verify_disk_info(&disk_info).is_ok());
+    }
+
+    #[test]
+    fn sealed_discard_restores_payload_when_key_activation_fails() {
+        let temp = TempDisk::new();
+        let disk_id = Uuid::new_v4();
+        let seal_id = Uuid::new_v4();
+        let old_key = Uuid::new_v4();
+        write_sealed_disk(&temp, disk_id, seal_id, old_key);
+        let before = fs::read(temp.root().join(DISK_INFO_FILE)).unwrap();
+
+        let repo = SharedRepo::default();
+        {
+            let mut guard = repo.0.lock().unwrap();
+            guard.registered_disk = Some(registered_disk(disk_id));
+            guard.fail_activate = true;
+        }
+
+        let error = run_reinitialize_with_repo(
+            repo.clone(),
+            template(),
+            security(),
+            disk_id,
+            sealed_discard_request(&temp.path, seal_id),
+            temp.path.clone(),
+            "ext4".to_string(),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("activate failed"));
+        assert_eq!(fs::read(temp.root().join(DISK_INFO_FILE)).unwrap(), before);
+        assert_eq!(
+            crate::reinitializer::read_disk_info(&temp.path)
+                .unwrap()
+                .status
+                .code,
+            DiskStatusCode::Sealed
+        );
+        assert!(temp.root().join("data/object.enc").exists());
+        assert!(temp.root().join("meta/object.json").exists());
+        assert!(temp.root().join("manifests/export_manifest.json").exists());
+        let guard = repo.0.lock().unwrap();
+        assert_eq!(guard.active_key, None);
+        assert_eq!(guard.retired_key, None);
+        assert!(guard.runtime.contains(&RuntimeStatus::Error));
+    }
+
     fn request(mount_path: &Path, seal_id: Uuid) -> CenterReinitializeRequest {
         CenterReinitializeRequest {
             mount_path: mount_path.to_path_buf(),
@@ -1332,6 +1755,18 @@ mod tests {
             expected_status_code: DiskStatusCode::Imported,
             operator_reason: "vm acceptance cleanup for authorized disk".to_string(),
             confirm_reinitialize: true,
+            confirm_discard_sealed_export: false,
+        }
+    }
+
+    fn sealed_discard_request(mount_path: &Path, seal_id: Uuid) -> CenterReinitializeRequest {
+        CenterReinitializeRequest {
+            mount_path: mount_path.to_path_buf(),
+            seal_id,
+            expected_status_code: DiskStatusCode::Sealed,
+            operator_reason: "discard sealed test export for fresh end-to-end run".to_string(),
+            confirm_reinitialize: true,
+            confirm_discard_sealed_export: true,
         }
     }
 
@@ -1375,10 +1810,89 @@ mod tests {
         .unwrap();
         let mut disk_info = crate::reinitializer::read_disk_info(&temp.path).unwrap();
         disk_info.manifest = Some(ManifestInfo {
+            manifest_path: EXPORT_MANIFEST.to_string(),
+            manifest_sha256_path: EXPORT_MANIFEST_SHA256.to_string(),
+            object_count: 1,
+            total_bytes: 1024,
             manifest_sha256: sha,
         });
         disk_info.security.center_signature = String::new();
         disk_info.security.center_signature = security().sign_disk_info(&disk_info).unwrap();
+        crate::reinitializer::write_disk_info(&temp.path, &disk_info).unwrap();
+    }
+
+    fn write_sealed_disk(temp: &TempDisk, disk_id: Uuid, seal_id: Uuid, old_key: Uuid) {
+        let export_job_id = Uuid::new_v4();
+        fs::create_dir_all(temp.root().join("data")).unwrap();
+        fs::create_dir_all(temp.root().join("meta")).unwrap();
+        fs::create_dir_all(temp.root().join("manifests")).unwrap();
+        fs::write(temp.root().join("data/object.enc"), b"ciphertext").unwrap();
+        fs::write(temp.root().join("meta/object.json"), b"{}").unwrap();
+
+        let manifest = serde_json::json!({
+            "manifest_version": "1.0.0",
+            "disk_id": disk_id,
+            "seal_id": seal_id,
+            "export_job_id": export_job_id,
+            "edge_code": "edge-a",
+            "objects": [{
+                "bucket": "test",
+                "key": "object.bin",
+                "relative_data_path": "data/object.enc",
+                "encrypted": true,
+                "encryption_alg": "AES-256-GCM",
+                "data_key_id": old_key,
+                "nonce": "nonce",
+                "tag": "tag",
+                "aad": "aad",
+                "ciphertext_size_bytes": 10,
+                "ciphertext_sha256": "ciphertext-sha",
+                "chunked": false,
+                "chunk_group_id": "",
+                "chunk_index": 0,
+                "chunk_total": 1,
+                "chunk_offset_bytes": 0,
+                "chunk_size_bytes": 0,
+                "chunk_sha256": "",
+                "relative_meta_path": "meta/object.json",
+                "size_bytes": 10,
+                "etag": "etag",
+                "last_modified": "2026-08-11T00:00:00Z",
+                "plaintext_sha256": "plaintext-sha",
+                "object_status": "EXPORTED"
+            }]
+        });
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+        let manifest_sha = sha256_hex(&manifest_bytes);
+        fs::write(temp.root().join(EXPORT_MANIFEST), manifest_bytes).unwrap();
+        fs::write(temp.root().join(EXPORT_MANIFEST_SHA256), &manifest_sha).unwrap();
+
+        let signing = security();
+        let mut disk_info = imported_disk_info(disk_id, seal_id, old_key);
+        disk_info.edge = Some(EdgeSealInfo {
+            edge_name: "edge-a".to_string(),
+            edge_code: "edge-a".to_string(),
+            seal_id: seal_id.to_string(),
+            export_job_id: export_job_id.to_string(),
+            export_started_at: "2026-08-11T00:00:00Z".to_string(),
+            export_finished_at: "2026-08-11T00:01:00Z".to_string(),
+        });
+        disk_info.manifest = Some(ManifestInfo {
+            manifest_path: EXPORT_MANIFEST.to_string(),
+            manifest_sha256_path: EXPORT_MANIFEST_SHA256.to_string(),
+            object_count: 1,
+            total_bytes: 10,
+            manifest_sha256: manifest_sha,
+        });
+        disk_info.status = crate::reinitializer::DiskStatus {
+            code: DiskStatusCode::Sealed,
+            sealed: true,
+            imported: false,
+            reusable: false,
+            last_error: None,
+        };
+        disk_info.security.center_signature = String::new();
+        disk_info.security.center_signature = signing.sign_disk_info(&disk_info).unwrap();
         crate::reinitializer::write_disk_info(&temp.path, &disk_info).unwrap();
     }
 
@@ -1482,23 +1996,33 @@ mod tests {
         let signing = security();
         let mut disk_info = DiskInfo {
             protocol: ProtocolInfo {
+                name: crate::disk_info_document::PROTOCOL_NAME.to_string(),
                 version: "1.0".to_string(),
             },
             disk: DiskIdentity {
                 disk_id,
                 sn: Some("SN001".to_string()),
                 capacity_bytes: 1024,
+                last_init_time: "2026-08-11T00:00:00Z".to_string(),
+                initialized_by: "center".to_string(),
             },
             center: CenterInfo {
                 center_id: Uuid::new_v4(),
                 center_name: Some("center".to_string()),
             },
             edge: Some(EdgeSealInfo {
+                edge_name: "edge-a".to_string(),
                 edge_code: "edge-a".to_string(),
-                export_job_id: Uuid::new_v4(),
-                seal_id: Some(seal_id),
+                seal_id: seal_id.to_string(),
+                export_job_id: Uuid::new_v4().to_string(),
+                export_started_at: "2026-08-11T00:00:00Z".to_string(),
+                export_finished_at: "2026-08-11T00:01:00Z".to_string(),
             }),
             manifest: Some(ManifestInfo {
+                manifest_path: EXPORT_MANIFEST.to_string(),
+                manifest_sha256_path: EXPORT_MANIFEST_SHA256.to_string(),
+                object_count: 1,
+                total_bytes: 1024,
                 manifest_sha256: String::new(),
             }),
             security: SecurityInfo {

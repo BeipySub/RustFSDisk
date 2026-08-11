@@ -10,6 +10,8 @@ use uuid::Uuid;
 use crate::center_security::{
     CenterSecurity, ENCRYPTION_ALG_AES_256_GCM, SIGNATURE_ALG_HMAC_SHA256,
 };
+use crate::disk_info_document::{write_initialized_disk_info, InitializedDiskInfoDocument};
+use crate::{CenterConfigRecord, DiskRecord};
 
 pub const PROTOCOL_ROOT: &str = "rustfs-transfer";
 pub const DISK_INFO_FILE: &str = "disk_info.json";
@@ -46,6 +48,12 @@ struct ReinitializeAdmission {
     disk_id: Uuid,
     seal_id: Uuid,
     old_data_key_id: Uuid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReinitializeSource {
+    Imported,
+    DiscardSealedExport,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,9 +157,42 @@ where
         seal_id: Uuid,
         document: DiskInfoDocument,
     ) -> Result<ReinitializedDisk, ReinitializeError> {
+        self.reinitialize_disk_from_document(
+            mount_path,
+            disk_id,
+            seal_id,
+            document,
+            ReinitializeSource::Imported,
+        )
+    }
+
+    pub(crate) fn discard_sealed_export_and_reinitialize_from_document(
+        &mut self,
+        mount_path: &Path,
+        disk_id: Uuid,
+        seal_id: Uuid,
+        document: DiskInfoDocument,
+    ) -> Result<ReinitializedDisk, ReinitializeError> {
+        self.reinitialize_disk_from_document(
+            mount_path,
+            disk_id,
+            seal_id,
+            document,
+            ReinitializeSource::DiscardSealedExport,
+        )
+    }
+
+    fn reinitialize_disk_from_document(
+        &mut self,
+        mount_path: &Path,
+        disk_id: Uuid,
+        seal_id: Uuid,
+        document: DiskInfoDocument,
+        source: ReinitializeSource,
+    ) -> Result<ReinitializedDisk, ReinitializeError> {
         validate_center_signature_for_reinitialize(&document, &self.security)?;
         let previous_disk_info = document.disk_info;
-        validate_imported_disk_info(&previous_disk_info, disk_id, seal_id)?;
+        validate_reinitializable_disk_info(&previous_disk_info, disk_id, seal_id, source)?;
         let registered_disk = self
             .repo
             .registered_disk(disk_id)?
@@ -164,7 +205,17 @@ where
             old_data_key_id,
         };
 
-        let result = self.reinitialize_after_admission(mount_path, admission, &previous_disk_info);
+        let result = match source {
+            ReinitializeSource::Imported => {
+                self.reinitialize_after_admission(mount_path, admission, &previous_disk_info)
+            }
+            ReinitializeSource::DiscardSealedExport => self
+                .reinitialize_sealed_export_after_admission(
+                    mount_path,
+                    admission,
+                    &previous_disk_info,
+                ),
+        };
         if let Err(error) = &result {
             let _ = self.repo.set_runtime(
                 disk_id,
@@ -194,7 +245,7 @@ where
         let new_key = generate_data_key(admission.disk_id, &self.security)?;
         self.repo.stage_new_data_key(admission.disk_id, &new_key)?;
 
-        let initialized_disk_info = self.initialized_disk_info(previous_disk_info, &new_key);
+        let initialized_disk_info = self.initialized_disk_info(previous_disk_info, &new_key)?;
         if let Err(error) = self
             .repo
             .activate_new_key(admission.disk_id, new_key.data_key_id)
@@ -202,12 +253,99 @@ where
             let _ = self.repo.abort_staged_data_key(new_key.data_key_id);
             return Err(error);
         }
-        if let Err(error) = write_disk_info(mount_path, &initialized_disk_info) {
+        if let Err(error) = write_initialized_disk_info(mount_path, &initialized_disk_info) {
             let _ = self
                 .repo
                 .rollback_new_key_activation(admission.disk_id, new_key.data_key_id);
             let _ = self.repo.abort_staged_data_key(new_key.data_key_id);
+            return Err(ReinitializeError::Repository(format!(
+                "write initialized disk_info: {error:#}"
+            )));
+        }
+        if let Err(error) = self
+            .repo
+            .retire_old_key(admission.disk_id, admission.old_data_key_id)
+        {
+            tracing::warn!(
+                disk_id = %admission.disk_id,
+                old_data_key_id = %admission.old_data_key_id,
+                error = %error,
+                "old data key retirement failed after successful reinitialize"
+            );
+        }
+
+        self.repo
+            .set_runtime(admission.disk_id, RuntimeStatus::Done, None, None)?;
+
+        Ok(ReinitializedDisk {
+            disk_id: admission.disk_id,
+            old_seal_id: admission.seal_id,
+            old_data_key_id: admission.old_data_key_id,
+            new_data_key_id: new_key.data_key_id,
+        })
+    }
+
+    fn reinitialize_sealed_export_after_admission(
+        &mut self,
+        mount_path: &Path,
+        admission: ReinitializeAdmission,
+        previous_disk_info: &DiskInfo,
+    ) -> Result<ReinitializedDisk, ReinitializeError> {
+        ensure_no_partial_residue(mount_path)?;
+        self.repo
+            .set_runtime(admission.disk_id, RuntimeStatus::Cleaning, None, None)?;
+
+        let mut backup = SealedPayloadBackup::move_payload(mount_path)?;
+        let result =
+            self.reinitialize_after_payload_cleared(mount_path, admission, previous_disk_info);
+        match result {
+            Ok(output) => {
+                backup.discard()?;
+                Ok(output)
+            }
+            Err(error) => {
+                if let Err(restore_error) = backup.restore() {
+                    tracing::error!(
+                        disk_id = %admission.disk_id,
+                        error = %restore_error,
+                        "failed to restore sealed payload after discard reinitialize failure"
+                    );
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn reinitialize_after_payload_cleared(
+        &mut self,
+        mount_path: &Path,
+        admission: ReinitializeAdmission,
+        previous_disk_info: &DiskInfo,
+    ) -> Result<ReinitializedDisk, ReinitializeError> {
+        create_protocol_dirs(mount_path)?;
+
+        self.repo
+            .set_runtime(admission.disk_id, RuntimeStatus::Reinitializing, None, None)?;
+
+        let new_key = generate_data_key(admission.disk_id, &self.security)?;
+        self.repo.stage_new_data_key(admission.disk_id, &new_key)?;
+
+        let initialized_disk_info = self.initialized_disk_info(previous_disk_info, &new_key)?;
+        if let Err(error) = self
+            .repo
+            .activate_new_key(admission.disk_id, new_key.data_key_id)
+        {
+            let _ = self.repo.abort_staged_data_key(new_key.data_key_id);
             return Err(error);
+        }
+        if let Err(error) = write_initialized_disk_info(mount_path, &initialized_disk_info) {
+            let _ = self
+                .repo
+                .rollback_new_key_activation(admission.disk_id, new_key.data_key_id);
+            let _ = self.repo.abort_staged_data_key(new_key.data_key_id);
+            return Err(ReinitializeError::Repository(format!(
+                "write initialized disk_info: {error:#}"
+            )));
         }
         if let Err(error) = self
             .repo
@@ -236,31 +374,33 @@ where
         &self,
         previous_disk_info: &DiskInfo,
         new_key: &NewDataKey,
-    ) -> DiskInfo {
-        let mut next = previous_disk_info.clone();
-        next.protocol.version = self.template.protocol_version.clone();
-        next.center.center_id = self.template.center_id;
-        next.center.center_name = self.template.center_name.clone();
-        next.edge = None;
-        next.manifest = None;
-        next.status = DiskStatus {
-            code: DiskStatusCode::Initialized,
-            sealed: false,
-            imported: false,
-            reusable: true,
-            last_error: None,
+    ) -> Result<InitializedDiskInfoDocument, ReinitializeError> {
+        let capacity_bytes =
+            i64::try_from(previous_disk_info.disk.capacity_bytes).map_err(|_| {
+                ReinitializeError::Repository(
+                    "disk capacity exceeds supported i64 range".to_string(),
+                )
+            })?;
+        let center_config = CenterConfigRecord {
+            center_id: self.template.center_id,
+            protocol_version: self.template.protocol_version.clone(),
         };
-        next.security.center_key_id = self.template.center_key_id;
-        next.security.data_key_id = new_key.data_key_id;
-        next.security.encryption_alg = new_key.encryption_alg.clone();
-        next.security.signature_alg = self.template.signature_alg.clone();
-        next.updated_at = Utc::now();
-        next.security.center_signature = String::new();
-        next.security.center_signature = self
-            .security
-            .sign_disk_info(&next)
-            .expect("disk_info signing uses validated center security key");
-        next
+        let disk = DiskRecord {
+            disk_id: previous_disk_info.disk.disk_id,
+            sn: previous_disk_info.disk.sn.clone().unwrap_or_default(),
+            capacity_bytes,
+            disk_enabled: true,
+        };
+        InitializedDiskInfoDocument::initialized(
+            &center_config,
+            &disk,
+            capacity_bytes,
+            new_key.data_key_id,
+            &self.security,
+        )
+        .map_err(|error| {
+            ReinitializeError::Repository(format!("build initialized disk_info: {error:#}"))
+        })
     }
 }
 
@@ -281,10 +421,11 @@ fn generate_data_key(
     })
 }
 
-fn validate_imported_disk_info(
+fn validate_reinitializable_disk_info(
     disk_info: &DiskInfo,
     disk_id: Uuid,
     seal_id: Uuid,
+    source: ReinitializeSource,
 ) -> Result<(), ReinitializeError> {
     if disk_info.disk.disk_id != disk_id {
         return Err(ReinitializeError::DiskIdentityMismatch {
@@ -292,12 +433,31 @@ fn validate_imported_disk_info(
             actual: disk_info.disk.disk_id,
         });
     }
-    if disk_info.status.code != DiskStatusCode::Imported {
-        return Err(ReinitializeError::DiskNotImported {
+    let expected_status = match source {
+        ReinitializeSource::Imported => DiskStatusCode::Imported,
+        ReinitializeSource::DiscardSealedExport => DiskStatusCode::Sealed,
+    };
+    if disk_info.status.code != expected_status {
+        return Err(ReinitializeError::DiskStatusNotReinitializable {
+            expected: expected_status.as_str(),
             actual: disk_info.status.code.as_str().to_string(),
         });
     }
-    let actual_seal_id = disk_info.edge.as_ref().and_then(|edge| edge.seal_id);
+    if source == ReinitializeSource::DiscardSealedExport
+        && (!disk_info.status.sealed || disk_info.status.imported || disk_info.status.reusable)
+    {
+        return Err(ReinitializeError::DiskStatusNotReinitializable {
+            expected: "SEALED with sealed=true, imported=false, reusable=false",
+            actual: format!(
+                "{} sealed={} imported={} reusable={}",
+                disk_info.status.code.as_str(),
+                disk_info.status.sealed,
+                disk_info.status.imported,
+                disk_info.status.reusable
+            ),
+        });
+    }
+    let actual_seal_id = disk_info.edge.as_ref().and_then(EdgeSealInfo::seal_id_uuid);
     if actual_seal_id != Some(seal_id) {
         return Err(ReinitializeError::SealMismatch {
             expected: seal_id,
@@ -344,6 +504,97 @@ fn clean_sealed_payload(mount_path: &Path) -> Result<(), ReinitializeError> {
     }
     sync_dir(&root)?;
     Ok(())
+}
+
+struct SealedPayloadBackup {
+    root: PathBuf,
+    backup_root: PathBuf,
+    moved_dirs: Vec<&'static str>,
+    restored: bool,
+}
+
+impl SealedPayloadBackup {
+    fn move_payload(mount_path: &Path) -> Result<Self, ReinitializeError> {
+        let root = protocol_root(mount_path);
+        let backup_root = root.join(format!(".sealed-discard-backup-{}", Uuid::new_v4()));
+        fs::create_dir(&backup_root).map_err(|source| ReinitializeError::Fs {
+            action: format!("create {}", backup_root.display()),
+            source,
+        })?;
+
+        let mut moved_dirs = Vec::new();
+        for dir_name in ["data", "meta", "manifests", "logs", "quarantine"] {
+            let from = root.join(dir_name);
+            if !from.exists() {
+                continue;
+            }
+            let to = backup_root.join(dir_name);
+            fs::rename(&from, &to).map_err(|source| ReinitializeError::Fs {
+                action: format!("move {} to {}", from.display(), to.display()),
+                source,
+            })?;
+            moved_dirs.push(dir_name);
+        }
+        sync_dir(&root)?;
+        Ok(Self {
+            root,
+            backup_root,
+            moved_dirs,
+            restored: false,
+        })
+    }
+
+    fn restore(&mut self) -> Result<(), ReinitializeError> {
+        for dir_name in ["data", "meta", "manifests", "logs", "quarantine"] {
+            let recreated = self.root.join(dir_name);
+            if recreated.exists() {
+                fs::remove_dir_all(&recreated).map_err(|source| ReinitializeError::Fs {
+                    action: format!("remove recreated {}", recreated.display()),
+                    source,
+                })?;
+            }
+        }
+        for dir_name in self.moved_dirs.iter().copied() {
+            let from = self.backup_root.join(dir_name);
+            let to = self.root.join(dir_name);
+            fs::rename(&from, &to).map_err(|source| ReinitializeError::Fs {
+                action: format!("restore {} to {}", from.display(), to.display()),
+                source,
+            })?;
+        }
+        if self.backup_root.exists() {
+            fs::remove_dir_all(&self.backup_root).map_err(|source| ReinitializeError::Fs {
+                action: format!("remove {}", self.backup_root.display()),
+                source,
+            })?;
+        }
+        sync_dir(&self.root)?;
+        self.restored = true;
+        Ok(())
+    }
+
+    fn discard(mut self) -> Result<(), ReinitializeError> {
+        if self.backup_root.exists() {
+            fs::remove_dir_all(&self.backup_root).map_err(|source| ReinitializeError::Fs {
+                action: format!("remove {}", self.backup_root.display()),
+                source,
+            })?;
+        }
+        sync_dir(&self.root)?;
+        self.restored = true;
+        Ok(())
+    }
+}
+
+impl Drop for SealedPayloadBackup {
+    fn drop(&mut self) {
+        if !self.restored && self.backup_root.exists() {
+            tracing::error!(
+                backup_root = %self.backup_root.display(),
+                "sealed discard payload backup dropped without restore or discard"
+            );
+        }
+    }
 }
 
 fn create_protocol_dirs(mount_path: &Path) -> Result<(), ReinitializeError> {
@@ -425,6 +676,20 @@ pub fn read_disk_info_document(mount_path: &Path) -> Result<DiskInfoDocument, Re
             fields.insert(
                 "updated_at".to_string(),
                 Value::String(legacy_missing_updated_at().to_rfc3339()),
+            );
+        }
+    }
+    if value.pointer("/status/code").and_then(Value::as_str) == Some("SEALED")
+        && value.pointer("/protocol/name").is_none()
+    {
+        if let Some(protocol) = parse_value
+            .as_object_mut()
+            .and_then(|fields| fields.get_mut("protocol"))
+            .and_then(Value::as_object_mut)
+        {
+            protocol.insert(
+                "name".to_string(),
+                Value::String(crate::disk_info_document::PROTOCOL_NAME.to_string()),
             );
         }
     }
@@ -523,8 +788,11 @@ pub enum ReinitializeError {
         expected: String,
         actual: String,
     },
-    #[error("disk is not IMPORTED, got {actual}")]
-    DiskNotImported { actual: String },
+    #[error("disk is not eligible for this reinitialize path: expected {expected}, got {actual}")]
+    DiskStatusNotReinitializable {
+        expected: &'static str,
+        actual: String,
+    },
     #[error("seal_id mismatch: expected {expected}, got {actual:?}")]
     SealMismatch {
         expected: Uuid,
@@ -560,6 +828,7 @@ fn legacy_missing_updated_at() -> DateTime<Utc> {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProtocolInfo {
+    pub name: String,
     pub version: String,
 }
 
@@ -568,23 +837,56 @@ pub struct DiskIdentity {
     pub disk_id: Uuid,
     pub sn: Option<String>,
     pub capacity_bytes: u64,
+    #[serde(default)]
+    pub last_init_time: String,
+    #[serde(default)]
+    pub initialized_by: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CenterInfo {
     pub center_id: Uuid,
+    #[serde(default)]
     pub center_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EdgeSealInfo {
+    #[serde(default)]
+    pub edge_name: String,
+    #[serde(default)]
     pub edge_code: String,
-    pub export_job_id: Uuid,
-    pub seal_id: Option<Uuid>,
+    #[serde(default)]
+    pub seal_id: String,
+    #[serde(default)]
+    pub export_job_id: String,
+    #[serde(default)]
+    pub export_started_at: String,
+    #[serde(default)]
+    pub export_finished_at: String,
+}
+
+impl EdgeSealInfo {
+    pub fn seal_id_uuid(&self) -> Option<Uuid> {
+        parse_optional_uuid(&self.seal_id)
+    }
+
+    pub fn export_job_id_uuid(&self) -> Option<Uuid> {
+        parse_optional_uuid(&self.export_job_id)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ManifestInfo {
+    #[serde(default = "default_manifest_path")]
+    pub manifest_path: String,
+    #[serde(default = "default_manifest_sha256_path")]
+    pub manifest_sha256_path: String,
+    #[serde(default)]
+    pub object_count: u64,
+    #[serde(default)]
+    pub total_bytes: u64,
+    #[serde(default)]
     pub manifest_sha256: String,
 }
 
@@ -604,6 +906,23 @@ pub struct DiskStatus {
     pub imported: bool,
     pub reusable: bool,
     pub last_error: Option<String>,
+}
+
+fn parse_optional_uuid(value: &str) -> Option<Uuid> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Uuid::parse_str(trimmed).ok()
+    }
+}
+
+fn default_manifest_path() -> String {
+    "manifests/export_manifest.json".to_string()
+}
+
+fn default_manifest_sha256_path() -> String {
+    "manifests/export_manifest.sha256".to_string()
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -765,8 +1084,18 @@ mod tests {
         let disk_info = read_disk_info(&temp.path).unwrap();
         assert_eq!(disk_info.status.code, DiskStatusCode::Initialized);
         assert!(disk_info.status.reusable);
-        assert_eq!(disk_info.edge, None);
-        assert_eq!(disk_info.manifest, None);
+        let edge = disk_info
+            .edge
+            .as_ref()
+            .expect("initialized disk_info uses full edge object");
+        assert!(edge.seal_id.is_empty());
+        assert!(edge.export_job_id.is_empty());
+        let manifest = disk_info
+            .manifest
+            .as_ref()
+            .expect("initialized disk_info uses full manifest object");
+        assert_eq!(manifest.object_count, 0);
+        assert_eq!(manifest.total_bytes, 0);
         assert_ne!(
             disk_info.updated_at.to_rfc3339(),
             LEGACY_UPDATED_AT_SENTINEL
@@ -1240,23 +1569,33 @@ mod tests {
     ) -> DiskInfo {
         let mut disk_info = DiskInfo {
             protocol: ProtocolInfo {
+                name: crate::disk_info_document::PROTOCOL_NAME.to_string(),
                 version: "1.0".to_string(),
             },
             disk: DiskIdentity {
                 disk_id,
                 sn: Some("SN001".to_string()),
                 capacity_bytes: 1024,
+                last_init_time: "2026-08-11T00:00:00Z".to_string(),
+                initialized_by: "center".to_string(),
             },
             center: CenterInfo {
                 center_id: Uuid::new_v4(),
                 center_name: Some("center".to_string()),
             },
             edge: Some(EdgeSealInfo {
+                edge_name: "edge-a".to_string(),
                 edge_code: "edge-a".to_string(),
-                export_job_id: Uuid::new_v4(),
-                seal_id: Some(seal_id),
+                seal_id: seal_id.to_string(),
+                export_job_id: Uuid::new_v4().to_string(),
+                export_started_at: "2026-08-11T00:00:00Z".to_string(),
+                export_finished_at: "2026-08-11T00:01:00Z".to_string(),
             }),
             manifest: Some(ManifestInfo {
+                manifest_path: "manifests/export_manifest.json".to_string(),
+                manifest_sha256_path: "manifests/export_manifest.sha256".to_string(),
+                object_count: 1,
+                total_bytes: 1024,
                 manifest_sha256: "manifest-sha".to_string(),
             }),
             security: SecurityInfo {

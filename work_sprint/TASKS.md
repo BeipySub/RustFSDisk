@@ -68,6 +68,29 @@
 | Web | Agent E1/E2 | TASK-S1-WEB-EDGE-001, TASK-S1-WEB-CENTER-001 mock | 对接真实 HTTP/WS |
 | Deploy / QA | Agent F | TASK-S1-TEST-001, TASK-S1-DEPLOY-001 | TASK-S1-INTEGRATION-001 |
 
+## Edge 实时可视化上线补充并行安排
+
+本组任务用于补齐 `docs/上线要求.md` 中新增的 Edge 端“插盘后自动流转、前端实时可视化反馈”上线要求。现有 Edge 已具备受控扫描、导出、写盘和封盘能力；本组任务只把现有能力串成可控自动流程，并补齐前端真实状态展示，不放宽冻结协议、安全和状态机约束。
+
+并行原则：
+
+- 后端自动编排只调用既有受控能力，不复制扫描、Planner 或 DiskWorker 逻辑。
+- 插盘/扫描/导出事件统一从后端权威状态发布，前端只消费，不本地推断完成态。
+- 浏览器仍只读，不接触控制 token、`disk_data_key`、`edge_auth_secret`、nonce、tag 或 `data_key_id`。
+- 自动导出必须可配置关闭；默认上线可灰度启用，失败时能回退到现有受控 API。
+- udev 仍只触发 rescan，不直接导出；自动编排由 Edge 常驻服务在准入通过后启动。
+- RustFS 全量扫描一天最多成功执行一次；24 小时内重复插盘或重复 udev 事件必须复用最近一次成功扫描快照。
+- 导出计划只允许使用最近一次成功扫描窗口内确认上传完成的 `STABLE` 对象；正在上传、覆盖或扫描期间变化的对象不得计入统计和导出队列。
+
+| 泳道 | 建议负责人 | 任务 | 可并行条件 | 交付物 |
+|---|---|---|---|---|
+| Edge Orchestrator | Agent D3 | TASK-S1-EDGE-AUTO-001 | 基于现有 scan/create/start 接口内部模块 | `READY -> scan -> create -> start -> seal` 自动编排与幂等 |
+| Edge Event Stream | Agent D4 | TASK-S1-EDGE-WS-BOOT-001 | 可与自动编排并行 | 插盘、校验、扫描、导出、封盘统一 WS 事件 |
+| Edge Web Production | Agent E3 | TASK-S1-WEB-EDGE-PROD-001 | 可先基于 fixture/contract 并行 | 去预览兜底、去写操作入口、真实空态/错误态 |
+| Edge Web Timeline | Agent E4 | TASK-S1-WEB-EDGE-TIMELINE-001 | 等 WS 字段冻结后对接 | 每盘时间线、插盘即时反馈、多盘进度 |
+| Deploy / Toggle | Agent F1 | TASK-S1-EDGE-AUTO-DEPLOY-001 | 跟自动编排并行 | 配置开关、systemd/udev 静态检查、回滚说明 |
+| QA / Integration | Agent F2 | TASK-S1-EDGE-REALTIME-QA-001 | 依赖前四项可用 | 浏览器真实联调、插盘 1 秒反馈、端到端验收记录 |
+
 ## 不可降级底线
 
 - WebSocket 只用于本端后端向本端前端推送状态；边缘端和中控端在线交互只走 HTTP API。
@@ -121,11 +144,20 @@
 | TASK-S1-CENTER-HOTFIX-005 | Center 导入成功后 data_key 封盘生命周期绑定 | P0 解阻塞 | Center / DB | [x] | Day 2 真实导入修补 | TASK-S1-CENTER-004, TASK-S1-CENTER-005 |
 | TASK-S1-SECURITY-HOTFIX-006 | AES-GCM AAD 同源构造与全加密面审计 | P0 解阻塞 | Common / Edge / Center / Security | [x] | Day 3 审计修补 | TASK-S1-COMMON-002, TASK-S1-EDGE-005, TASK-S1-CENTER-004 |
 | TASK-S1-SECURITY-HOTFIX-007 | center_signature 同源签名/验签 API 与 reinitialize 分叉修复 | P0 解阻塞 | Common / Center / Edge / Security | [x] | Day 3 真实闭环阻塞修补 | TASK-S1-SECURITY-HOTFIX-006, TASK-S1-CENTER-005 |
+| TASK-S1-CENTER-HOTFIX-006 | Center import API 空 import_job_status 错误包装修补 | P0 解阻塞 | Center / Import | [x] | Day 3 真实导入阻塞修补 | TASK-S1-CENTER-004, TASK-S1-SECURITY-HOTFIX-007 |
+| TASK-S1-CENTER-HOTFIX-007 | Center 初始化与重新初始化 disk_info 生成同源修补 | P0 解阻塞 | Center / Protocol | [x] | Day 3 真实导入阻塞修补 | TASK-S1-CENTER-HOTFIX-006, TASK-S1-CENTER-005 |
+| TASK-S1-CENTER-HOTFIX-008 | Center 受控丢弃 SEALED 测试导出并重置 | P0 解阻塞 | Center / Reinitialize | [x] | Day 3 从零闭环阻塞修补 | TASK-S1-CENTER-HOTFIX-007 |
 | TASK-S1-WEB-EDGE-001 | 边缘端 DashboardView、HTTP 汇总和 WS 进度展示 | P2 交付增强 | Web / Edge | [x] | Day 1-2 | TASK-S1-TEST-001 |
 | TASK-S1-WEB-CENTER-001 | 中控端 DashboardView、HTTP 汇总和 WS 进度展示 | P2 交付增强 | Web / Center | [x] | Day 1-2 | TASK-S1-TEST-001 |
 | TASK-S1-DASHBOARD-REALTIME-001 | 双端真实 Dashboard HTTP summary 与本端 WebSocket 推送 | P0 解阻塞 | Center / Edge / Web | [x] | Day 2 联调修补 | TASK-S1-WEB-EDGE-001, TASK-S1-WEB-CENTER-001 |
 | TASK-S1-P1-EDGE-WEB-CONTRACT-001 | Edge Web 浏览器安全只读契约补齐 | P1 主闭环 | Edge / Web contract | [x] | Day 2 审计修补 | TASK-S1-DASHBOARD-REALTIME-001, TASK-S1-WEB-EDGE-001 |
 | TASK-S1-DEPLOY-001 | systemd、udev、配置示例和本地联调脚本 | P2 交付增强 | Deploy | [x] | Day 1-2 | TASK-S1-CENTER-001, TASK-S1-EDGE-001 |
+| TASK-S1-EDGE-AUTO-001 | Edge 插盘后自动扫描、自动建任务和自动启动导出编排 | P0 解阻塞 | Edge | [x] | Day 3 上午 | TASK-S1-EDGE-002, TASK-S1-EDGE-003, TASK-S1-EDGE-004, TASK-S1-EDGE-005 |
+| TASK-S1-EDGE-WS-BOOT-001 | Edge 插盘、校验、扫描和封盘阶段 WebSocket 事件补齐 | P0 解阻塞 | Edge / Web contract | [x] | Day 3 上午 | TASK-S1-DASHBOARD-REALTIME-001, TASK-S1-EDGE-002 |
+| TASK-S1-WEB-EDGE-PROD-001 | Edge Dashboard 生产态清理与浏览器只读收口 | P1 主闭环 | Web / Edge | [~] | Day 3 上午 | TASK-S1-P1-EDGE-WEB-CONTRACT-001 |
+| TASK-S1-WEB-EDGE-TIMELINE-001 | Edge Dashboard 插盘即时反馈、每盘时间线和扫描态展示 | P1 主闭环 | Web / Edge | [x] | Day 3 下午 | TASK-S1-EDGE-WS-BOOT-001, TASK-S1-WEB-EDGE-PROD-001 |
+| TASK-S1-EDGE-AUTO-DEPLOY-001 | Edge 自动流程配置开关、部署检查和回滚说明 | P1 主闭环 | Deploy / Edge | [x] | Day 3 下午 | TASK-S1-EDGE-AUTO-001 |
+| TASK-S1-EDGE-REALTIME-QA-001 | Edge 前后端实时可视化端到端联调验收 | P0 解阻塞 | Integration / QA | [ ] | Day 3 下午 | TASK-S1-EDGE-AUTO-001, TASK-S1-EDGE-WS-BOOT-001, TASK-S1-WEB-EDGE-TIMELINE-001, TASK-S1-EDGE-AUTO-DEPLOY-001 |
 | TASK-S1-INTEGRATION-001 | 主闭环联调、验收、风险登记和交付检查 | P2 交付增强 | Integration | [~] | Day 2 下午 | Day 2 主闭环任务 |
 
 ---
@@ -1593,6 +1625,121 @@
 
 ---
 
+# 开发任务卡片：TASK-S1-CENTER-HOTFIX-006
+
+### 任务基本信息
+
+- **任务 ID**：TASK-S1-CENTER-HOTFIX-006
+- **任务名称**：Center import API 空 import_job_status 错误包装修补
+- **所属 Track / 模块**：
+  - [ ] Track 1: Common
+  - [ ] Track 2: Edge
+  - [x] Track 3: Center (`crates/center-backend`)
+  - [ ] Track 4: Web
+- **任务状态**：[x] 开发完成
+- **负责人 / Role**：Codex 真实导入阻塞修补窗口
+- **计划时间**：Day 3 真实导入阻塞修补
+- **依赖任务**：TASK-S1-CENTER-004, TASK-S1-SECURITY-HOTFIX-007
+
+### 任务目标与范围
+
+- **核心目标**：修补真实 Center 导入 API 在 worker 尚未进入 `IMPORTING` 进度前失败时，把默认空进度状态包装成最外层错误 `import_job_status=`，导致真实错误码/错误信息被 API 响应遮蔽的问题。
+- **对应代码位置**：`crates/center-backend/src/import_runtime.rs`。
+
+### 协议与数据结构约束
+
+- `import_job_status` 只表示导入任务状态，允许值为 `PENDING`、`IMPORTING`、`DONE`、`FAILED`、`CANCELLED`。
+- 运输盘生命周期 `INITIALIZED`、`SEALED`、`IMPORTED` 不得混入 `import_job_status`。
+- `POST /api/center/import-jobs/start` 请求 DTO 仍只需要 `mount_path`；不得新增请求协议字段或要求客户端传入 `import_job_status`。
+
+### 安全与状态机边界
+
+- 本任务仅修复错误包装和测试；不修改冻结文档，不部署 VM，不调用真实 API，不操作硬盘、数据库、RustFS 源对象、archive 或 object_ledger。
+- 导入状态机和 repo 对非法任务状态的拒绝逻辑保持不放宽；修补目标是使失败响应保留真实 `ImportErrorCode` 与错误说明。
+
+### 验收与检查清单
+
+- [x] worker 未创建 import job 前失败时，API 错误消息归一为 `import_job_status=PENDING; <IMPORT_ERROR_CODE>: <message>`，不再出现空的 `import_job_status=`。
+- [x] 回归测试覆盖空进度状态不会遮蔽真实错误码。
+- [x] 回归测试覆盖 `import_job_status` 与运输盘生命周期状态语义隔离。
+- [x] 既有受控导入路由测试确认请求缺省 `import_job_status` 仍可进入导入服务。
+- [x] `cargo fmt --all -- --check` 通过。
+- [x] `cargo test -p rustfs-transfer-common` 通过。
+- [x] `cargo test -p rustfs-transfer-center` 通过。
+- [x] 未修改 `docs/v1.0冻结/`，未部署、未调用真实 API、未操作硬盘或生产 SQL。
+
+---
+
+# 开发任务卡片：TASK-S1-CENTER-HOTFIX-007
+
+### 任务基本信息
+
+- **任务 ID**：TASK-S1-CENTER-HOTFIX-007
+- **任务名称**：Center 初始化与重新初始化 disk_info 生成同源修补
+- **所属 Track / 模块**：
+  - [ ] Track 1: Common
+  - [ ] Track 2: Edge
+  - [x] Track 3: Center (`crates/center-backend`)
+  - [ ] Track 4: Web
+- **任务状态**：[x] 开发完成
+- **负责人 / Role**：Codex 真实导入阻塞修补窗口
+- **计划时间**：Day 3 真实导入阻塞修补
+- **依赖任务**：TASK-S1-CENTER-HOTFIX-006, TASK-S1-CENTER-005
+
+### 任务目标与范围
+
+- **核心目标**：修补 Center 注册初始化和导入后重新初始化各自拼装 `disk_info.json` 的分叉，避免 reinitialize 生成缺少 `protocol.name`、`disk.last_init_time`、`disk.initialized_by` 等冻结协议必填/签名覆盖字段的窄版协议文件。
+- **对应代码位置**：`crates/center-backend/src/disk_info_document.rs`、`crates/center-backend/src/lib.rs`、`crates/center-backend/src/reinitializer.rs`、`crates/center-backend/src/reinitialize_runtime.rs`。
+
+### 协议与数据结构约束
+
+- `INITIALIZED` 状态的 `disk_info.json` 只能通过 Center 共享构造器生成，包含完整 `protocol`、`disk`、`edge`、`center`、`manifest`、`security`、`status` 结构。
+- `center_signature` 仍按冻结协议只覆盖 `protocol`、`disk`、`security.center_key_id`、`security.data_key_id`、`security.signature_alg`；不得通过跳过验签绕过错误。
+- `edge.seal_id`、`edge.export_job_id` 等盘内协议字段保持字符串形态；准入需要 UUID 时单独解析，避免 DTO 重序列化改变 canonical 输入。
+
+### 安全与状态机边界
+
+- 本任务仅修复本地代码和测试；不修改冻结文档，不部署 VM，不调用真实 API，不操作硬盘、数据库、RustFS 源对象、archive 或 object_ledger。
+- 导入解析仍要求冻结协议必填字段；不放宽 import DTO 来兼容错误生成物。
+
+### 验收与检查清单
+
+- [x] Center 初始化和重新初始化成功路径共用同一套 `INITIALIZED` disk_info 构造与原子写入 helper。
+- [x] 回归测试覆盖 reinitialize 后的 `disk_info.json` 具有完整 edge/manifest 空对象、`protocol.name` 和签名覆盖 disk 字段。
+- [x] 回归测试覆盖重新初始化输出读回后 `center_signature` 仍可验证。
+- [x] `cargo fmt --all -- --check` 通过。
+- [x] `cargo test -p rustfs-transfer-common` 通过。
+- [x] `cargo test -p rustfs-transfer-center` 通过。
+- [x] 未修改 `docs/v1.0冻结/`，未部署、未调用真实 API、未操作硬盘或生产 SQL。
+
+---
+
+# 开发任务卡片：TASK-S1-CENTER-HOTFIX-008
+
+### 任务基本信息
+
+- **任务 ID**：TASK-S1-CENTER-HOTFIX-008
+- **任务名称**：Center 受控丢弃 SEALED 测试导出并重置
+- **所属 Track / 模块**：Center / Reinitialize
+- **优先级**：P0 解阻塞
+- **计划时间**：Day 3 从零闭环阻塞修补
+- **当前状态**：[x]
+- **依赖任务**：TASK-S1-CENTER-HOTFIX-007
+
+### 任务目标与范围
+
+- **核心目标**：新增最小受控能力，在用户明确放弃单个测试盘已封盘导出数据时，允许 Center 对满足严格门禁的 `SEALED` 盘清理测试导出载荷并重新初始化为 `INITIALIZED`，用于从零重新扫描导出。
+- **对应代码位置**：`crates/center-backend/src/reinitialize_runtime.rs`、`crates/center-backend/src/reinitializer.rs`、相关 Center 测试。
+- **不在范围内**：不修改冻结文档；不部署 VM；不触碰真实盘、源对象、archive、object_ledger 或无关 DB 记录；不放宽普通 `IMPORTED` 清理重新初始化路径。
+
+### 验收标准
+
+- [x] 仅当请求显式确认丢弃 `SEALED` 测试导出且 `expected_status_code=SEALED` 时进入新分支。
+- [x] 进入写入前完成 ext4、协议文件、目标身份、`.partial=0`、Center 签名、封盘 seal、manifest/data/meta 自洽门禁。
+- [x] 成功后清理测试导出 payload，写回完整 `INITIALIZED` disk_info，生成并激活新 data_key。
+- [x] 失败时保持盘内 `SEALED` 边界，不手工 SQL，不影响源对象、其他盘、archive 或 object_ledger。
+- [x] `cargo fmt --all -- --check`、`cargo test -p rustfs-transfer-common`、`cargo test -p rustfs-transfer-center` 通过。
+
 # 开发任务卡片：TASK-S1-WEB-EDGE-001
 
 ### 任务基本信息
@@ -1847,3 +1994,316 @@
 - [ ] 迁移脚本可在空库执行。
 - [ ] 主闭环联调记录写入当天 dev log。
 - [ ] 未完成项已回写对应任务卡和 dev log。
+
+---
+
+# 开发任务卡片：TASK-S1-EDGE-AUTO-001
+
+### 任务基本信息
+
+- **任务 ID**：TASK-S1-EDGE-AUTO-001
+- **任务名称**：Edge 插盘后自动扫描、自动建任务和自动启动导出编排
+- **所属 Track / 模块**：
+  - [ ] Track 1: Common
+  - [x] Track 2: Edge (`crates/edge-backend`)
+  - [ ] Track 3: Center
+  - [ ] Track 4: Web
+- **任务状态**：[x] 开发完成
+- **负责人 / Role**：Agent D3
+- **计划时间**：Day 3 上午
+- **依赖任务**：TASK-S1-EDGE-002, TASK-S1-EDGE-003, TASK-S1-EDGE-004, TASK-S1-EDGE-005
+
+### 任务目标与范围
+
+- **核心目标**：新增 Edge 自动编排模块，在运输盘准入为 `READY` 后自动串起扫描 RustFS、创建导出任务、启动导出 Worker，并保证重复 udev / 启动扫描不会重复创建同一轮导出。
+- **建议代码位置**：`crates/edge-backend/src/auto_export.rs`、`crates/edge-backend/src/server.rs`、`crates/edge-backend/src/rescan.rs`、`crates/edge-backend/src/control.rs`。
+
+### Interface 设计
+
+- 新增深模块 `AutoExportOrchestrator`，外部 Interface 尽量保持一个入口：`on_transport_disks_refreshed(trigger)`。
+- 该模块内部可复用 `EdgeControlService::scan_once`、`create_export_job`、`start_export_job`，不得复制扫描、Planner、分配或 DiskWorker 实现。
+- 编排器必须接受配置开关，例如 `auto_export.enabled`、`auto_export.start_on_ready`、`auto_export.min_ready_disk_count`、`auto_export.cooldown_seconds`。
+- 编排器需要返回结构化结果：未启用、无 READY 盘、已有活动任务、已启动任务、启动失败。
+
+### 协议与数据结构约束
+
+- 自动流程只能在 `disk_status_code = INITIALIZED` 且 `runtime_status = READY` 后启动。
+- 同一批 READY 盘已有 `PENDING`、`SCANNING`、`COPYING`、`SEALING` 或未完成 `export_job` 时，不得创建新的自动任务。
+- RustFS 扫描一天最多成功执行一次；最近 24 小时已有 `DONE` 扫描记录时，自动编排必须复用最近扫描快照创建导出任务。
+- 导出计划只能读取最近一次成功扫描窗口内的 `stable_status = STABLE` 快照。
+- 自动任务创建后仍使用现有 `export_job_status`、`object_status` 和 `disk_runtime.status`。
+- 不新增裸 `status` 字段。
+
+### 安全与状态机边界
+
+- udev 仍只触发 rescan；自动导出由 Edge 常驻服务执行。
+- 自动编排不得绕过 Center `/api/disk/verify` 或 `/api/disk/export-key`。
+- 中控不可达且未领取本次 `disk_data_key` 时不得开始加密导出。
+- Edge 不得初始化、清理、格式化、重新初始化或导入运输盘。
+- 不得删除、覆盖或修改 RustFS 源对象。
+
+### 验收与检查清单
+
+- [x] 配置关闭时，插盘只进入 READY，不自动 scan/export。
+- [x] 配置开启时，插入单块 `INITIALIZED` 盘后自动完成 scan、create export_job、start DiskWorker。
+- [x] 服务启动时已有 READY 盘也能自动进入流程。
+- [x] 24 小时内重复触发自动流程不会再次全量扫描 RustFS。
+- [x] 自动导出只包含最近一次成功扫描确认上传完成的 `STABLE` 对象。
+- [x] 连续 udev 重复事件不会重复创建多个活动 export_job。
+- [x] 已存在活动 export_job 时不会启动第二个自动任务。
+- [x] Center verify/export-key 失败时不启动导出，并留下可机读错误。
+- [x] `cargo fmt --all -- --check` 通过。
+- [x] `cargo test -p rustfs-transfer-edge` 通过。
+
+---
+
+# 开发任务卡片：TASK-S1-EDGE-WS-BOOT-001
+
+### 任务基本信息
+
+- **任务 ID**：TASK-S1-EDGE-WS-BOOT-001
+- **任务名称**：Edge 插盘、校验、扫描和封盘阶段 WebSocket 事件补齐
+- **所属 Track / 模块**：
+  - [ ] Track 1: Common
+  - [x] Track 2: Edge (`crates/edge-backend`)
+  - [ ] Track 3: Center
+  - [x] Track 4: Web contract
+- **任务状态**：[x] 开发完成
+- **负责人 / Role**：Agent D4
+- **计划时间**：Day 3 上午
+- **依赖任务**：TASK-S1-DASHBOARD-REALTIME-001, TASK-S1-EDGE-002
+
+### 任务目标与范围
+
+- **核心目标**：补齐 Edge 从插盘到封盘的全阶段 WebSocket 事件，让前端不用等到 `COPY_PROGRESS` 才知道后端发生了什么。
+- **建议代码位置**：`crates/edge-backend/src/progress.rs`、`crates/edge-backend/src/scanner/progress.rs`、`crates/edge-backend/src/disk_detection.rs`、`crates/edge-backend/src/server.rs`。
+
+### Interface 设计
+
+- 新增或扩展一个小 Interface：`EdgeRealtimePublisher`，由 disk detection、scanner、auto orchestrator 和 DiskWorker 发布状态。
+- WebSocket Publisher 统一消费该 Interface 的快照或广播通道。
+- 不让前端轮询多个接口拼状态；后端提供单一事件流。
+
+### 协议与数据结构约束
+
+- 必须支持事件：`DISK_DETECTED`、`DISK_CHECKING`、`DISK_READY`、`DISK_REJECTED`、`DISK_REMOVED`、`SCAN_STARTED`、`SCAN_PROGRESS`、`SCAN_DONE`、`COPY_STARTED`、`COPY_PROGRESS`、`COPY_DONE`、`SEAL_DONE`、`ERROR`。
+- 事件字段必须使用 `disk_status_code`、`runtime_status`、`export_job_status`、`object_status`。
+- `COPY_PROGRESS` 的高频字节进度仍来自内存 `ProgressAggregator`。
+- 扫描事件可以来自 scanner progress snapshot，但不得每秒扫描数据库聚合。
+
+### 安全与状态机边界
+
+- WebSocket 只服务 Edge 后端到 Edge 前端展示，不用于 Center/Edge 同步。
+- 事件不得包含控制 token、`disk_data_key`、`edge_auth_secret`、nonce、tag 或 `data_key_id`。
+- `SEAL_DONE` 只能在实际封盘和 `disk_info.json.status.code = SEALED` 成功后发布。
+
+### 验收与检查清单
+
+- [x] 插盘后 1 秒内 WebSocket 可收到 `DISK_DETECTED` 或 HTTP summary 可观察到对应新盘。
+- [x] 准入校验期间可收到 `DISK_CHECKING`。
+- [x] 校验失败可收到 `DISK_REJECTED` 或 `ERROR`，包含标准错误码。
+- [x] 扫描期间可收到 `SCAN_STARTED`、`SCAN_PROGRESS`、`SCAN_DONE`。
+- [x] 导出启动时可收到 `COPY_STARTED`。
+- [x] 封盘成功时可收到 `SEAL_DONE`。
+- [x] 所有事件 payload 无裸 `status` 混用。
+- [x] `cargo test -p rustfs-transfer-edge` 通过。
+
+---
+
+# 开发任务卡片：TASK-S1-WEB-EDGE-PROD-001
+
+### 任务基本信息
+
+- **任务 ID**：TASK-S1-WEB-EDGE-PROD-001
+- **任务名称**：Edge Dashboard 生产态清理与浏览器只读收口
+- **所属 Track / 模块**：
+  - [ ] Track 1: Common
+  - [ ] Track 2: Edge
+  - [ ] Track 3: Center
+  - [x] Track 4: Web (`web/edge-web`)
+- **任务状态**：[x] 开发完成
+- **负责人 / Role**：Agent E3
+- **计划时间**：Day 3 上午
+- **依赖任务**：TASK-S1-P1-EDGE-WEB-CONTRACT-001
+
+### 任务目标与范围
+
+- **核心目标**：把 Edge Dashboard 从演示/预览态收口为上线生产态，避免 HTTP 失败时展示假数据，移除浏览器写操作入口。
+- **对应代码位置**：`web/edge-web/src/views/DashboardView.vue`、`web/edge-web/src/api/edgeDashboard.ts`、`web/edge-web/src/ws/edgeCopyProgress.ts`、`web/edge-web/src/style.css`。
+
+### 协议与数据结构约束
+
+- 页面首次加载只调用 `/api/edge/dashboard/summary`。
+- 运行中只连接 `/ws/edge/copy-progress` 或兼容 `/ws/edge/progress`。
+- 导出记录只使用 `/api/edge/dashboard/export-jobs` 和详情接口。
+- 不调用 `/api/edge/scan`、`/api/edge/export-jobs`、`/api/edge/export-jobs/{id}/start`、`/recover` 等受控写路径。
+
+### 安全与状态机边界
+
+- 删除或隔离 `previewSummary` 上线展示兜底；HTTP 失败必须展示真实空态/错误态。
+- 页面不得提供初始化、清理、格式化、重新初始化、导入、启动导出、恢复导出等写操作按钮。
+- 浏览器代码不得读取、展示或发送控制 token、Center 地址、`authorization_key`、`disk_data_key`、nonce、tag 或 `data_key_id`。
+- Edge 页面不得展示 `IMPORTED` 作为正常盘状态。
+
+### 验收与检查清单
+
+- [ ] HTTP summary 失败时不展示假进度、假盘位或假对象。
+- [ ] Dashboard 无受控写接口调用。
+- [ ] 页面无“执行恢复检查”等生产不允许操作入口。
+- [ ] 空态、断线态、错误态都有真实展示。
+- [ ] `npm run typecheck` 通过。
+- [ ] `npm run build` 通过。
+- [ ] 浏览器接口响应字段映射无裸 `status` 混用。
+- [x] Dashboard Edge 节点名仅在顶部标题右侧展示，左侧源服务器框不重复显示节点名。
+- [x] 同步记录页统计卡仅展示总览不触发筛选，返回入口、列表和详情抽屉按 16:9 首屏对齐，底部提示条移除。
+- [x] 同步记录统计逐项容错，列表全量在当前页时兜底计算；详情面板默认展示首条记录，无记录时显示暂无内容。
+- [x] Dashboard 在 HTTP summary 已确认终态且 `disks[]` 为空时，不再因旧 WebSocket 非终态快照恢复已拔出的盘位列表。
+
+---
+
+# 开发任务卡片：TASK-S1-WEB-EDGE-TIMELINE-001
+
+### 任务基本信息
+
+- **任务 ID**：TASK-S1-WEB-EDGE-TIMELINE-001
+- **任务名称**：Edge Dashboard 插盘即时反馈、每盘时间线和扫描态展示
+- **所属 Track / 模块**：
+  - [ ] Track 1: Common
+  - [ ] Track 2: Edge
+  - [ ] Track 3: Center
+  - [x] Track 4: Web (`web/edge-web`)
+- **任务状态**：[x] 开发完成
+- **负责人 / Role**：Agent E4
+- **计划时间**：Day 3 下午
+- **依赖任务**：TASK-S1-EDGE-WS-BOOT-001, TASK-S1-WEB-EDGE-PROD-001
+
+### 任务目标与范围
+
+- **核心目标**：实现 Edge Dashboard 全流程视觉反馈：插盘即时出现、校验中、扫描中、导出中、封盘完成、可拔盘和异常处理。
+- **对应代码位置**：`web/edge-web/src/views/DashboardView.vue`、`web/edge-web/src/ws/edgeCopyProgress.ts`、`web/edge-web/src/api/edgeDashboard.ts`、`web/edge-web/src/style.css`。
+
+### 协议与数据结构约束
+
+- 每块盘以 WebSocket `disks[]` 为独立进度来源。
+- 时间线节点固定为：已检测、校验中、已授权、扫描 RustFS、分配对象、写盘中、生成清单、封盘完成、可拔盘。
+- 只有 `SEAL_DONE` 或 HTTP summary 确认 `disk_status_code = SEALED` 且 `runtime_status = DONE` 时，才展示可拔盘。
+- 扫描态使用 `SCAN_STARTED`、`SCAN_PROGRESS`、`SCAN_DONE`，不得硬编码固定扫描百分比。
+
+### 安全与状态机边界
+
+- 前端不得本地推断封盘完成。
+- 前端不得自行创造状态枚举；未知事件进入“未知/等待后端更新”展示，不转成成功态。
+- 错误态必须展示 `last_error_code` 和后端 `message`。
+
+### 验收与检查清单
+
+- [x] 插盘后出现检测视觉反馈。
+- [x] 每盘时间线能随事件推进。
+- [x] 扫描期间显示 bucket、对象数、稳定对象数和容量。
+- [x] 导出期间显示全局进度、每盘进度、当前对象、速度和剩余字节。
+- [x] WebSocket 断开后显示重连态；重连后继续更新。
+- [x] 页面刷新后 HTTP summary 能恢复当前状态。
+- [x] 封盘前不显示可拔盘；封盘后显示可拔盘。
+- [x] 移动端和 1440x810 桌面视口不出现文字重叠。
+- [x] `npm run typecheck` 和 `npm run build` 通过。
+
+---
+
+# 开发任务卡片：TASK-S1-EDGE-AUTO-DEPLOY-001
+
+### 任务基本信息
+
+- **任务 ID**：TASK-S1-EDGE-AUTO-DEPLOY-001
+- **任务名称**：Edge 自动流程配置开关、部署检查和回滚说明
+- **所属 Track / 模块**：
+- [ ] Track 1: Common
+- [x] Track 2: Edge (`deploy/`, `crates/edge-backend`)
+- [ ] Track 3: Center
+- [ ] Track 4: Web
+- **任务状态**：[x] 开发完成
+- **负责人 / Role**：Agent F1
+- **计划时间**：Day 3 下午
+- **依赖任务**：TASK-S1-EDGE-AUTO-001
+
+### 任务目标与范围
+
+- **核心目标**：让 Edge 自动流程可部署、可灰度、可回滚，并把上线检查写进静态验证和运行手册。
+- **对应代码位置**：`deploy/config/edge.example.toml`、`deploy/systemd/`、`deploy/udev/`、`scripts/check-deploy.ps1`、`docs/上线要求.md`。
+
+### 协议与数据结构约束
+
+- 新增配置只能控制是否自动触发 scan/export，不改变协议字段、状态码或数据库语义。
+- 默认值必须保守；如默认不开启，部署说明必须写清如何开启。
+- udev 规则不得直接包含 export、import、cleanup、reinitialize、mkfs 或 format 业务动作。
+
+### 安全与状态机边界
+
+- 回滚方式必须能恢复到现有受控 API 模式。
+- 示例配置不得包含真实密钥、token 或生产地址。
+- 不得修改冻结文档。
+
+### 验收与检查清单
+
+- [x] 示例配置包含自动流程开关和说明。
+- [x] 静态检查能确认 udev 仍只触发 rescan。
+- [x] 部署说明包含开启、关闭、回滚和排障步骤。
+- [x] `scripts/check-deploy.ps1` 通过。
+- [x] 自动流程关闭后原受控 scan/export/start 仍可用。
+
+---
+
+# 开发任务卡片：TASK-S1-EDGE-REALTIME-QA-001
+
+### 任务基本信息
+
+- **任务 ID**：TASK-S1-EDGE-REALTIME-QA-001
+- **任务名称**：Edge 前后端实时可视化端到端联调验收
+- **所属 Track / 模块**：
+  - [x] Track 1: Common
+  - [x] Track 2: Edge
+  - [ ] Track 3: Center
+  - [x] Track 4: Web / Deploy / QA
+- **任务状态**：[ ] 未开始
+- **负责人 / Role**：Agent F2
+- **计划时间**：Day 3 下午
+- **依赖任务**：TASK-S1-EDGE-AUTO-001, TASK-S1-EDGE-WS-BOOT-001, TASK-S1-WEB-EDGE-TIMELINE-001, TASK-S1-EDGE-AUTO-DEPLOY-001
+
+### 任务目标与范围
+
+- **核心目标**：在真实 Edge 前后端环境跑通插盘自动导出可视化链路，并形成可交付验收记录。
+- **对应位置**：`work_sprint/dev_log/`、`web/edge-web/design-qa.md`、必要时新增 `work_sprint/edge_realtime_acceptance.md`。
+
+### 验收路径
+
+```text
+Center 初始化运输盘
+-> 运输盘插入 Edge
+-> Edge Dashboard 1 秒内出现 DISK_DETECTED 视觉反馈
+-> Edge 自动校验并进入 READY
+-> Edge 自动扫描 RustFS
+-> Edge 自动创建并启动导出
+-> Dashboard 展示 SCAN_PROGRESS 和 COPY_PROGRESS
+-> Edge 封盘到 SEALED
+-> Dashboard 展示 SEAL_DONE 和可拔盘
+```
+
+### 安全与状态机边界
+
+- 不允许为演示跳过 HMAC、Center verify/export-key、ext4 检查、`.partial` 恢复检查、AES-GCM 或数据库分配锁。
+- 不允许手工写数据库、手工改盘内协议文件或手工标记任务成功。
+- 不允许修改冻结文档。
+
+### 验收与检查清单
+
+- [ ] 插盘 1 秒内前端有真实反馈截图或录像记录。
+- [ ] WebSocket 事件序列覆盖 `DISK_DETECTED -> DISK_CHECKING -> DISK_READY -> SCAN_* -> COPY_* -> SEAL_DONE`。
+- [ ] RustFS 全量扫描一天最多成功执行一次；重复插盘复用最近一次成功扫描结果。
+- [ ] 正在上传或扫描期间变化的对象不计入稳定对象统计，不进入导出队列。
+- [ ] 页面刷新后 summary 恢复当前状态。
+- [ ] WebSocket 断开/重连不造成假完成态。
+- [ ] 盘内最终 `disk_info.json.status.code = SEALED`。
+- [ ] `.partial=0`。
+- [ ] `export_job_status = SEALED`，对象状态无 `IMPORTED`。
+- [ ] 浏览器未暴露敏感字段。
+- [ ] 后端测试、前端 typecheck/build、部署静态检查通过。
+- [ ] 验收记录写入当天 dev log。

@@ -11,3 +11,10 @@ Install the binaries under `/opt/rustfs-transfer/`:
 Install configuration under `/etc/rustfs-transfer/` and runtime data under `/var/lib/rustfs-transfer/`.
 
 The rescan template is intentionally a notification shim. It must only tell the local daemon that block devices changed; export, import, cleanup, and reinitialization work stay inside the long-running center or edge service.
+
+Edge auto export is controlled by `/etc/rustfs-transfer/edge.toml` or
+`/etc/rustfs-transfer/edge.env`. Keep both
+`RUSTFS_TRANSFER__AUTO_EXPORT__ENABLED=false` and
+`RUSTFS_TRANSFER__AUTO_EXPORT__START_ON_READY=false` unless an approved Edge
+rollout explicitly enables automatic scan/export. Rollback is the reverse:
+set both values to `false` and restart `rustfs-transfer-edge`.

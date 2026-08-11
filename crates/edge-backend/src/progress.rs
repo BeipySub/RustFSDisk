@@ -70,6 +70,7 @@ pub struct ProgressAggregator {
 struct ProgressState {
     edge_code: String,
     export_job_id: String,
+    event_type: String,
     disk_status_code: String,
     export_job_status: String,
     disks: BTreeMap<String, DiskProgress>,
@@ -97,6 +98,7 @@ impl ProgressAggregator {
             inner: Arc::new(Mutex::new(ProgressState {
                 edge_code: edge_code.into(),
                 export_job_id: export_job_id.into(),
+                event_type: "COPY_STARTED".to_string(),
                 disk_status_code: "EDGE_COPYING".to_string(),
                 export_job_status: "COPYING".to_string(),
                 disks: BTreeMap::new(),
@@ -144,13 +146,9 @@ impl ProgressAggregator {
     ) {
         let key = key.into();
         let display_name = key.rsplit('/').next().unwrap_or(&key).to_string();
-        if let Some(disk) = self
-            .inner
-            .lock()
-            .expect("progress mutex poisoned")
-            .disks
-            .get_mut(disk_id)
-        {
+        let mut state = self.inner.lock().expect("progress mutex poisoned");
+        state.event_type = "COPY_PROGRESS".to_string();
+        if let Some(disk) = state.disks.get_mut(disk_id) {
             disk.current_object = Some(CurrentObjectProgress {
                 bucket: bucket.into(),
                 key,
@@ -183,13 +181,8 @@ impl ProgressAggregator {
     }
 
     pub fn complete_object(&self, disk_id: &str) {
-        if let Some(disk) = self
-            .inner
-            .lock()
-            .expect("progress mutex poisoned")
-            .disks
-            .get_mut(disk_id)
-        {
+        let mut state = self.inner.lock().expect("progress mutex poisoned");
+        if let Some(disk) = state.disks.get_mut(disk_id) {
             disk.object_done = disk.object_done.saturating_add(1).min(disk.object_total);
             if let Some(current) = disk.current_object.as_mut() {
                 current.object_status = "EXPORTED".to_string();
@@ -197,32 +190,43 @@ impl ProgressAggregator {
                 current.remaining_bytes = 0;
             }
         }
+        if !state.disks.is_empty()
+            && state
+                .disks
+                .values()
+                .all(|disk| disk.object_done >= disk.object_total)
+        {
+            state.event_type = "COPY_DONE".to_string();
+        }
     }
 
     pub fn fail_disk(&self, disk_id: &str, error_code: impl Into<String>) {
-        if let Some(disk) = self
-            .inner
-            .lock()
-            .expect("progress mutex poisoned")
-            .disks
-            .get_mut(disk_id)
-        {
+        let mut state = self.inner.lock().expect("progress mutex poisoned");
+        state.event_type = "ERROR".to_string();
+        state.export_job_status = "FAILED".to_string();
+        state.disk_status_code = "ERROR".to_string();
+        if let Some(disk) = state.disks.get_mut(disk_id) {
             disk.runtime_status = "ERROR".to_string();
             disk.message = error_code.into();
         }
     }
 
     pub fn mark_disk_done(&self, disk_id: &str) {
-        if let Some(disk) = self
-            .inner
-            .lock()
-            .expect("progress mutex poisoned")
-            .disks
-            .get_mut(disk_id)
-        {
+        let mut state = self.inner.lock().expect("progress mutex poisoned");
+        if let Some(disk) = state.disks.get_mut(disk_id) {
             disk.runtime_status = "DONE".to_string();
             disk.current_object = None;
             disk.message = "sealed".to_string();
+        }
+        if !state.disks.is_empty()
+            && state
+                .disks
+                .values()
+                .all(|disk| disk.runtime_status == "DONE")
+        {
+            state.event_type = "SEAL_DONE".to_string();
+            state.disk_status_code = "SEALED".to_string();
+            state.export_job_status = "SEALED".to_string();
         }
     }
 
@@ -231,6 +235,7 @@ impl ProgressAggregator {
         event_type: impl Into<String>,
         message: impl Into<String>,
     ) -> CopyProgressEvent {
+        let requested_event_type = event_type.into();
         let state = self.inner.lock().expect("progress mutex poisoned");
         let elapsed = state.started_at.elapsed().as_secs().max(1);
         let total_bytes = state.disks.values().map(|disk| disk.total_bytes).sum();
@@ -259,7 +264,11 @@ impl ProgressAggregator {
             .collect();
 
         CopyProgressEvent {
-            event_type: event_type.into(),
+            event_type: if requested_event_type == "COPY_PROGRESS" {
+                state.event_type.clone()
+            } else {
+                requested_event_type
+            },
             event_time: Utc::now(),
             source: "edge".to_string(),
             edge_code: state.edge_code.clone(),

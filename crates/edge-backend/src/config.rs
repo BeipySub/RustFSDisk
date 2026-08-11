@@ -12,6 +12,8 @@ pub struct EdgeConfig {
     pub paths: PathConfig,
     #[serde(default)]
     pub rescan: RescanConfig,
+    #[serde(default)]
+    pub auto_export: AutoExportConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -67,6 +69,18 @@ pub struct RescanConfig {
     pub endpoint_url: Option<String>,
     pub token: Option<String>,
     pub token_env: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AutoExportConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub start_on_ready: bool,
+    #[serde(default = "default_auto_export_min_ready_disk_count")]
+    pub min_ready_disk_count: usize,
+    #[serde(default = "default_auto_export_cooldown_seconds")]
+    pub cooldown_seconds: u64,
 }
 
 impl EdgeConfig {
@@ -176,6 +190,22 @@ impl EdgeConfig {
                 self.rescan.token = Some(token);
             }
         }
+        override_bool(
+            "RUSTFS_TRANSFER__AUTO_EXPORT__ENABLED",
+            &mut self.auto_export.enabled,
+        );
+        override_bool(
+            "RUSTFS_TRANSFER__AUTO_EXPORT__START_ON_READY",
+            &mut self.auto_export.start_on_ready,
+        );
+        override_usize(
+            "RUSTFS_TRANSFER__AUTO_EXPORT__MIN_READY_DISK_COUNT",
+            &mut self.auto_export.min_ready_disk_count,
+        );
+        override_u64(
+            "RUSTFS_TRANSFER__AUTO_EXPORT__COOLDOWN_SECONDS",
+            &mut self.auto_export.cooldown_seconds,
+        );
     }
 
     fn validate(&self) -> anyhow::Result<()> {
@@ -234,6 +264,17 @@ impl Default for PathConfig {
     }
 }
 
+impl Default for AutoExportConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            start_on_ready: false,
+            min_ready_disk_count: default_auto_export_min_ready_disk_count(),
+            cooldown_seconds: default_auto_export_cooldown_seconds(),
+        }
+    }
+}
+
 fn override_string(name: &str, value: &mut String) {
     if let Ok(env_value) = env::var(name) {
         if !env_value.trim().is_empty() {
@@ -246,6 +287,32 @@ fn override_optional_string(name: &str, value: &mut Option<String>) {
     if let Ok(env_value) = env::var(name) {
         if !env_value.trim().is_empty() {
             *value = Some(env_value);
+        }
+    }
+}
+
+fn override_bool(name: &str, value: &mut bool) {
+    if let Ok(env_value) = env::var(name) {
+        match env_value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => *value = true,
+            "0" | "false" | "no" | "off" => *value = false,
+            _ => {}
+        }
+    }
+}
+
+fn override_usize(name: &str, value: &mut usize) {
+    if let Ok(env_value) = env::var(name) {
+        if let Ok(parsed) = env_value.trim().parse::<usize>() {
+            *value = parsed;
+        }
+    }
+}
+
+fn override_u64(name: &str, value: &mut u64) {
+    if let Ok(env_value) = env::var(name) {
+        if let Ok(parsed) = env_value.trim().parse::<u64>() {
+            *value = parsed;
         }
     }
 }
@@ -307,6 +374,14 @@ fn default_disk_mount_roots() -> Vec<String> {
     vec!["/mnt/rustfs-transfer".to_owned()]
 }
 
+fn default_auto_export_min_ready_disk_count() -> usize {
+    1
+}
+
+fn default_auto_export_cooldown_seconds() -> u64 {
+    60
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,6 +416,10 @@ mod tests {
         assert_eq!(config.server.control_api_token, None);
         assert_eq!(config.rustfs.region, "us-east-1");
         assert_eq!(config.paths.disk_mount_roots, vec!["/mnt/rustfs-transfer"]);
+        assert!(!config.auto_export.enabled);
+        assert!(!config.auto_export.start_on_ready);
+        assert_eq!(config.auto_export.min_ready_disk_count, 1);
+        assert_eq!(config.auto_export.cooldown_seconds, 60);
         assert_eq!(
             config.rescan_endpoint_url(),
             "http://127.0.0.1:8081/internal/disk/rescan"
@@ -391,6 +470,50 @@ mod tests {
         std::env::remove_var("RUSTFS_TRANSFER__TEST_EDGE_SECRET");
         std::env::remove_var("RUSTFS_TRANSFER__TEST_RESCAN_TOKEN");
         std::env::remove_var("RUSTFS_TRANSFER__TEST_CONTROL_TOKEN");
+    }
+
+    #[test]
+    fn auto_export_env_overrides_support_gray_enable_and_rollback() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        clear_rustfs_credential_env();
+        std::env::set_var("RUSTFS_TRANSFER__AUTO_EXPORT__ENABLED", "true");
+        std::env::set_var("RUSTFS_TRANSFER__AUTO_EXPORT__START_ON_READY", "1");
+        std::env::set_var("RUSTFS_TRANSFER__AUTO_EXPORT__MIN_READY_DISK_COUNT", "2");
+        std::env::set_var("RUSTFS_TRANSFER__AUTO_EXPORT__COOLDOWN_SECONDS", "300");
+        let raw = r#"
+            [database]
+            url = "postgres://edge:edge@localhost/edge"
+
+            [center]
+            base_url = "http://center.local:8080"
+            edge_code = "edge-a"
+            auth_key_id = "auth-key-example"
+            edge_auth_secret = "example-dev-secret"
+
+            [rustfs]
+            endpoint = "http://127.0.0.1:9000"
+            access_key_id = "edge-access-key"
+            secret_access_key = "edge-secret-key"
+        "#;
+
+        let config = EdgeConfig::from_toml(raw).expect("config loads");
+
+        assert!(config.auto_export.enabled);
+        assert!(config.auto_export.start_on_ready);
+        assert_eq!(config.auto_export.min_ready_disk_count, 2);
+        assert_eq!(config.auto_export.cooldown_seconds, 300);
+
+        std::env::set_var("RUSTFS_TRANSFER__AUTO_EXPORT__ENABLED", "false");
+        std::env::set_var("RUSTFS_TRANSFER__AUTO_EXPORT__START_ON_READY", "off");
+        let config = EdgeConfig::from_toml(raw).expect("config reloads");
+
+        assert!(!config.auto_export.enabled);
+        assert!(!config.auto_export.start_on_ready);
+
+        std::env::remove_var("RUSTFS_TRANSFER__AUTO_EXPORT__ENABLED");
+        std::env::remove_var("RUSTFS_TRANSFER__AUTO_EXPORT__START_ON_READY");
+        std::env::remove_var("RUSTFS_TRANSFER__AUTO_EXPORT__MIN_READY_DISK_COUNT");
+        std::env::remove_var("RUSTFS_TRANSFER__AUTO_EXPORT__COOLDOWN_SECONDS");
     }
 
     #[test]
@@ -457,5 +580,9 @@ mod tests {
     fn clear_rustfs_credential_env() {
         std::env::remove_var("RUSTFS_TRANSFER__RUSTFS__ACCESS_KEY_ID");
         std::env::remove_var("RUSTFS_TRANSFER__RUSTFS__SECRET_ACCESS_KEY");
+        std::env::remove_var("RUSTFS_TRANSFER__AUTO_EXPORT__ENABLED");
+        std::env::remove_var("RUSTFS_TRANSFER__AUTO_EXPORT__START_ON_READY");
+        std::env::remove_var("RUSTFS_TRANSFER__AUTO_EXPORT__MIN_READY_DISK_COUNT");
+        std::env::remove_var("RUSTFS_TRANSFER__AUTO_EXPORT__COOLDOWN_SECONDS");
     }
 }

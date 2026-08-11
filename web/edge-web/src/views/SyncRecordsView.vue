@@ -9,67 +9,12 @@ import {
   type ExportJobStatus,
 } from "../api/edgeDashboard";
 
-const previewRecords: EdgeExportJobRecord[] = [
-  {
-    export_job_id: "exp-20260721-009-0001",
-    edge_code: "edge-src-a-01",
-    export_job_status: "COPYING",
-    object_count: 128_684_912,
-    copied_count: 98_532_118,
-    total_bytes: 12_130_000_000_000,
-    copied_bytes: 8_240_000_000_000,
-    disk_count: 4,
-    start_time: "2026-07-21T08:42:10Z",
-    object_status_counts: { COPYING: 30_152_794, EXPORTED: 98_532_118, SKIPPED: 12_348 },
-  },
-  {
-    export_job_id: "exp-20260721-008-0001",
-    edge_code: "edge-src-a-01",
-    export_job_status: "SEALED",
-    object_count: 118_623_004,
-    copied_count: 118_623_004,
-    total_bytes: 11_800_000_000_000,
-    copied_bytes: 11_800_000_000_000,
-    disk_count: 4,
-    start_time: "2026-07-21T05:08:22Z",
-    finish_time: "2026-07-21T07:41:10Z",
-    object_status_counts: { EXPORTED: 118_623_004 },
-  },
-  {
-    export_job_id: "exp-20260721-007-0001",
-    edge_code: "edge-src-a-01",
-    export_job_status: "FAILED",
-    object_count: 37_912_001,
-    copied_count: 18_400_000,
-    total_bytes: 4_300_000_000_000,
-    copied_bytes: 1_920_000_000_000,
-    disk_count: 2,
-    start_time: "2026-07-21T02:26:00Z",
-    finish_time: "2026-07-21T03:18:45Z",
-    error_message: "写入校验失败",
-    object_status_counts: { EXPORTED: 18_400_000, FAILED: 3, SKIPPED: 20_000 },
-  },
-  ...Array.from({ length: 5 }, (_, index) => ({
-    export_job_id: `exp-20260720-00${6 - index}-0001`,
-    edge_code: "edge-src-a-01",
-    export_job_status: "SEALED" as ExportJobStatus,
-    object_count: 96_210_556 - index * 1_200_000,
-    copied_count: 96_210_556 - index * 1_200_000,
-    total_bytes: (9.6 - index * 0.4) * 1_000_000_000_000,
-    copied_bytes: (9.6 - index * 0.4) * 1_000_000_000_000,
-    disk_count: 4 + (index % 2),
-    start_time: `2026-07-20T0${9 + index}:05:00Z`,
-    finish_time: `2026-07-20T1${1 + index}:22:00Z`,
-    object_status_counts: { EXPORTED: 96_210_556 - index * 1_200_000 },
-  })),
-];
-
 const page = ref(1);
 const pageSize = 8;
 const total = ref(0);
 const records = ref<EdgeExportJobRecord[]>([]);
 const selected = ref<EdgeExportJobDetail | null>(null);
-const selectedId = ref("exp-20260721-009-0001");
+const selectedId = ref("");
 const filterStatus = ref<"" | ExportJobStatus>("");
 const timeRange = ref("30");
 const query = ref("");
@@ -77,8 +22,14 @@ const loading = ref(false);
 const detailLoading = ref(false);
 const error = ref<DashboardHttpError | null>(null);
 const detailError = ref<DashboardHttpError | null>(null);
+const recordStats = ref({
+  total: 0,
+  running: 0,
+  sealed: 0,
+  failed: 0,
+});
 
-const sourceRecords = computed(() => (records.value.length > 0 ? records.value : previewRecords));
+const sourceRecords = computed(() => records.value);
 const filteredRecords = computed(() => {
   const needle = query.value.trim().toLowerCase();
   return sourceRecords.value.filter((record) => {
@@ -90,11 +41,12 @@ const filteredRecords = computed(() => {
     return statusMatch && textMatch;
   });
 });
-const pageCount = computed(() => Math.max(1, Math.ceil((records.value.length ? total.value : filteredRecords.value.length) / pageSize)));
+const pageCount = computed(() => Math.max(1, Math.ceil(total.value / pageSize)));
 const selectedRecord = computed(() => filteredRecords.value.find((record) => record.export_job_id === selectedId.value) ?? filteredRecords.value[0] ?? null);
-const selectedDetail = computed<EdgeExportJobDetail>(() => {
+const selectedDetail = computed<EdgeExportJobDetail | null>(() => {
   if (selected.value) return selected.value;
-  const record = selectedRecord.value ?? previewRecords[0];
+  const record = selectedRecord.value;
+  if (!record) return null;
   return {
     ...record,
     disks: ["7F22", "51C8", "8F2A", "0D16"].map((suffix, index) => ({
@@ -121,20 +73,20 @@ const selectedDetail = computed<EdgeExportJobDetail>(() => {
     ],
   };
 });
-const stats = computed(() => ({
-  total: records.value.length ? total.value : 127,
-  running: records.value.length
-    ? sourceRecords.value.filter((record) => record.export_job_status === "COPYING" || record.export_job_status === "SCANNING").length
-    : 2,
-  sealed: records.value.length ? sourceRecords.value.filter((record) => record.export_job_status === "SEALED").length : 118,
-  failed: records.value.length ? sourceRecords.value.filter((record) => record.export_job_status === "FAILED").length : 5,
-}));
+const stats = computed(() => recordStats.value);
 
-watch([filterStatus, timeRange, query], () => {
+watch([timeRange, query], () => {
   page.value = 1;
+  void loadStats();
+  void loadRecords();
 });
 
-watch([page, filterStatus], () => {
+watch(filterStatus, () => {
+  page.value = 1;
+  void loadRecords();
+});
+
+watch(page, () => {
   void loadRecords();
 });
 
@@ -152,7 +104,20 @@ async function loadRecords() {
     });
     records.value = response.items;
     total.value = response.total;
+    updateStatsFromCurrentList();
+    const nextRecord =
+      records.value.find((record) => record.export_job_id === selectedId.value) ?? records.value[0] ?? null;
+    if (nextRecord) {
+      if (selected.value?.export_job_id !== nextRecord.export_job_id) void openDetail(nextRecord);
+    } else {
+      selected.value = null;
+      selectedId.value = "";
+    }
   } catch (loadError) {
+    records.value = [];
+    total.value = 0;
+    selected.value = null;
+    selectedId.value = "";
     error.value =
       loadError instanceof DashboardHttpError
         ? loadError
@@ -160,6 +125,36 @@ async function loadRecords() {
   } finally {
     loading.value = false;
   }
+}
+
+async function loadStats() {
+  const baseQuery = {
+    page: 1,
+    page_size: 1,
+    started_from: "",
+    started_to: "",
+    q: query.value,
+  };
+  const [all, copying, scanning, sealing, sealed, failed] = await Promise.allSettled([
+    fetchEdgeExportJobs({ ...baseQuery, export_job_status: "" }),
+    fetchEdgeExportJobs({ ...baseQuery, export_job_status: "COPYING" }),
+    fetchEdgeExportJobs({ ...baseQuery, export_job_status: "SCANNING" }),
+    fetchEdgeExportJobs({ ...baseQuery, export_job_status: "SEALING" }),
+    fetchEdgeExportJobs({ ...baseQuery, export_job_status: "SEALED" }),
+    fetchEdgeExportJobs({ ...baseQuery, export_job_status: "FAILED" }),
+  ]);
+  const current = recordStats.value;
+  const pageStats = fullPageStats();
+  const runningFromApi =
+    totalFrom(copying) !== undefined || totalFrom(scanning) !== undefined || totalFrom(sealing) !== undefined
+      ? (totalFrom(copying) ?? 0) + (totalFrom(scanning) ?? 0) + (totalFrom(sealing) ?? 0)
+      : undefined;
+  recordStats.value = {
+    total: totalFrom(all) ?? pageStats?.total ?? current.total,
+    running: runningFromApi ?? pageStats?.running ?? current.running,
+    sealed: totalFrom(sealed) ?? pageStats?.sealed ?? current.sealed,
+    failed: totalFrom(failed) ?? pageStats?.failed ?? current.failed,
+  };
 }
 
 async function openDetail(record: EdgeExportJobRecord) {
@@ -181,7 +176,6 @@ async function openDetail(record: EdgeExportJobRecord) {
 
 function selectSummaryStatus(nextStatus: "" | ExportJobStatus) {
   filterStatus.value = nextStatus;
-  void loadRecords();
 }
 
 function goDashboard() {
@@ -214,7 +208,7 @@ function formatTime(value?: string): string {
 function statusTone(value: ExportJobStatus): string {
   if (value === "SEALED") return "success";
   if (value === "FAILED") return "danger";
-  if (value === "COPYING" || value === "SCANNING") return "running";
+  if (value === "COPYING" || value === "SCANNING" || value === "SEALING") return "running";
   return "muted";
 }
 
@@ -225,7 +219,37 @@ function resultText(record: EdgeExportJobRecord): string {
   return "待处理";
 }
 
-onMounted(() => void loadRecords());
+function countRecordStats(items: EdgeExportJobRecord[], totalCount = items.length) {
+  return {
+    total: totalCount,
+    running: items.filter((record) =>
+      record.export_job_status === "COPYING" ||
+      record.export_job_status === "SCANNING" ||
+      record.export_job_status === "SEALING"
+    ).length,
+    sealed: items.filter((record) => record.export_job_status === "SEALED").length,
+    failed: items.filter((record) => record.export_job_status === "FAILED").length,
+  };
+}
+
+function fullPageStats() {
+  if (filterStatus.value !== "" || records.value.length === 0 || records.value.length < total.value) return null;
+  return countRecordStats(records.value, total.value);
+}
+
+function updateStatsFromCurrentList() {
+  const pageStats = fullPageStats();
+  if (pageStats) recordStats.value = pageStats;
+}
+
+function totalFrom(result: PromiseSettledResult<{ total: number }>): number | undefined {
+  return result.status === "fulfilled" ? result.value.total : undefined;
+}
+
+onMounted(() => {
+  void loadStats();
+  void loadRecords();
+});
 </script>
 
 <template>
@@ -240,27 +264,27 @@ onMounted(() => void loadRecords());
 
     <header class="records-title">
       <h1>同步记录</h1>
-      <button type="button" @click="goDashboard">← 返回 Dashboard</button>
       <p>本机历史独立保存，仅展示边缘端导出生命周期</p>
+      <button type="button" @click="goDashboard">← 返回 Dashboard</button>
     </header>
 
     <section class="record-summary">
-      <button :class="{ active: filterStatus === '' }" type="button" @click="selectSummaryStatus('')">
+      <div class="summary-card">
         <img alt="" src="/assets/fustfs-baseline/icons/task-confirmed-database.svg" />
         <span>全部</span><strong>{{ stats.total }}</strong>
-      </button>
-      <button :class="{ active: filterStatus === 'COPYING' }" type="button" @click="selectSummaryStatus('COPYING')">
+      </div>
+      <div class="summary-card">
         <img alt="" src="/assets/fustfs-baseline/icons/task-eta-clock.svg" />
         <span>进行中</span><strong>{{ stats.running }}</strong>
-      </button>
-      <button :class="{ active: filterStatus === 'SEALED' }" type="button" @click="selectSummaryStatus('SEALED')">
+      </div>
+      <div class="summary-card">
         <img alt="" src="/assets/fustfs-baseline/a04-packed-shield-v1.png" />
         <span>已封盘</span><strong>{{ stats.sealed }}</strong>
-      </button>
-      <button :class="{ active: filterStatus === 'FAILED' }" type="button" @click="selectSummaryStatus('FAILED')">
+      </div>
+      <div class="summary-card">
         <img alt="" src="/assets/fustfs-baseline/a04-failed-lock-small-v1.png" />
         <span>失败</span><strong class="danger">{{ stats.failed }}</strong>
-      </button>
+      </div>
     </section>
 
     <section class="record-controls" aria-label="同步记录筛选">
@@ -271,9 +295,12 @@ onMounted(() => void loadRecords());
       </select>
       <div class="segmented-filter">
         <button :class="{ active: filterStatus === '' }" type="button" @click="selectSummaryStatus('')">全部</button>
-        <button :class="{ active: filterStatus === 'COPYING' }" type="button" @click="selectSummaryStatus('COPYING')">进行中</button>
-        <button :class="{ active: filterStatus === 'SEALED' }" type="button" @click="selectSummaryStatus('SEALED')">已封盘</button>
-        <button :class="{ active: filterStatus === 'FAILED' }" type="button" @click="selectSummaryStatus('FAILED')">失败</button>
+        <button :class="{ active: filterStatus === 'COPYING' }" type="button"
+          @click="selectSummaryStatus('COPYING')">进行中</button>
+        <button :class="{ active: filterStatus === 'SEALED' }" type="button"
+          @click="selectSummaryStatus('SEALED')">已封盘</button>
+        <button :class="{ active: filterStatus === 'FAILED' }" type="button"
+          @click="selectSummaryStatus('FAILED')">失败</button>
       </div>
       <input v-model.trim="query" placeholder="批次号 / 导出任务 ID" type="search" @keydown.enter="loadRecords" />
     </section>
@@ -289,14 +316,9 @@ onMounted(() => void loadRecords());
         <span>结果</span>
         <span>操作</span>
       </div>
-      <button
-        v-for="record in filteredRecords"
-        :key="record.export_job_id"
-        :class="{ selected: selectedRecord?.export_job_id === record.export_job_id }"
-        class="record-row"
-        type="button"
-        @click="openDetail(record)"
-      >
+      <button v-for="record in filteredRecords" :key="record.export_job_id"
+        :class="{ selected: selectedRecord?.export_job_id === record.export_job_id }" class="record-row" type="button"
+        @click="openDetail(record)">
         <span>{{ formatTime(record.start_time) }}</span>
         <strong>{{ record.export_job_id.replace('exp-', 'A-').slice(0, 14) }}</strong>
         <span :class="`tone-${statusTone(record.export_job_status)}`"><i></i>{{ record.export_job_status }}</span>
@@ -326,19 +348,28 @@ onMounted(() => void loadRecords());
     <aside class="record-drawer glass-panel" aria-label="导出记录详情">
       <header>
         <h2>导出任务详情</h2>
-        <button aria-label="关闭详情" type="button" @click="selectedId = ''">×</button>
       </header>
       <section v-if="detailLoading" class="drawer-loading">正在读取详情</section>
-      <section v-else-if="detailError" class="drawer-loading error-state">{{ detailError.error_code }} · {{ detailError.message }}</section>
+      <section v-else-if="detailError" class="drawer-loading error-state">{{ detailError.error_code }} · {{
+        detailError.message }}</section>
+      <section v-else-if="filteredRecords.length === 0" class="drawer-loading">暂无导出记录</section>
+      <section v-else-if="!selectedDetail" class="drawer-loading">正在读取导出任务详情</section>
       <template v-else>
         <dl class="drawer-overview">
-          <dt>导出任务 ID</dt><dd>{{ selectedDetail.export_job_id }}</dd>
-          <dt>开始时间</dt><dd>{{ formatTime(selectedDetail.start_time) }}</dd>
-          <dt>结束时间</dt><dd>{{ formatTime(selectedDetail.finish_time) }}</dd>
-          <dt>总对象数</dt><dd>{{ selectedDetail.object_count.toLocaleString() }}</dd>
-          <dt>已导出对象</dt><dd>{{ selectedDetail.copied_count.toLocaleString() }}</dd>
-          <dt>跳过对象</dt><dd>{{ selectedDetail.object_status_counts.SKIPPED ?? 0 }}</dd>
-          <dt>失败对象</dt><dd class="danger">{{ selectedDetail.object_status_counts.FAILED ?? 0 }}</dd>
+          <dt>导出任务 ID</dt>
+          <dd>{{ selectedDetail.export_job_id }}</dd>
+          <dt>开始时间</dt>
+          <dd>{{ formatTime(selectedDetail.start_time) }}</dd>
+          <dt>结束时间</dt>
+          <dd>{{ formatTime(selectedDetail.finish_time) }}</dd>
+          <dt>总对象数</dt>
+          <dd>{{ selectedDetail.object_count.toLocaleString() }}</dd>
+          <dt>已导出对象</dt>
+          <dd>{{ selectedDetail.copied_count.toLocaleString() }}</dd>
+          <dt>跳过对象</dt>
+          <dd>{{ selectedDetail.object_status_counts.SKIPPED ?? 0 }}</dd>
+          <dt>失败对象</dt>
+          <dd class="danger">{{ selectedDetail.object_status_counts.FAILED ?? 0 }}</dd>
         </dl>
         <h3>参与运输盘列表</h3>
         <div class="drawer-disk-list">
@@ -349,17 +380,16 @@ onMounted(() => void loadRecords());
           </p>
         </div>
         <dl class="drawer-overview manifest-lines">
-          <dt>错误码 / 失败原因</dt><dd>{{ selectedDetail.error_message ?? "—" }}</dd>
-          <dt>manifest 信息</dt><dd class="tone-running">manifest-20260721-009.manifest</dd>
-          <dt>seal 信息</dt><dd>{{ selectedDetail.export_job_status === "SEALED" ? "seal-20260721-009" : "—" }}</dd>
+          <dt>错误码 / 失败原因</dt>
+          <dd>{{ selectedDetail.error_message ?? "—" }}</dd>
+          <dt>manifest 信息</dt>
+          <dd class="tone-running">manifest-20260721-009.manifest</dd>
+          <dt>seal 信息</dt>
+          <dd>{{ selectedDetail.export_job_status === "SEALED" ? "seal-20260721-009" : "—" }}</dd>
         </dl>
         <p class="drawer-note"><i>i</i> 本机历史独立保存，仅展示边缘端导出生命周期；Edge 不写入中控导入结果。</p>
       </template>
     </aside>
 
-    <section class="records-note glass-panel">
-      <i>i</i>
-      <span>同步记录仅保存在当前 Edge 端；Edge 不写入中控导入结果。</span>
-    </section>
   </main>
 </template>

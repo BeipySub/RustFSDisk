@@ -11,7 +11,7 @@ use crate::{
     },
 };
 use anyhow::{anyhow, Context};
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 use std::{
@@ -38,6 +38,7 @@ const LOAD_DISK_RUNTIME_SQL: &str = r#"
     FROM disk_runtime
     ORDER BY id ASC
     "#;
+const DAILY_SCAN_WINDOW_HOURS: i64 = 24;
 
 pub trait EdgeControlService: Send + Sync {
     fn scan_once<'a>(
@@ -70,6 +71,8 @@ pub trait EdgeControlService: Send + Sync {
     ) -> ControlFuture<'a, ExportJobRecordsResponse>;
 
     fn summary<'a>(&'a self) -> ControlFuture<'a, EdgeControlSummary>;
+
+    fn scan_progress_snapshot<'a>(&'a self) -> ControlFuture<'a, ScanProgressSnapshot>;
 
     fn copy_progress_snapshot<'a>(&'a self) -> ControlFuture<'a, Option<CopyProgressEvent>>;
 }
@@ -112,6 +115,35 @@ pub struct StartExportJobRequest {
     pub candidate_limit: i64,
     #[serde(default = "default_batch_size")]
     pub batch_size: i64,
+}
+
+impl Default for ScanTriggerRequest {
+    fn default() -> Self {
+        Self {
+            export_job_id: None,
+            enqueue_stable_objects: false,
+            record_source_changed_objects: default_record_source_changed_objects(),
+        }
+    }
+}
+
+impl Default for CreateExportJobRequest {
+    fn default() -> Self {
+        Self {
+            export_job_id: None,
+            run_scan: true,
+            max_single_disk_object_budget_bytes: None,
+        }
+    }
+}
+
+impl Default for StartExportJobRequest {
+    fn default() -> Self {
+        Self {
+            candidate_limit: default_candidate_limit(),
+            batch_size: default_batch_size(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -404,23 +436,39 @@ impl ProductionEdgeControlService {
             ));
         }
 
+        if let Some(report) = load_recent_successful_scan(&self.pool).await? {
+            self.scan_progress.reuse_recent_scan(&report);
+            return Ok(report);
+        }
+
+        let scan_run_id = Uuid::new_v4();
+        begin_scan_run(&self.pool, scan_run_id).await?;
+
         let scanner = ObjectScanner::new(
             AwsS3RustFsReadClient::new(self.s3_client.clone()),
             PgObjectSnapshotRepository::new(self.pool.clone()),
             self.scan_progress.clone(),
         );
 
-        scanner
+        let scan_result = scanner
             .scan_all_buckets(ScanOptions {
                 export_job_id: request.export_job_id,
                 enqueue_stable_objects: request.enqueue_stable_objects,
                 record_source_changed_objects: request.record_source_changed_objects,
             })
-            .await
-            .map_err(|err| {
+            .await;
+
+        match scan_result {
+            Ok(report) => {
+                finish_scan_run(&self.pool, scan_run_id, &report).await?;
+                Ok(report)
+            }
+            Err(err) => {
                 self.scan_progress.fail_scan("SCAN_FAILED", err.to_string());
-                ControlError::internal(err.to_string())
-            })
+                fail_scan_run(&self.pool, scan_run_id, "SCAN_FAILED", &err.to_string()).await?;
+                Err(ControlError::internal(err.to_string()))
+            }
+        }
     }
 
     async fn default_max_budget(&self) -> Result<u64, ControlError> {
@@ -479,7 +527,11 @@ impl EdgeControlService for ProductionEdgeControlService {
                 stable_object_count: report.stable_object_count,
                 source_changed_count: report.source_changed_count,
                 total_bytes: report.total_bytes,
-                message: "RustFS scan completed".to_string(),
+                message: if report.reused_recent_scan {
+                    "RustFS scan reused: last successful scan is within 24 hours".to_string()
+                } else {
+                    "RustFS scan completed".to_string()
+                },
             })
         })
     }
@@ -713,6 +765,10 @@ impl EdgeControlService for ProductionEdgeControlService {
                 .map(|progress| progress.snapshot("COPY_PROGRESS", "edge copy progress snapshot")))
         })
     }
+
+    fn scan_progress_snapshot<'a>(&'a self) -> ControlFuture<'a, ScanProgressSnapshot> {
+        Box::pin(async move { Ok(self.scan_progress.snapshot()) })
+    }
 }
 
 #[derive(Debug)]
@@ -769,6 +825,110 @@ async fn load_export_job(
         disks,
         events,
     })
+}
+
+async fn load_recent_successful_scan(pool: &PgPool) -> Result<Option<ScanReport>, ControlError> {
+    let cutoff = Utc::now() - ChronoDuration::hours(DAILY_SCAN_WINDOW_HOURS);
+    let row = sqlx::query(
+        r#"
+        SELECT bucket_count, object_seen, stable_object_count, source_changed_count, total_bytes
+        FROM edge_scan_run
+        WHERE scan_status = 'DONE'
+          AND scan_finished_at IS NOT NULL
+          AND scan_finished_at >= $1
+        ORDER BY scan_finished_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(cutoff.naive_utc())
+    .fetch_optional(pool)
+    .await
+    .context("query recent successful RustFS scan")?;
+
+    Ok(row.map(|row| ScanReport {
+        bucket_count: row.get::<i64, _>("bucket_count").max(0) as u64,
+        object_seen: row.get::<i64, _>("object_seen").max(0) as u64,
+        stable_object_count: row.get::<i64, _>("stable_object_count").max(0) as u64,
+        source_changed_count: row.get::<i64, _>("source_changed_count").max(0) as u64,
+        total_bytes: row.get::<i64, _>("total_bytes").max(0) as u64,
+        reused_recent_scan: true,
+    }))
+}
+
+async fn begin_scan_run(pool: &PgPool, scan_run_id: Uuid) -> Result<(), ControlError> {
+    sqlx::query(
+        r#"
+        INSERT INTO edge_scan_run(scan_run_id, scan_status, scan_started_at)
+        VALUES ($1, 'SCANNING', NOW() AT TIME ZONE 'UTC')
+        "#,
+    )
+    .bind(scan_run_id)
+    .execute(pool)
+    .await
+    .context("insert RustFS scan run")?;
+
+    Ok(())
+}
+
+async fn finish_scan_run(
+    pool: &PgPool,
+    scan_run_id: Uuid,
+    report: &ScanReport,
+) -> Result<(), ControlError> {
+    sqlx::query(
+        r#"
+        UPDATE edge_scan_run
+        SET scan_status = 'DONE',
+            scan_finished_at = NOW() AT TIME ZONE 'UTC',
+            bucket_count = $2,
+            object_seen = $3,
+            stable_object_count = $4,
+            source_changed_count = $5,
+            total_bytes = $6
+        WHERE scan_run_id = $1
+        "#,
+    )
+    .bind(scan_run_id)
+    .bind(saturating_i64(report.bucket_count))
+    .bind(saturating_i64(report.object_seen))
+    .bind(saturating_i64(report.stable_object_count))
+    .bind(saturating_i64(report.source_changed_count))
+    .bind(saturating_i64(report.total_bytes))
+    .execute(pool)
+    .await
+    .context("mark RustFS scan run DONE")?;
+
+    Ok(())
+}
+
+async fn fail_scan_run(
+    pool: &PgPool,
+    scan_run_id: Uuid,
+    error_code: &str,
+    error_message: &str,
+) -> Result<(), ControlError> {
+    sqlx::query(
+        r#"
+        UPDATE edge_scan_run
+        SET scan_status = 'FAILED',
+            scan_finished_at = NOW() AT TIME ZONE 'UTC',
+            error_code = $2,
+            error_message = $3
+        WHERE scan_run_id = $1
+        "#,
+    )
+    .bind(scan_run_id)
+    .bind(error_code)
+    .bind(error_message)
+    .execute(pool)
+    .await
+    .context("mark RustFS scan run FAILED")?;
+
+    Ok(())
+}
+
+fn saturating_i64(value: u64) -> i64 {
+    value.min(i64::MAX as u64) as i64
 }
 
 async fn load_export_jobs(
@@ -1789,6 +1949,10 @@ where
 
     fn summary<'a>(&'a self) -> ControlFuture<'a, EdgeControlSummary> {
         (**self).summary()
+    }
+
+    fn scan_progress_snapshot<'a>(&'a self) -> ControlFuture<'a, ScanProgressSnapshot> {
+        (**self).scan_progress_snapshot()
     }
 
     fn copy_progress_snapshot<'a>(&'a self) -> ControlFuture<'a, Option<CopyProgressEvent>> {

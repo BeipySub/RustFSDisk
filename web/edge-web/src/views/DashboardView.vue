@@ -1,136 +1,91 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, inject, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import {
   DashboardHttpError,
   diskStatusDisplay,
   fetchEdgeDashboardSummary,
+  fetchEdgeReadiness,
+  isActiveExportJobStatus,
   type EdgeDashboardSummary,
   type EdgeDiskProgress,
-  type RuntimeStatus,
+  type EdgeReadiness,
 } from "../api/edgeDashboard";
 import {
   applyCopyProgressEvent,
   connectEdgeProgressSocket,
+  type CopyProgressEvent,
   type EdgeProgressSocket,
 } from "../ws/edgeCopyProgress";
 
-const previewDiskConfigs: Array<{
-  doneTb: number;
-  errorMessage?: string;
-  lastErrorCode?: string;
-  message?: string;
-  status: RuntimeStatus;
-}> = [
-  { status: "COPYING", doneTb: 4.32 },
-  { status: "COPYING", doneTb: 3.66 },
-  { status: "COPYING", doneTb: 2.88 },
-  { status: "COPYING", doneTb: 0.9 },
-  { status: "READY", doneTb: 6, message: "就绪" },
-  { status: "COPYING", doneTb: 5.34 },
-  { status: "REJECTED", doneTb: 0, lastErrorCode: "FILESYSTEM_UNSUPPORTED", errorMessage: "写入被不支持", message: "拒绝" },
-  { status: "READY", doneTb: 6, message: "就绪" },
-  { status: "ERROR", doneTb: 0, lastErrorCode: "DISK_FULL", errorMessage: "写入错误", message: "错误" },
-  { status: "COPYING", doneTb: 1.98 },
-  { status: "REMOVED", doneTb: 0, message: "已移除" },
-  { status: "READY", doneTb: 6, message: "就绪" },
-  { status: "READY", doneTb: 6, message: "就绪" },
-  { status: "COPYING", doneTb: 0.42 },
-  { status: "READY", doneTb: 6, message: "就绪" },
-  { status: "READY", doneTb: 6, message: "就绪" },
-];
+type EdgeRoute = "/dashboard" | "/sync-records";
+type TimelineNodeState = "done" | "active" | "waiting" | "error";
 
-const previewDisks: EdgeDiskProgress[] = previewDiskConfigs.map((config, index) => {
-  const id = index + 1;
-  const status = config.status;
-  const done = config.doneTb;
-  const total = status === "REMOVED" ? 0 : 6;
+interface DiskTimelineNode {
+  key: string;
+  label: string;
+  state: TimelineNodeState;
+}
+
+function emptySummary(): EdgeDashboardSummary {
+  const now = new Date().toISOString();
   return {
-    disk_id: `disk-${String(id).padStart(2, "0")}`,
-    disk_sn: `SN...${["7F22", "51C8", "0D16", "8F2A", "5C19", "286E"][index % 6]}`,
-    hardware_serial: `SN-${id}-20260721`,
-    mount_path: `/media/edge/disk-${id}`,
-    device_path: `/dev/sd${String.fromCharCode(98 + index)}`,
-    filesystem: "ext4",
-    filesystem_uuid: `0878ee5b-${String(id).padStart(4, "0")}-4ae0-8d0f-461c2732ee42`,
-    disk_status_code: status === "COPYING" ? "EDGE_COPYING" : "INITIALIZED",
-    runtime_status: status,
-    total_bytes: total * 1_000_000_000_000,
-    done_bytes: done * 1_000_000_000_000,
-    remaining_bytes: Math.max(0, total - done) * 1_000_000_000_000,
-    free_bytes: Math.max(0, total - done) * 1_000_000_000_000,
-    speed_bytes_per_sec: status === "COPYING" ? 168_500_000 : 0,
-    object_total: 8_041_000,
-    object_done: status === "COPYING" ? 2_315_000 + index * 11_000 : status === "READY" ? 8_041_000 : 0,
-    object_remaining: status === "READY" ? 0 : 5_726_000,
-    current_object:
-      status === "COPYING"
-        ? {
-            bucket: "media-bucket",
-            key: "video/2026/07/sample_0001.mp4",
-            display_name: "sample_0001.mp4",
-            relative_data_path: "data/media-bucket/video/2026/07/sample_0001.mp4",
-            size_bytes: 12_680_000_000,
-            done_bytes: 2_340_000_000,
-            remaining_bytes: 10_340_000_000,
-            speed_bytes_per_sec: 168_500_000,
-            object_status: "COPYING",
-          }
-        : null,
-    last_error_code: config.lastErrorCode,
-    error_message: config.errorMessage,
-    message: config.message ?? (status === "REMOVED" ? "已移除" : status === "READY" ? "就绪" : status === "COPYING" ? "正在复制" : "需要处理"),
+    source: "edge",
+    edge_code: "",
+    edge_name: "Edge",
+    edge_status: undefined,
+    export_job_id: "",
+    export_job_status: "PENDING",
+    disk_status_code: undefined,
+    scan: {
+      scan_event_type: "SCAN_PROGRESS",
+      scanned_bucket_count: 0,
+      scanned_object_count: 0,
+      scanned_bytes: 0,
+      stable_object_count: 0,
+      skipped_object_count: 0,
+      current_bucket: "",
+      current_key: "",
+      last_scan_at: now,
+      message: "等待 Edge 后端返回扫描状态",
+    },
+    global_progress: {
+      total_bytes: 0,
+      done_bytes: 0,
+      remaining_bytes: 0,
+      speed_bytes_per_sec: 0,
+      object_total: 0,
+      object_done: 0,
+      object_remaining: 0,
+    },
+    disks: [],
+    ws_connected: false,
+    last_http_refresh_at: now,
+    message: "等待 Edge Dashboard 只读接口",
   };
-});
-
-const previewSummary: EdgeDashboardSummary = {
-  source: "edge",
-  edge_code: "edge-src-a-01",
-  edge_name: "Edge 工厂 A",
-  edge_status: "ACTIVE",
-  export_job_id: "A-20260721-009",
-  export_job_status: "COPYING",
-  disk_status_code: "EDGE_COPYING",
-  scan: {
-    scan_event_type: "SCAN_DONE",
-    scanned_bucket_count: 12,
-    scanned_object_count: 128_532_118,
-    scanned_bytes: 12_520_000_000_000,
-    stable_object_count: 118_623_004,
-    skipped_object_count: 12_348,
-    current_bucket: "media-bucket",
-    current_key: "video/2026/07/sample_0001.mp4",
-    last_scan_at: "2026-07-21T06:32:08Z",
-    message: "扫描完成",
-  },
-  global_progress: {
-    total_bytes: 12_130_000_000_000,
-    done_bytes: 8_240_000_000_000,
-    remaining_bytes: 3_890_000_000_000,
-    speed_bytes_per_sec: 1_460_000_000,
-    object_total: 128_684_912,
-    object_done: 98_532_118,
-    object_remaining: 30_152_794,
-  },
-  disks: previewDisks,
-  ws_connected: true,
-  last_http_refresh_at: "2026-07-21T06:32:08Z",
-  message: "多盘并行写入中",
-};
+}
 
 const summary = ref<EdgeDashboardSummary | null>(null);
-const selectedDiskId = ref("disk-02");
+const readiness = ref<EdgeReadiness | null>(null);
+const readyError = ref<DashboardHttpError | null>(null);
+const selectedDiskId = ref("");
 const isRefreshing = ref(false);
 const httpError = ref<DashboardHttpError | null>(null);
 const wsConnected = ref(false);
 const wsMessage = ref("WebSocket 尚未连接");
-const recoveryMessage = ref("");
+const navigate = inject<(path: EdgeRoute) => void>("edgeNavigate");
 let progressSocket: EdgeProgressSocket | null = null;
+let pendingProgressEvent: CopyProgressEvent | null = null;
+const TRANSPORT_SLOT_COUNT = 9;
 
-const viewSummary = computed(() => summary.value ?? previewSummary);
+const viewSummary = computed(() => summary.value ?? emptySummary());
 const disks = computed(() => viewSummary.value.disks);
-const selectedDisk = computed(
-  () => disks.value.find((disk) => disk.disk_id === selectedDiskId.value) ?? disks.value[0] ?? null,
+const transportSlots = computed(() =>
+  Array.from({ length: TRANSPORT_SLOT_COUNT }, (_, index) => ({
+    slotNumber: index + 1,
+    disk: disks.value[index] ?? null,
+  })),
 );
+const selectedDisk = computed(() => disks.value.find((disk) => disk.disk_id === selectedDiskId.value) ?? null);
 const showParticleStream = computed(() => disks.value.some((disk) => disk.runtime_status === "COPYING"));
 const globalProgressPercent = computed(() =>
   progressPercent(viewSummary.value.global_progress.done_bytes, viewSummary.value.global_progress.total_bytes),
@@ -140,24 +95,109 @@ const readyDisks = computed(() => disks.value.filter((disk) => disk.runtime_stat
 const removedDisks = computed(() => disks.value.filter((disk) => disk.runtime_status === "REMOVED").length);
 const rejectedDisks = computed(() => disks.value.filter((disk) => disk.runtime_status === "REJECTED").length);
 const errorDisks = computed(() => disks.value.filter((disk) => disk.runtime_status === "ERROR").length);
-const recoveryDisks = computed(() => rejectedDisks.value + errorDisks.value);
-const otherWarningDisks = computed(() => disks.value.filter((disk) => disk.last_error_code === "INSUFFICIENT_SPACE").length || (summary.value ? 0 : 1));
+const attentionDisks = computed(() => rejectedDisks.value + errorDisks.value);
+const otherWarningDisks = computed(() => disks.value.filter((disk) => disk.last_error_code === "INSUFFICIENT_SPACE").length);
 const selectedProgressPercent = computed(() =>
   progressPercent(selectedDisk.value?.done_bytes ?? 0, selectedDisk.value?.total_bytes ?? 0),
 );
-const lastHeartbeat = computed(() => (wsConnected.value ? "2 秒前" : "等待连接"));
+const selectedDiskIndex = computed(() => (selectedDisk.value ? disks.value.findIndex((disk) => disk.disk_id === selectedDisk.value?.disk_id) : -1));
+const selectedSlotLabel = computed(() => (selectedDiskIndex.value >= 0 ? String(selectedDiskIndex.value + 1).padStart(2, "0") : "--"));
+const selectedDiskTitle = computed(() =>
+  selectedDisk.value ? `选中磁盘详情（盘位 ${selectedSlotLabel.value}）` : "选中磁盘详情（未选中）",
+);
+const selectedTimeline = computed(() => diskTimeline(selectedDisk.value, viewSummary.value));
+const selectedCanRemove = computed(() => (selectedDisk.value ? canRemoveDisk(selectedDisk.value) : false));
+const selectedDiskNotice = computed(() => {
+  const disk = selectedDisk.value;
+  if (!disk) return "等待 Edge 后端检测运输盘";
+  if (disk.runtime_status === "ERROR" || disk.runtime_status === "REJECTED") {
+    return `${disk.last_error_code ?? "EDGE_DISK_ERROR"}：${disk.error_message ?? disk.message}`;
+  }
+  if (selectedCanRemove.value) return "封盘完成，可拔盘";
+  return disk.message || "等待后端更新";
+});
+const selectedDiskFreeLabel = computed(() => {
+  const disk = selectedDisk.value;
+  if (!disk) return "未返回";
+  const freePercent = progressPercent(disk.free_bytes, disk.total_bytes);
+  return `${formatBytes(disk.free_bytes)} (${freePercent.toFixed(2)}%)`;
+});
+const currentObjectProgressPercent = computed(() =>
+  progressPercent(selectedDisk.value?.current_object?.done_bytes ?? 0, selectedDisk.value?.current_object?.size_bytes ?? 0),
+);
+const exportedObjectPercent = computed(() =>
+  progressPercent(
+    viewSummary.value.global_progress.object_done,
+    viewSummary.value.scan.scanned_object_count || viewSummary.value.global_progress.object_total,
+  ),
+);
+const skippedObjectPercent = computed(() =>
+  progressPercent(viewSummary.value.scan.skipped_object_count, viewSummary.value.scan.scanned_object_count),
+);
+const selectedDiskShortName = computed(() => {
+  const disk = selectedDisk.value;
+  if (!disk) return "未选中";
+  const serial = disk.disk_sn ? `SN...${disk.disk_sn.slice(-4)}` : "SN 未返回";
+  return `盘位 ${selectedSlotLabel.value}（${serial}）`;
+});
+const showRecoveryCheckAction = computed(() => {
+  const disk = selectedDisk.value;
+  if (!disk) return false;
+  return (
+    disk.runtime_status === "ERROR" ||
+    disk.runtime_status === "REJECTED" ||
+    disk.runtime_status === "REMOVED" ||
+    Boolean(disk.last_error_code || disk.error_message)
+  );
+});
+const lastHeartbeat = computed(() => (wsConnected.value ? "实时" : "等待连接"));
 const lastUpdate = computed(() => formatClock(viewSummary.value.last_http_refresh_at || new Date().toISOString()));
 const estimatedDone = computed(() => {
   const speed = viewSummary.value.global_progress.speed_bytes_per_sec;
   if (speed <= 0) return "等待速度";
   return formatDuration(Math.ceil(viewSummary.value.global_progress.remaining_bytes / speed));
 });
+const readyLabel = computed(() => {
+  if (readiness.value?.ok) return "可用";
+  if (readyError.value) return dashboardStatusLabel(readyError.value.error_code);
+  if (readiness.value) return "不可用";
+  return "检查中";
+});
+const httpLabel = computed(() => {
+  if (httpError.value) return dashboardStatusLabel(httpError.value.error_code);
+  if (isRefreshing.value) return "加载中";
+  return "已连接";
+});
+const isEmpty = computed(() => !isRefreshing.value && !httpError.value && disks.value.length === 0);
+const edgeDisplayName = computed(() => viewSummary.value.edge_name || viewSummary.value.edge_code || "Edge 本地节点");
+const hasCurrentExport = computed(
+  () =>
+    isActiveExportJobStatus(viewSummary.value.export_job_status) &&
+    Boolean(viewSummary.value.export_job_id || viewSummary.value.global_progress.total_bytes > 0),
+);
+const exportStatusTitle = computed(() => {
+  if (httpError.value) return "只读接口不可用";
+  if (hasCurrentExport.value) return "当前导出进度";
+  return "当前无导出任务";
+});
+const exportStatusNotice = computed(() => {
+  if (httpError.value) return `Edge Dashboard 只读接口不可用：${httpError.value.error_code}。当前不展示模拟数据。`;
+  if (hasCurrentExport.value) return `WS：${wsMessage.value}`;
+  if (isEmpty.value) return "未检测到运输盘；插入未注册盘或异常盘后会显示在盘位区。";
+  return "运输盘已被探测，但当前没有运行中的导出任务。";
+});
+const scanCapacityLabel = computed(() =>
+  `${formatBytes(viewSummary.value.scan.scanned_bytes)} / ${viewSummary.value.scan.stable_object_count.toLocaleString()} 稳定对象`,
+);
+const scanObjectLabel = computed(() =>
+  `${viewSummary.value.scan.scanned_object_count.toLocaleString()} 对象 · ${viewSummary.value.scan.scanned_bucket_count.toLocaleString()} bucket`,
+);
 
 watch(
   () => disks.value.map((disk) => disk.disk_id).join("|"),
   () => {
     if (!disks.value.some((disk) => disk.disk_id === selectedDiskId.value)) {
-      selectedDiskId.value = disks.value[0]?.disk_id ?? "";
+      selectedDiskId.value = "";
     }
   },
   { immediate: true },
@@ -166,9 +206,33 @@ watch(
 async function refreshFromHttpSummary() {
   isRefreshing.value = true;
   httpError.value = null;
-  recoveryMessage.value = "";
+  readyError.value = null;
   try {
-    summary.value = await fetchEdgeDashboardSummary();
+    const [readyResult, summaryResult] = await Promise.allSettled([
+      fetchEdgeReadiness(),
+      fetchEdgeDashboardSummary(),
+    ]);
+
+    if (readyResult.status === "fulfilled") {
+      readiness.value = readyResult.value;
+    } else {
+      readyError.value =
+        readyResult.reason instanceof DashboardHttpError
+          ? readyResult.reason
+          : new DashboardHttpError("EDGE_READY_UNAVAILABLE", "Edge readiness unavailable");
+    }
+
+    if (summaryResult.status === "fulfilled") {
+      const nextSummary = pendingProgressEvent
+        ? applyCopyProgressEvent(summaryResult.value, pendingProgressEvent)
+        : summaryResult.value;
+      summary.value = nextSummary;
+      publishEdgeIdentity(nextSummary);
+      return;
+    }
+
+    summary.value = null;
+    throw summaryResult.reason;
   } catch (error) {
     httpError.value =
       error instanceof DashboardHttpError
@@ -179,20 +243,27 @@ async function refreshFromHttpSummary() {
   }
 }
 
-async function runRecoveryCheck() {
-  const exportJobId = viewSummary.value.export_job_id;
-  if (!exportJobId) return;
-  recoveryMessage.value = "正在请求恢复检查";
-  try {
-    const response = await fetch(`/api/edge/export-jobs/${encodeURIComponent(exportJobId)}/recover`, { method: "POST" });
-    recoveryMessage.value = response.ok ? "恢复检查已触发" : `恢复检查接口返回 HTTP ${response.status}`;
-  } catch (error) {
-    recoveryMessage.value = error instanceof Error ? error.message : "恢复检查接口不可用";
-  }
-}
-
 function selectDisk(disk: EdgeDiskProgress) {
   selectedDiskId.value = disk.disk_id;
+}
+
+function openSyncRecords() {
+  if (navigate) {
+    navigate("/sync-records");
+    return;
+  }
+  window.history.pushState({}, "", "/sync-records");
+}
+
+function publishEdgeIdentity(nextSummary: EdgeDashboardSummary) {
+  window.dispatchEvent(
+    new CustomEvent("edge-dashboard:identity", {
+      detail: {
+        edge_name: nextSummary.edge_name,
+        edge_code: nextSummary.edge_code,
+      },
+    }),
+  );
 }
 
 function diskTone(disk: EdgeDiskProgress): string {
@@ -202,6 +273,62 @@ function diskTone(disk: EdgeDiskProgress): string {
   if (disk.runtime_status === "REMOVED") return "removed";
   if (disk.runtime_status === "ERROR") return "danger";
   return "muted";
+}
+
+function diskTimeline(
+  disk: EdgeDiskProgress | null,
+  currentSummary: EdgeDashboardSummary,
+): DiskTimelineNode[] {
+  const hasDisk = Boolean(disk);
+  const runtimeStatus = disk?.runtime_status;
+  const diskStatusCode = disk?.disk_status_code;
+  const exportJobStatus = currentSummary.export_job_status;
+  const lastEventType = disk?.last_event_type;
+  const isScanActive =
+    currentSummary.scan.scan_event_type === "SCAN_STARTED" ||
+    currentSummary.scan.scan_event_type === "SCAN_PROGRESS" ||
+    exportJobStatus === "SCANNING";
+  const isScanDone = currentSummary.scan.scan_event_type === "SCAN_DONE" || isActiveExportJobStatus(exportJobStatus) || exportJobStatus === "SEALED";
+  const isCopyActive =
+    runtimeStatus === "COPYING" ||
+    exportJobStatus === "COPYING" ||
+    lastEventType === "COPY_STARTED" ||
+    lastEventType === "COPY_PROGRESS";
+  const isCopyDone = lastEventType === "COPY_DONE" || lastEventType === "SEAL_DONE" || exportJobStatus === "SEALING" || exportJobStatus === "SEALED";
+  const isSealed = lastEventType === "SEAL_DONE" || canRemoveDisk(disk);
+  const hasError = runtimeStatus === "ERROR" || runtimeStatus === "REJECTED";
+
+  const node = (key: string, label: string, state: TimelineNodeState): DiskTimelineNode => ({
+    key,
+    label,
+    state: hasError && (state === "active" || state === "waiting") ? "error" : state,
+  });
+
+  return [
+    node("detected", "已检测", hasDisk ? "done" : "waiting"),
+    node("checking", "校验中", runtimeStatus === "CHECKING" ? "active" : hasDisk && runtimeStatus !== "DETECTED" ? "done" : "waiting"),
+    node(
+      "authorized",
+      "已授权",
+      runtimeStatus === "READY" || runtimeStatus === "COPYING" || runtimeStatus === "DONE" || diskStatusCode === "INITIALIZED" || diskStatusCode === "EDGE_COPYING" || diskStatusCode === "SEALED"
+        ? "done"
+        : "waiting",
+    ),
+    node("scanning", "扫描 RustFS", isScanActive ? "active" : isScanDone ? "done" : "waiting"),
+    node("assigned", "分配对象", exportJobStatus === "PENDING" && isScanDone ? "active" : isCopyActive || isCopyDone ? "done" : "waiting"),
+    node("copying", "写盘中", isCopyActive ? "active" : isCopyDone ? "done" : "waiting"),
+    node("manifest", "生成清单", exportJobStatus === "SEALING" || lastEventType === "COPY_DONE" ? "active" : isSealed ? "done" : "waiting"),
+    node("sealed", "封盘完成", isSealed ? "done" : "waiting"),
+    node("removable", "可拔盘", canRemoveDisk(disk) ? "done" : "waiting"),
+  ];
+}
+
+function canRemoveDisk(disk: EdgeDiskProgress | null): boolean {
+  return Boolean(
+    disk &&
+      (disk.last_event_type === "SEAL_DONE" ||
+        (disk.disk_status_code === "SEALED" && disk.runtime_status === "DONE")),
+  );
 }
 
 function formatBytes(bytes: number): string {
@@ -220,13 +347,23 @@ function progressPercent(doneBytes: number, totalBytes: number): number {
   return Math.min(100, Math.max(0, (doneBytes / totalBytes) * 100));
 }
 
+function dashboardStatusLabel(value: string): string {
+  const labels: Record<string, string> = {
+    DASHBOARD_UNAVAILABLE: "接口不可用",
+    DASHBOARD_ENDPOINT_NOT_READY: "接口未就绪",
+    EDGE_READY_UNAVAILABLE: "自检不可用",
+    NETWORK_ERROR: "网络异常",
+  };
+  return labels[value] ?? "异常";
+}
+
 function formatPercent(doneBytes: number, totalBytes: number): string {
   return `${progressPercent(doneBytes, totalBytes).toFixed(1)}%`;
 }
 
 function formatClock(value: string): string {
   const date = new Date(value);
-  if (Number.isNaN(date.valueOf())) return "14:32:08";
+  if (Number.isNaN(date.valueOf())) return "--:--:--";
   return new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" }).format(date);
 }
 
@@ -241,7 +378,10 @@ onMounted(() => {
   void refreshFromHttpSummary();
   progressSocket = connectEdgeProgressSocket({
     onEvent(event) {
-      summary.value = summary.value ? applyCopyProgressEvent(summary.value, event) : applyCopyProgressEvent(previewSummary, event);
+      pendingProgressEvent = event;
+      if (summary.value) {
+        summary.value = applyCopyProgressEvent(summary.value, event);
+      }
       wsMessage.value = event.message || event.event_type;
       wsConnected.value = true;
     },
@@ -259,8 +399,9 @@ onBeforeUnmount(() => progressSocket?.close());
 <template>
   <main class="dashboard page-panel">
     <section class="top-telemetry" aria-label="Edge 连接状态">
-      <span class="status-pill ok"><i></i> HTTP 服务：{{ httpError ? "异常" : "已就绪" }}</span>
-      <span class="status-pill live"><i></i> WebSocket：{{ wsConnected ? "已连接" : "重连中" }}</span>
+      <span :class="['status-pill', httpError ? 'warning' : 'ok']"><i></i> HTTP：{{ httpLabel }}</span>
+      <span :class="['status-pill', readiness?.ok ? 'ok' : 'quiet']"><i></i> 本机服务：{{ readyLabel }}</span>
+      <span :class="['status-pill', wsConnected ? 'live' : 'quiet']"><i></i> WebSocket：{{ wsConnected ? "已连接" : "重连中" }}</span>
       <span class="status-pill quiet">最后心跳：{{ lastHeartbeat }}</span>
       <span class="last-update">最后更新 {{ lastUpdate }}</span>
       <button aria-label="刷新 Dashboard" class="icon-refresh" :disabled="isRefreshing" type="button" @click="refreshFromHttpSummary">↻</button>
@@ -268,9 +409,8 @@ onBeforeUnmount(() => progressSocket?.close());
 
     <section class="runtime-stage" aria-label="Edge 导出运行态">
       <div class="source-meta">
-        <strong>源服务器（RustFS） <i></i> 运行中</strong>
-        <span>{{ viewSummary.edge_code }}</span>
-        <button type="button">查看源端详情</button>
+        <strong>源服务器（RustFS）<i></i> Edge</strong>
+        <button class="records-shortcut" type="button" @click="openSyncRecords">同步记录</button>
       </div>
       <img alt="" class="source-rack" src="/assets/fustfs-baseline/source-rack-cutout-v3.webp" />
       <div v-if="showParticleStream" class="particle-field" aria-hidden="true">
@@ -287,35 +427,70 @@ onBeforeUnmount(() => progressSocket?.close());
       <div class="transport-array">
         <header>
           <strong>运输盘位 · {{ disks.length }} 盘位</strong>
-          <small><i></i> 固件版本 1.2.0</small>
+          <small><i></i> Edge 后端盘位状态</small>
         </header>
         <div class="nas-shell">
-          <img alt="" src="/assets/fustfs-baseline/transport-nas-cutout-v3.webp" />
-          <div class="disk-slot-matrix">
-            <button
-              v-for="(disk, index) in disks"
-              :key="disk.disk_id"
-              :aria-pressed="selectedDisk?.disk_id === disk.disk_id"
-              :class="[`slot-${diskTone(disk)}`, { selected: selectedDisk?.disk_id === disk.disk_id }]"
-              type="button"
-              @click="selectDisk(disk)"
-            >
-              <b>{{ String(index + 1).padStart(2, "0") }}</b>
-              <strong v-if="disk.runtime_status === 'COPYING'">{{ formatPercent(disk.done_bytes, disk.total_bytes) }}</strong>
-              <strong v-else>{{ disk.message }}</strong>
-              <span>{{ disk.runtime_status === "REMOVED" ? "已移除" : disk.last_error_code ?? formatBytes(disk.done_bytes) }}</span>
-              <small>{{ disk.runtime_status === "COPYING" ? formatBytes(disk.total_bytes) : disk.error_message ?? formatBytes(disk.free_bytes) }}</small>
-            </button>
+          <img alt="" src="/assets/fustfs-baseline/transport-bay-inner-black-clean-alpha.png" />
+          <div class="disk-slot-matrix" aria-label="运输盘位列表">
+            <template v-for="slot in transportSlots" :key="slot.slotNumber">
+              <button
+                v-if="slot.disk"
+                :aria-pressed="selectedDisk?.disk_id === slot.disk.disk_id"
+                :class="[`slot-${diskTone(slot.disk)}`, { selected: selectedDisk?.disk_id === slot.disk.disk_id }]"
+                type="button"
+                @click="selectDisk(slot.disk)"
+              >
+                <b>{{ String(slot.slotNumber).padStart(2, "0") }}</b>
+                <strong v-if="slot.disk.runtime_status === 'COPYING'">{{ formatPercent(slot.disk.done_bytes, slot.disk.total_bytes) }}</strong>
+                <strong v-else>{{ slot.disk.message }}</strong>
+                <span>{{ slot.disk.runtime_status === "REMOVED" ? "已移除" : slot.disk.last_error_code ?? formatBytes(slot.disk.done_bytes) }}</span>
+                <small>{{ slot.disk.runtime_status === "COPYING" ? formatBytes(slot.disk.total_bytes) : slot.disk.error_message ?? formatBytes(slot.disk.free_bytes) }}</small>
+              </button>
+              <div v-else class="disk-slot-cell empty" :aria-label="`empty transport slot ${slot.slotNumber}`">
+                <b>{{ String(slot.slotNumber).padStart(2, "0") }}</b>
+              </div>
+            </template>
           </div>
         </div>
       </div>
     </section>
 
-    <section class="global-progress glass-panel">
-      <div>
-        <span>全局导出进度</span>
-        <strong>{{ globalProgressPercent.toFixed(0) }}<small>%</small></strong>
-        <em>总进度</em>
+    <section
+      v-if="selectedDisk"
+      :class="['selected-disk-strip', 'glass-panel', { 'has-action': showRecoveryCheckAction }]"
+      aria-label="选中磁盘详情"
+    >
+      <div class="selected-disk-content">
+        <div class="selected-disk-head">
+          <strong>{{ selectedDiskTitle }}</strong>
+          <span :class="['remove-badge', selectedCanRemove ? 'ready' : 'waiting']">{{ selectedCanRemove ? "可拔盘" : "不可拔盘" }}</span>
+          <em>{{ selectedDiskNotice }}</em>
+        </div>
+        <div class="selected-disk-main">
+          <dl>
+            <div><dt>disk_id</dt><dd>{{ selectedDisk?.disk_id ?? "未返回" }}</dd></div>
+            <div><dt>mount_path</dt><dd>{{ selectedDisk?.mount_path ?? "未返回" }}</dd></div>
+            <div><dt>disk_sn</dt><dd>{{ selectedDisk?.disk_sn ?? "未返回" }}</dd></div>
+            <div><dt>filesystem</dt><dd>{{ selectedDisk?.filesystem ?? "未返回" }}</dd></div>
+            <div><dt>runtime_status</dt><dd class="tone-running">{{ selectedDisk?.runtime_status ?? "未返回" }}</dd></div>
+            <div><dt>disk_status_code</dt><dd class="tone-running">{{ diskStatusDisplay(selectedDisk?.disk_status_code) }}</dd></div>
+            <div><dt>object_budget_bytes</dt><dd>{{ formatBytes(selectedDisk?.total_bytes ?? 0) }}</dd></div>
+            <div><dt>free_bytes</dt><dd>{{ selectedDiskFreeLabel }}</dd></div>
+          </dl>
+          <ol class="disk-timeline" aria-label="选中盘时间线">
+            <li v-for="node in selectedTimeline" :key="node.key" :class="`timeline-${node.state}`">
+              <i></i><span>{{ node.label }}</span>
+            </li>
+          </ol>
+        </div>
+      </div>
+    </section>
+
+    <section v-if="hasCurrentExport" class="global-progress glass-panel" aria-label="导出任务总进度">
+      <div class="progress-title">
+        <span>导出任务总进度</span>
+        <strong v-if="hasCurrentExport">{{ globalProgressPercent.toFixed(0) }}<small>%</small></strong>
+        <em>所有运行中任务汇总</em>
       </div>
       <div class="progress-main">
         <p>
@@ -325,38 +500,118 @@ onBeforeUnmount(() => progressSocket?.close());
         </p>
         <div class="progress-track"><b :style="{ width: `${globalProgressPercent}%` }"></b></div>
         <dl>
-          <div><dt>文件</dt><dd>{{ viewSummary.global_progress.object_total.toLocaleString() }}</dd></div>
-          <div><dt>对象</dt><dd>{{ viewSummary.global_progress.object_done.toLocaleString() }}</dd></div>
-          <div><dt>批次</dt><dd>{{ viewSummary.export_job_id }}</dd></div>
+          <div><dt>扫描态</dt><dd>{{ viewSummary.scan.scan_event_type }}</dd></div>
+          <div><dt>跳过对象</dt><dd>{{ viewSummary.scan.skipped_object_count.toLocaleString() }}（{{ skippedObjectPercent.toFixed(2) }}%）</dd></div>
+          <div><dt>批次</dt><dd>{{ viewSummary.export_job_id || "暂无" }}</dd></div>
           <div><dt>预计完成</dt><dd>{{ estimatedDone }}</dd></div>
         </dl>
       </div>
     </section>
 
-    <section class="dashboard-grid">
+    <section :class="['dashboard-lower-grid', { compact: !hasCurrentExport }]">
+      <article class="overview-panel glass-panel">
+        <h2>扫描与导出概览</h2>
+        <dl class="overview-metrics">
+          <div><dt>已发现对象</dt><dd>{{ viewSummary.scan.scanned_object_count.toLocaleString() }}</dd></div>
+          <div><dt>已导出对象</dt><dd>{{ viewSummary.global_progress.object_done.toLocaleString() }}</dd></div>
+          <div><dt>导出进度</dt><dd>{{ exportedObjectPercent.toFixed(2) }}%</dd></div>
+          <div><dt>扫描容量</dt><dd>{{ scanCapacityLabel }}</dd></div>
+          <div><dt>扫描范围</dt><dd>{{ scanObjectLabel }}</dd></div>
+          <div><dt>跳过对象</dt><dd>{{ viewSummary.scan.skipped_object_count.toLocaleString() }}（{{ skippedObjectPercent.toFixed(2) }}%）</dd></div>
+        </dl>
+      </article>
+
+      <article class="object-panel object-wide-panel glass-panel">
+        <h2>当前对象与异常处理</h2>
+        <div v-if="selectedDisk" class="object-detail-grid">
+          <dl>
+            <dt>对象路径</dt><dd>{{ selectedDisk.current_object?.key ?? (viewSummary.scan.current_key || "暂无") }}</dd>
+            <dt>对象状态</dt><dd class="tone-running">{{ selectedDisk.current_object?.object_status ?? "等待对象" }}</dd>
+            <dt>剩余大小</dt><dd>{{ formatBytes(selectedDisk.current_object?.remaining_bytes ?? 0) }} / {{ formatBytes(selectedDisk.current_object?.size_bytes ?? 0) }}</dd>
+            <dt>传输速度</dt><dd>{{ formatSpeed(selectedDisk.speed_bytes_per_sec ?? 0) }}</dd>
+          </dl>
+          <dl>
+            <dt>文件系统</dt><dd>{{ selectedDiskShortName }}</dd>
+            <dt>对象标识</dt><dd>{{ selectedDisk.current_object?.key ?? "未返回" }}</dd>
+            <dt>加密状态</dt><dd>{{ selectedDisk.current_object ? "已加密" : "未返回" }}</dd>
+            <dt>写入阶段</dt><dd>{{ selectedDisk.runtime_status }}</dd>
+            <dt>校验状态</dt><dd>{{ selectedDisk.disk_status_code ? diskStatusDisplay(selectedDisk.disk_status_code) : "未返回" }}</dd>
+          </dl>
+        </div>
+        <p v-else class="object-empty">
+          未选中运输盘。未注册或异常盘只有在 Edge 后端检测并返回后才会显示。
+        </p>
+        <div class="object-progress-row">
+          <div class="progress-track object-progress"><b :style="{ width: `${currentObjectProgressPercent}%` }"></b></div>
+          <span>{{ currentObjectProgressPercent.toFixed(2) }}%</span>
+        </div>
+        <h3>异常汇总（基于当前导出任务）</h3>
+        <div class="warning-cards alert-cards">
+          <span><b>{{ attentionDisks }}</b><em>需恢复</em><small>硬盘</small></span>
+          <span><b>{{ removedDisks }}</b><em>已移除</em><small>硬盘</small></span>
+          <span class="danger"><b>{{ rejectedDisks }}</b><em>被拒绝</em><small>硬盘</small></span>
+          <span class="danger"><b>{{ errorDisks }}</b><em>错误</em><small>硬盘</small></span>
+          <span><b>{{ otherWarningDisks }}</b><em>其他告警</em><small>硬盘</small></span>
+        </div>
+      </article>
+    </section>
+
+    <section v-if="false" :class="['global-progress', 'glass-panel', { idle: !hasCurrentExport }]">
+      <div>
+        <span>{{ exportStatusTitle }}</span>
+        <strong v-if="hasCurrentExport">{{ globalProgressPercent.toFixed(0) }}<small>%</small></strong>
+        <strong v-else>--<small></small></strong>
+        <em>{{ hasCurrentExport ? viewSummary.export_job_status : "IDLE" }}</em>
+      </div>
+      <div v-if="hasCurrentExport" class="progress-main">
+        <p>
+          <span>已完成 <b>{{ formatBytes(viewSummary.global_progress.done_bytes) }}</b> / {{ formatBytes(viewSummary.global_progress.total_bytes) }}</span>
+          <span>剩余 <b>{{ formatBytes(viewSummary.global_progress.remaining_bytes) }}</b></span>
+          <span>速度 <b>{{ formatSpeed(viewSummary.global_progress.speed_bytes_per_sec) }}</b></span>
+        </p>
+        <div class="progress-track"><b :style="{ width: `${globalProgressPercent}%` }"></b></div>
+        <dl>
+          <div><dt>文件</dt><dd>{{ viewSummary.global_progress.object_total.toLocaleString() }}</dd></div>
+          <div><dt>对象</dt><dd>{{ viewSummary.global_progress.object_done.toLocaleString() }}</dd></div>
+          <div><dt>批次</dt><dd>{{ viewSummary.export_job_id || "暂无" }}</dd></div>
+          <div><dt>预计完成</dt><dd>{{ estimatedDone }}</dd></div>
+        </dl>
+      </div>
+      <div v-else class="progress-main idle-copy">
+        <p>{{ exportStatusNotice }}</p>
+        <dl>
+          <div><dt>现场盘位</dt><dd>{{ disks.length }} 盘位</dd></div>
+          <div><dt>未注册盘</dt><dd>会展示</dd></div>
+          <div><dt>历史批次</dt><dd>同步记录</dd></div>
+          <div><dt>浏览器权限</dt><dd>只读</dd></div>
+        </dl>
+      </div>
+    </section>
+
+    <section v-if="false" class="dashboard-grid">
       <article class="overview-panel glass-panel">
         <h2>扫描与导出概览</h2>
         <dl class="metric-strip">
-          <div><dt>扫描完成</dt><dd>98.62%</dd><small>{{ formatBytes(viewSummary.scan.scanned_bytes) }}</small></div>
+          <div><dt>扫描字节</dt><dd>{{ formatBytes(viewSummary.scan.scanned_bytes) }}</dd><small>{{ viewSummary.scan.scan_event_type }}</small></div>
           <div><dt>已发现对象</dt><dd>{{ viewSummary.scan.scanned_object_count.toLocaleString() }}</dd><small>总计对象</small></div>
           <div><dt>已导出对象</dt><dd>{{ viewSummary.global_progress.object_done.toLocaleString() }}</dd><small>{{ globalProgressPercent.toFixed(2) }}%</small></div>
           <div><dt>预计完成</dt><dd>{{ estimatedDone }}</dd><small>剩余时间</small></div>
         </dl>
-        <h2>导出前置检查</h2>
+        <h2>只读接口边界</h2>
         <ul class="check-list">
-          <li>源端扫描完成</li>
-          <li>运输盘已注册</li>
-          <li>加密写入可用</li>
-          <li>校验链路正常</li>
-          <li>断点续传可用</li>
-          <li>封盘前检查通过</li>
+          <li>浏览器仅请求本机 Edge Dashboard API</li>
+          <li>浏览器不携带控制 token</li>
+          <li>WebSocket 只接收本端实时状态</li>
+          <li>隐藏中控导入生命周期</li>
+          <li>生产页面仅保留观察入口</li>
+          <li>异常处理遵循 Edge 后端受保护流程</li>
         </ul>
       </article>
 
       <article class="warning-panel glass-panel">
         <h2>异常盘汇总</h2>
         <div class="warning-cards">
-          <span><b>{{ recoveryDisks }}</b>需恢复</span>
+          <span><b>{{ attentionDisks }}</b>需关注</span>
           <span><b>{{ removedDisks }}</b>已移除</span>
           <span class="danger"><b>{{ rejectedDisks }}</b>被拒绝</span>
           <span class="danger"><b>{{ errorDisks }}</b>错误</span>
@@ -382,29 +637,24 @@ onBeforeUnmount(() => progressSocket?.close());
 
       <article class="object-panel glass-panel">
         <h2>当前对象（{{ selectedDisk?.message ?? "等待状态" }}）</h2>
-        <dl>
-          <dt>对象路径</dt><dd>{{ selectedDisk?.current_object?.key ?? viewSummary.scan.current_key }}</dd>
+        <dl v-if="selectedDisk">
+          <dt>对象路径</dt><dd>{{ selectedDisk?.current_object?.key ?? (viewSummary.scan.current_key || "暂无") }}</dd>
           <dt>对象状态</dt><dd class="tone-running">{{ selectedDisk?.current_object?.object_status ?? "等待对象" }}</dd>
           <dt>剩余大小</dt><dd>{{ formatBytes(selectedDisk?.current_object?.remaining_bytes ?? 0) }}</dd>
           <dt>传输速度</dt><dd>{{ formatSpeed(selectedDisk?.speed_bytes_per_sec ?? 0) }}</dd>
           <dt>文件系统</dt><dd>{{ selectedDisk?.filesystem ?? "未返回" }}</dd>
-          <dt>对象标识</dt><dd>{{ selectedDisk?.current_object?.display_name ?? "未返回" }}</dd>
-          <dt>加密状态</dt><dd>已加密</dd>
-          <dt>写入阶段</dt><dd>{{ selectedDisk?.runtime_status ?? "未返回" }}</dd>
-          <dt>校验状态</dt><dd>校验中</dd>
+          <dt>FS UUID</dt><dd>{{ selectedDisk?.filesystem_uuid ?? "未返回" }}</dd>
+          <dt>硬件 SN</dt><dd>{{ selectedDisk?.disk_sn ?? "未返回" }}</dd>
+          <dt>设备路径</dt><dd>{{ selectedDisk?.device_path ?? "未返回" }}</dd>
+          <dt>盘内状态</dt><dd>{{ diskStatusDisplay(selectedDisk?.disk_status_code) }}</dd>
         </dl>
-        <div class="progress-track object-progress"><b :style="{ width: `${selectedProgressPercent}%` }"></b></div>
-        <span class="object-percent">{{ selectedProgressPercent.toFixed(2) }}%</span>
+        <p v-else class="object-empty">
+          未选中运输盘。插入后，未注册或异常盘也会显示在右侧盘位区。
+        </p>
+        <div v-if="selectedDisk" class="progress-track object-progress"><b :style="{ width: `${selectedProgressPercent}%` }"></b></div>
+        <span v-if="selectedDisk" class="object-percent">{{ selectedProgressPercent.toFixed(2) }}%</span>
       </article>
     </section>
 
-    <section class="dashboard-actions glass-panel">
-      <p><i>i</i> 提示：支持恢复导出作业、断点续传与完整性验证。建议在运输前完成封盘（Seal Disk）操作。</p>
-      <button class="primary-action" type="button">查看选中盘详情</button>
-      <button type="button" @click="runRecoveryCheck">执行恢复检查</button>
-      <small v-if="recoveryMessage">{{ recoveryMessage }}</small>
-      <small v-else-if="httpError">{{ httpError.error_code }} · 当前展示视觉预览数据</small>
-      <small v-else>{{ wsMessage }}</small>
-    </section>
   </main>
 </template>

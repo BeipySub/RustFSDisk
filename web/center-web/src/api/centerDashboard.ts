@@ -80,6 +80,8 @@ export interface CenterGlobalProgress {
 
 export interface CenterDashboardSummary {
   source: "center";
+  center_id?: string;
+  center_name?: string;
   event_type?: string;
   event_time?: string;
   global_progress: CenterGlobalProgress;
@@ -164,6 +166,8 @@ export function normalizeCenterDashboardSummary(
 
   return {
     source: "center",
+    center_id: payload.center_id,
+    center_name: payload.center_name ?? "Center 控制中心",
     event_type: payload.event_type,
     event_time: payload.event_time,
     global_progress: payload.global_progress ?? {

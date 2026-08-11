@@ -29,6 +29,7 @@ pub struct ScanReport {
     pub stable_object_count: u64,
     pub source_changed_count: u64,
     pub total_bytes: u64,
+    pub reused_recent_scan: bool,
 }
 
 pub struct ObjectScanner<C, R> {

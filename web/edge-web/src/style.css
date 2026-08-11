@@ -83,7 +83,10 @@ button:focus-visible {
   min-width: 960px;
   min-height: 540px;
   overflow: auto;
-  background: #02070b;
+  background:
+    linear-gradient(180deg, rgb(2 7 14 / 10%), rgb(1 6 12 / 30%) 58%, rgb(1 6 12 / 86%) 100%),
+    url("/assets/fustfs-baseline/factory-environment-v4-16x9.webp") center center / cover no-repeat,
+    #02070b;
 }
 
 .edge-canvas {
@@ -94,7 +97,6 @@ button:focus-visible {
   min-height: 540px;
   overflow: hidden;
   color: #d8e0e7;
-  background: #02070b;
 }
 
 .product-header {
@@ -211,29 +213,11 @@ button:focus-visible {
   line-height: 1;
 }
 
-.dashboard {
-  background:
-    linear-gradient(180deg, rgb(2 7 14 / 7%), rgb(1 6 12 / 84%) 76%),
-    url("/assets/fustfs-baseline/factory-environment-v4.webp") center top / 100% 58% no-repeat,
-    #02070b;
-}
-
 .runtime-stage {
   position: absolute;
-  inset: 54px 0 42%;
+  inset: 54px 0 39.2%;
+  z-index: 1;
   overflow: hidden;
-}
-
-.runtime-stage::after {
-  position: absolute;
-  inset: auto 0 -8% 0;
-  height: 38%;
-  pointer-events: none;
-  content: "";
-  background:
-    radial-gradient(ellipse at 17% 70%, rgb(95 187 255 / 32%), transparent 22%),
-    radial-gradient(ellipse at 77% 72%, rgb(42 145 255 / 23%), transparent 20%),
-    linear-gradient(180deg, transparent, rgb(0 9 18 / 78%));
 }
 
 .source-meta {
@@ -270,15 +254,28 @@ button:focus-visible {
   border-radius: 6px;
 }
 
+.source-meta .records-shortcut {
+  width: 128px;
+  height: 32px;
+  padding: 0 14px;
+  border-color: rgb(0 139 255 / 55%);
+  color: #dcecff;
+  font-size: 14px;
+  background: rgb(6 29 51 / 56%);
+}
+
 .source-rack {
   position: absolute;
-  bottom: -2%;
+  bottom: 1.6%;
   left: 10%;
-  z-index: 5;
+  z-index: 12;
   width: 18.7%;
-  height: 88%;
+  height: 82%;
   object-fit: contain;
-  filter: drop-shadow(0 22px 22px rgb(0 0 0 / 72%));
+  object-position: center bottom;
+  filter:
+    drop-shadow(0 18px 14px rgb(0 0 0 / 82%))
+    drop-shadow(0 0 28px rgb(31 139 255 / 15%));
 }
 
 .particle-field {
@@ -348,23 +345,23 @@ button:focus-visible {
 
 .transport-array {
   position: absolute;
-  right: 1.8%;
-  bottom: -8%;
-  z-index: 10;
-  width: 51.2%;
-  height: 111%;
+  right: 2.6%;
+  bottom: 0.8%;
+  z-index: 12;
+  width: 49.4%;
+  height: 82%;
 }
 
 .transport-array header {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  height: 34px;
+  height: 30px;
   padding: 0 5%;
 }
 
 .transport-array header strong {
-  font-size: 18px;
+  font-size: 17px;
   font-weight: 600;
 }
 
@@ -393,44 +390,63 @@ button:focus-visible {
   width: 100%;
   height: 100%;
   object-fit: contain;
-  filter: drop-shadow(0 22px 28px rgb(0 0 0 / 68%));
+  object-position: center bottom;
+  filter:
+    drop-shadow(0 18px 16px rgb(0 0 0 / 82%))
+    drop-shadow(0 0 30px rgb(0 139 255 / 18%));
 }
 
 .disk-slot-matrix {
   position: absolute;
-  inset: 14.8% 8.7% 15.5% 8.9%;
+  inset: 20.2% 8.8% 9.8% 9.2%;
   z-index: 2;
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  grid-auto-rows: minmax(52px, 1fr);
-  gap: 4px 6px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2.1% 1.6%;
+  align-content: stretch;
+  justify-content: space-between;
 }
 
-.disk-slot-matrix button {
+.disk-slot-matrix button,
+.disk-slot-cell {
   position: relative;
   display: grid;
-  grid-template-columns: 34px minmax(0, 1fr);
+  grid-template-columns: 30px minmax(0, 1fr);
   grid-template-rows: 1fr 1fr;
+  flex: 0 0 calc((100% - 3.2%) / 3);
+  height: calc((100% - 4.2%) / 3);
   min-width: 0;
   padding: 8px 10px;
   color: #dce5ee;
   text-align: left;
-  background: linear-gradient(180deg, rgb(7 14 23 / 96%), rgb(2 7 13 / 98%));
-  border: 1px solid rgb(90 105 116 / 55%);
-  border-radius: 3px;
-  box-shadow: inset 0 0 16px rgb(0 0 0 / 68%);
+  background:
+    linear-gradient(180deg, rgb(7 18 28 / 32%), rgb(2 8 14 / 50%)),
+    url("/assets/fustfs-baseline/transport-bay-slot-bg-clean-alpha.png") center center / 100% 100% no-repeat;
+  border: 1px solid rgb(95 126 145 / 22%);
+  border-radius: 4px;
+  box-shadow: inset 0 0 12px rgb(0 0 0 / 38%);
+  backdrop-filter: blur(1px);
+}
+
+.disk-slot-cell {
+  pointer-events: none;
+  opacity: 0.82;
 }
 
 .disk-slot-matrix button.selected {
   border-color: var(--cyan);
+  background:
+    linear-gradient(180deg, rgb(12 46 68 / 54%), rgb(3 15 25 / 62%)),
+    url("/assets/fustfs-baseline/transport-bay-slot-bg-clean-alpha.png") center center / 100% 100% no-repeat;
   box-shadow:
     inset 0 0 0 1px rgb(0 139 255 / 70%),
     0 0 16px rgb(0 139 255 / 35%);
 }
 
-.disk-slot-matrix b {
+.disk-slot-matrix b,
+.disk-slot-cell b {
   grid-row: 1 / 3;
-  font-size: 17px;
+  font-size: 16px;
   font-weight: 400;
 }
 
@@ -439,7 +455,7 @@ button:focus-visible {
   min-width: 0;
   overflow: hidden;
   color: #a8dfff;
-  font-size: 13px;
+  font-size: 12px;
   text-align: right;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -451,7 +467,7 @@ button:focus-visible {
   min-width: 0;
   overflow: hidden;
   color: #d2d8df;
-  font-size: 11px;
+  font-size: 10px;
   text-align: right;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -476,18 +492,188 @@ button:focus-visible {
   color: #7d8791;
 }
 
-.global-progress {
+.selected-disk-strip {
   position: absolute;
-  inset: 44% 22px auto;
-  z-index: 20;
-  display: grid;
-  grid-template-columns: 132px minmax(0, 1fr);
-  gap: 24px;
-  height: 90px;
-  padding: 12px 20px;
+  inset: 44.3% 22px auto;
+  z-index: 23;
+  display: block;
+  height: 116px;
+  padding: 12px 18px 13px 20px;
 }
 
-.global-progress > div:first-child span {
+.selected-disk-content {
+  min-width: 0;
+}
+
+.selected-disk-head {
+  display: grid;
+  grid-template-columns: auto 78px minmax(0, 1fr);
+  gap: 12px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.selected-disk-head > strong {
+  min-width: 0;
+  overflow: hidden;
+  color: #e8eff6;
+  font-size: 16px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.selected-disk-head em {
+  min-width: 0;
+  overflow: hidden;
+  color: #adb9c5;
+  font-style: normal;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.remove-badge {
+  display: inline-flex;
+  justify-content: center;
+  align-items: center;
+  height: 24px;
+  color: #8f9ba6;
+  border: 1px solid rgb(133 151 169 / 42%);
+  border-radius: 4px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.remove-badge.ready {
+  color: var(--green);
+  border-color: rgb(18 217 131 / 56%);
+  background: rgb(18 217 131 / 10%);
+}
+
+.selected-disk-content dl {
+  display: grid;
+  grid-template-columns: 1.14fr 1.16fr 0.82fr 0.8fr 0.9fr 1fr 1fr 1.05fr;
+  gap: 0;
+}
+
+.selected-disk-content div {
+  min-width: 0;
+  padding: 0 16px;
+  border-left: 1px solid rgb(118 148 177 / 26%);
+}
+
+.selected-disk-content div:first-child {
+  padding-left: 0;
+  border-left: 0;
+}
+
+.selected-disk-content dt {
+  margin-bottom: 6px;
+  color: #9aa8b6;
+  font-size: 12px;
+}
+
+.selected-disk-content dd {
+  min-width: 0;
+  overflow: hidden;
+  color: #dce6ef;
+  font-size: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.disk-timeline {
+  display: grid;
+  grid-template-columns: repeat(9, minmax(0, 1fr));
+  gap: 0;
+  padding: 0;
+  margin: 10px 0 0;
+  list-style: none;
+}
+
+.disk-timeline li {
+  position: relative;
+  display: grid;
+  justify-items: center;
+  gap: 5px;
+  min-width: 0;
+  color: #75818d;
+  font-size: 12px;
+  text-align: center;
+}
+
+.disk-timeline li::before {
+  position: absolute;
+  top: 6px;
+  right: 50%;
+  left: -50%;
+  height: 1px;
+  content: "";
+  background: rgb(101 132 162 / 36%);
+}
+
+.disk-timeline li:first-child::before {
+  display: none;
+}
+
+.disk-timeline i {
+  position: relative;
+  z-index: 1;
+  width: 13px;
+  height: 13px;
+  background: #273746;
+  border: 1px solid rgb(138 163 188 / 42%);
+  border-radius: 50%;
+}
+
+.disk-timeline span {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.timeline-done,
+.timeline-active {
+  color: #cfe6f7 !important;
+}
+
+.timeline-done i {
+  background: var(--green);
+  border-color: var(--green);
+  box-shadow: 0 0 12px rgb(18 217 131 / 56%);
+}
+
+.timeline-active i {
+  background: var(--cyan-2);
+  border-color: var(--cyan-2);
+  box-shadow: 0 0 14px rgb(19 188 255 / 78%);
+}
+
+.timeline-error {
+  color: var(--red) !important;
+}
+
+.timeline-error i {
+  background: var(--red);
+  border-color: var(--red);
+  box-shadow: 0 0 14px rgb(255 69 77 / 68%);
+}
+
+.global-progress {
+  position: absolute;
+  inset: 55.9% 22px auto;
+  z-index: 20;
+  display: grid;
+  grid-template-columns: 142px minmax(0, 1fr);
+  gap: 30px;
+  height: 108px;
+  padding: 15px 20px;
+}
+
+.global-progress > div:first-child span,
+.progress-title span {
   font-weight: 700;
 }
 
@@ -507,12 +693,38 @@ button:focus-visible {
   font-style: normal;
 }
 
+.progress-main {
+  min-width: 0;
+}
+
 .progress-main p,
 .progress-main dl {
   display: flex;
-  gap: 28px;
+  gap: 34px;
   align-items: center;
   color: #c8d1dc;
+}
+
+.progress-main p {
+  justify-content: flex-end;
+  min-height: 22px;
+  font-size: 15px;
+}
+
+.progress-main dl {
+  justify-content: space-between;
+  font-size: 15px;
+}
+
+.progress-main dl div {
+  min-width: 0;
+}
+
+.progress-main dd {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .progress-main b {
@@ -543,26 +755,80 @@ dd {
   color: #dbe6ef;
 }
 
-.dashboard-grid {
+.dashboard-grid,
+.dashboard-lower-grid {
   position: absolute;
-  inset: 56.2% 22px 84px;
+  inset: 67.2% 22px 12px;
   z-index: 18;
   display: grid;
-  grid-template-columns: 31.5% 35.7% minmax(0, 1fr);
-  gap: 8px;
+  grid-template-columns: 34.2% minmax(0, 1fr);
+  gap: 10px;
 }
 
-.dashboard-grid article {
+.dashboard-lower-grid.compact {
+  inset: 70% 22px 12px;
+}
+
+.dashboard-grid article,
+.dashboard-lower-grid article {
   min-width: 0;
   overflow: hidden;
-  padding: 13px 15px;
+  padding: 17px 20px;
 }
 
-.dashboard-grid h2 {
+.dashboard-grid h2,
+.dashboard-lower-grid h2 {
   margin-bottom: 10px;
-  font-size: 16px;
+  font-size: 18px;
   font-weight: 650;
   color: #e2eaf2;
+}
+
+.dashboard-lower-grid h3 {
+  margin: 14px 0 10px;
+  color: #dce7f0;
+  font-size: 15px;
+}
+
+.overview-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0;
+  height: calc(100% - 34px);
+}
+
+.overview-metrics div {
+  display: grid;
+  align-content: center;
+  min-width: 0;
+  padding: 20px 22px;
+  border-left: 1px solid rgb(118 148 177 / 24%);
+  border-top: 1px solid rgb(118 148 177 / 20%);
+}
+
+.overview-metrics div:nth-child(1),
+.overview-metrics div:nth-child(4) {
+  border-left: 0;
+}
+
+.overview-metrics div:nth-child(-n + 3) {
+  border-top: 0;
+}
+
+.overview-metrics dt {
+  color: #c5d0dc;
+  font-size: 15px;
+}
+
+.overview-metrics dd {
+  margin-top: 16px;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--cyan-2);
+  font-size: 24px;
+  line-height: 1.1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .metric-strip {
@@ -726,6 +992,78 @@ dd {
   color: #a8b2bd;
 }
 
+.object-wide-panel {
+  display: flex;
+  flex-direction: column;
+}
+
+.object-wide-panel .object-detail-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.08fr) minmax(0, 1fr);
+  gap: 34px;
+  min-height: 98px;
+  padding: 4px 0 12px;
+}
+
+.object-wide-panel dl {
+  grid-template-columns: 118px minmax(0, 1fr);
+  gap: 9px 18px;
+  font-size: 14px;
+}
+
+.object-wide-panel dd {
+  color: #d7e3ee;
+}
+
+.object-progress-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 68px;
+  gap: 16px;
+  align-items: center;
+  margin: 8px 0 10px;
+}
+
+.object-progress-row .object-progress {
+  width: 100%;
+  margin: 0;
+}
+
+.object-progress-row span {
+  color: #b7c2cd;
+  text-align: right;
+}
+
+.object-wide-panel .alert-cards {
+  flex: 1;
+  align-items: stretch;
+  margin: 0;
+}
+
+.object-wide-panel .alert-cards span {
+  height: auto;
+  min-height: 84px;
+  background: linear-gradient(145deg, rgb(54 39 17 / 62%), rgb(9 17 26 / 70%));
+}
+
+.object-wide-panel .alert-cards em {
+  color: #ffc13d;
+  font-style: normal;
+  font-size: 16px;
+}
+
+.object-wide-panel .alert-cards small {
+  color: #c7d0da;
+  font-size: 13px;
+}
+
+.object-wide-panel .alert-cards .danger {
+  background: linear-gradient(145deg, rgb(59 18 24 / 62%), rgb(9 17 26 / 70%));
+}
+
+.object-wide-panel .alert-cards .danger em {
+  color: var(--red);
+}
+
 .dashboard-actions {
   position: absolute;
   right: 22px;
@@ -772,18 +1110,19 @@ dd {
 .sync-records {
   background:
     linear-gradient(90deg, rgb(0 4 10 / 98%) 0%, rgb(0 7 14 / 90%) 62%, rgb(0 7 14 / 34%) 100%),
-    url("/assets/fustfs-baseline/factory-environment-v4.webp") right center / 58% 100% no-repeat,
+    url("/assets/fustfs-baseline/factory-environment-v4-16x9.webp") center center / cover no-repeat,
     #02070b;
 }
 
 .records-title {
   position: absolute;
   top: 68px;
+  right: 44px;
   left: 18px;
   z-index: 8;
   display: grid;
-  grid-template-columns: auto auto 1fr;
-  gap: 8px 18px;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 18px;
   align-items: center;
 }
 
@@ -793,9 +1132,12 @@ dd {
 }
 
 .records-title p {
-  grid-column: 1 / 4;
+  min-width: 0;
+  overflow: hidden;
   color: #b8c1cb;
   font-size: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .record-summary {
@@ -809,7 +1151,7 @@ dd {
   gap: 16px;
 }
 
-.record-summary button {
+.record-summary .summary-card {
   display: grid;
   grid-template-columns: 74px 1fr;
   align-items: center;
@@ -830,7 +1172,7 @@ dd {
   filter: drop-shadow(0 0 12px rgb(0 139 255 / 38%));
 }
 
-.record-summary button.active {
+.record-summary .summary-card.active {
   border-color: var(--cyan);
   box-shadow: 0 0 18px rgb(0 139 255 / 18%);
 }
@@ -853,7 +1195,7 @@ dd {
   left: 16px;
   z-index: 8;
   display: grid;
-  grid-template-columns: 236px 330px 380px;
+  grid-template-columns: 236px 360px 380px;
   gap: 22px;
   align-items: center;
 }
@@ -868,10 +1210,18 @@ dd {
 }
 
 .segmented-filter button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   height: 44px;
+  min-width: 0;
+  padding: 0 10px;
   border: 0;
   border-right: 1px solid rgb(77 119 158 / 32%);
   border-radius: 0;
+  font-size: 13px;
+  line-height: 1;
+  white-space: nowrap;
 }
 
 .segmented-filter button.active {
@@ -883,7 +1233,7 @@ dd {
 .records-table {
   position: absolute;
   top: 304px;
-  bottom: 86px;
+  bottom: 22px;
   left: 16px;
   z-index: 8;
   display: flex;
@@ -986,9 +1336,9 @@ dd {
 
 .record-drawer {
   position: absolute;
-  top: 248px;
+  top: 304px;
   right: 44px;
-  bottom: 86px;
+  bottom: 22px;
   z-index: 9;
   width: 30.2%;
   padding: 18px 20px;

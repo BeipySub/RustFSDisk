@@ -1,10 +1,4 @@
-use std::{
-    collections::HashMap,
-    fs::{self, File},
-    io::Write,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use anyhow::{anyhow, Context, Result};
 use axum::{
@@ -31,16 +25,19 @@ use uuid::Uuid;
 pub mod center_auth;
 pub mod center_security;
 pub mod config;
+pub mod disk_info_document;
 pub mod import_runtime;
 pub mod import_worker;
 pub mod reinitialize_runtime;
 pub mod reinitializer;
 
 use center_security::{
-    disk_data_key_base64, CenterSecurity, ENCRYPTION_ALG_AES_256_GCM,
-    KEY_WRAP_ALG_LOCAL_MASTER_KEY, SIGNATURE_ALG_HMAC_SHA256,
+    disk_data_key_base64, CenterSecurity, ENCRYPTION_ALG_AES_256_GCM, KEY_WRAP_ALG_LOCAL_MASTER_KEY,
 };
 pub use config::CenterConfig;
+use disk_info_document::{
+    write_initialized_disk_info, DiskInfoStatus, InitializedDiskInfoDocument,
+};
 
 pub const PROTOCOL_VERSION: &str = "1.0";
 const ENCRYPTION_ALG: &str = ENCRYPTION_ALG_AES_256_GCM;
@@ -441,7 +438,7 @@ impl CenterService {
         };
 
         self.store.stage_initializing_data_key(key).await?;
-        let disk_info = DiskInfoDocument::initialized(
+        let disk_info = InitializedDiskInfoDocument::initialized(
             &center_config,
             &disk,
             req.capacity_bytes,
@@ -456,13 +453,8 @@ impl CenterService {
             .await
         {
             let mut failed_disk_info = disk_info;
-            failed_disk_info.status = DiskInfoStatus {
-                code: DiskStatusCode::Error,
-                sealed: false,
-                imported: false,
-                reusable: false,
-                last_error: Some("center failed to activate initialized data key".to_string()),
-            };
+            failed_disk_info.status =
+                DiskInfoStatus::error("center failed to activate initialized data key");
             let _ = write_initialized_disk_info(&req.mount_path, &failed_disk_info);
             return Err(error).context("activate initialized data key after disk_info write");
         }
@@ -1321,173 +1313,6 @@ struct HealthBody {
     service: &'static str,
 }
 
-#[derive(Debug, Serialize)]
-struct DiskInfoDocument {
-    protocol: DiskInfoProtocol,
-    disk: DiskInfoDisk,
-    edge: DiskInfoEdge,
-    center: DiskInfoCenter,
-    manifest: DiskInfoManifest,
-    security: DiskInfoSecurity,
-    status: DiskInfoStatus,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Serialize)]
-struct DiskInfoProtocol {
-    name: String,
-    version: String,
-}
-
-#[derive(Debug, Serialize)]
-struct DiskInfoDisk {
-    disk_id: Uuid,
-    sn: String,
-    capacity_bytes: i64,
-    last_init_time: String,
-    initialized_by: String,
-}
-
-#[derive(Debug, Serialize)]
-struct DiskInfoEdge {
-    edge_name: String,
-    edge_code: String,
-    seal_id: String,
-    export_job_id: String,
-    export_started_at: String,
-    export_finished_at: String,
-}
-
-#[derive(Debug, Serialize)]
-struct DiskInfoCenter {
-    center_id: Uuid,
-    import_job_id: String,
-    import_started_at: String,
-    import_finished_at: String,
-}
-
-#[derive(Debug, Serialize)]
-struct DiskInfoManifest {
-    manifest_path: String,
-    manifest_sha256_path: String,
-    object_count: u64,
-    total_bytes: u64,
-    manifest_sha256: String,
-}
-
-#[derive(Debug, Serialize)]
-struct DiskInfoSecurity {
-    center_key_id: Uuid,
-    data_key_id: Uuid,
-    encryption_alg: String,
-    signature_alg: String,
-    center_signature: String,
-}
-
-#[derive(Debug, Serialize)]
-struct DiskInfoStatus {
-    code: DiskStatusCode,
-    sealed: bool,
-    imported: bool,
-    reusable: bool,
-    last_error: Option<String>,
-}
-
-impl DiskInfoDocument {
-    fn initialized(
-        center_config: &CenterConfigRecord,
-        disk: &DiskRecord,
-        capacity_bytes: i64,
-        data_key_id: Uuid,
-        security: &CenterSecurity,
-    ) -> Result<Self> {
-        let now = Utc::now();
-        let mut document = Self {
-            protocol: DiskInfoProtocol {
-                name: "rustfs-offline-transfer".to_string(),
-                version: center_config.protocol_version.clone(),
-            },
-            disk: DiskInfoDisk {
-                disk_id: disk.disk_id,
-                sn: disk.sn.clone(),
-                capacity_bytes,
-                last_init_time: now.to_rfc3339(),
-                initialized_by: "center".to_string(),
-            },
-            edge: DiskInfoEdge {
-                edge_name: String::new(),
-                edge_code: String::new(),
-                seal_id: String::new(),
-                export_job_id: String::new(),
-                export_started_at: String::new(),
-                export_finished_at: String::new(),
-            },
-            center: DiskInfoCenter {
-                center_id: center_config.center_id,
-                import_job_id: String::new(),
-                import_started_at: String::new(),
-                import_finished_at: String::new(),
-            },
-            manifest: DiskInfoManifest {
-                manifest_path: "manifests/export_manifest.json".to_string(),
-                manifest_sha256_path: "manifests/export_manifest.sha256".to_string(),
-                object_count: 0,
-                total_bytes: 0,
-                manifest_sha256: String::new(),
-            },
-            security: DiskInfoSecurity {
-                center_key_id: security.center_key_id(),
-                data_key_id,
-                encryption_alg: ENCRYPTION_ALG.to_string(),
-                signature_alg: SIGNATURE_ALG_HMAC_SHA256.to_string(),
-                center_signature: String::new(),
-            },
-            status: DiskInfoStatus {
-                code: DiskStatusCode::Initialized,
-                sealed: false,
-                imported: false,
-                reusable: true,
-                last_error: None,
-            },
-            created_at: now,
-            updated_at: now,
-        };
-        document.security.center_signature = security.sign_disk_info(&document)?;
-        Ok(document)
-    }
-}
-
-fn write_initialized_disk_info(mount_path: &Path, document: &DiskInfoDocument) -> Result<()> {
-    let root = mount_path.join("rustfs-transfer");
-    fs::create_dir_all(root.join("data"))?;
-    fs::create_dir_all(root.join("meta"))?;
-    fs::create_dir_all(root.join("manifests"))?;
-    fs::create_dir_all(root.join("logs"))?;
-    fs::create_dir_all(root.join("quarantine").join("partial"))?;
-
-    let disk_info_path = root.join("disk_info.json");
-    let tmp_path = root.join("disk_info.json.tmp");
-    let bytes = serde_json::to_vec_pretty(document)?;
-
-    {
-        let mut file = File::create(&tmp_path)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-    }
-    fs::rename(&tmp_path, &disk_info_path)?;
-    sync_directory_best_effort(&root)?;
-    Ok(())
-}
-
-fn sync_directory_best_effort(path: &Path) -> Result<()> {
-    match File::open(path).and_then(|file| file.sync_all()) {
-        Ok(()) => Ok(()),
-        Err(err) if cfg!(windows) && err.kind() == std::io::ErrorKind::PermissionDenied => Ok(()),
-        Err(err) => Err(err.into()),
-    }
-}
-
 async fn register_disk_handler(
     State(state): State<AppState>,
     Json(req): Json<RegisterDiskRequest>,
@@ -1662,6 +1487,7 @@ impl axum::response::IntoResponse for EdgeApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::sync::Mutex;
 
     use axum::{
@@ -1899,11 +1725,7 @@ mod tests {
     async fn initialize_writes_initialized_disk_info() {
         let service = memory_service();
         let (disk_id, _) = ids(&service).await;
-        let mount_path = std::env::current_dir()
-            .unwrap()
-            .join("target")
-            .join("test-disks")
-            .join(format!("rustfs-center-c3-{disk_id}"));
+        let mount_path = test_disk_mount_path(format!("rustfs-center-c3-{disk_id}"));
         let _ = fs::remove_dir_all(&mount_path);
 
         let response = service
@@ -1951,11 +1773,7 @@ mod tests {
     async fn initialize_keeps_plaintext_data_key_out_of_db_and_disk_info() {
         let service = memory_service();
         let (disk_id, _) = ids(&service).await;
-        let mount_path = std::env::current_dir()
-            .unwrap()
-            .join("target")
-            .join("test-disks")
-            .join(format!("rustfs-center-key-wrapping-{disk_id}"));
+        let mount_path = test_disk_mount_path(format!("rustfs-center-key-wrapping-{disk_id}"));
         let _ = fs::remove_dir_all(&mount_path);
 
         let response = service
@@ -2035,10 +1853,7 @@ mod tests {
             mem.write().await.data_keys.clear();
         }
 
-        let base = std::env::current_dir()
-            .unwrap()
-            .join("target")
-            .join("test-disks");
+        let base = test_disk_mount_path(format!("rustfs-center-c3-failure-base-{disk_id}"));
         fs::create_dir_all(&base).unwrap();
         let blocked_mount_path = base.join(format!("rustfs-center-c3-blocked-{disk_id}"));
         let _ = fs::remove_file(&blocked_mount_path);
@@ -2111,11 +1926,7 @@ mod tests {
             );
         }
 
-        let mount_path = std::env::current_dir()
-            .unwrap()
-            .join("target")
-            .join("test-disks")
-            .join(format!("rustfs-center-c3-supersede-{disk_id}"));
+        let mount_path = test_disk_mount_path(format!("rustfs-center-c3-supersede-{disk_id}"));
         let _ = fs::remove_dir_all(&mount_path);
 
         let response = service
@@ -2432,5 +2243,11 @@ mod tests {
     async fn json_body(response: axum::response::Response) -> serde_json::Value {
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn test_disk_mount_path(name: impl AsRef<str>) -> PathBuf {
+        std::env::temp_dir()
+            .join("rustfs-center-test-disks")
+            .join(name.as_ref())
     }
 }

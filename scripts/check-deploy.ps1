@@ -28,6 +28,17 @@ if ($centerService -notmatch "EnvironmentFile=-/etc/rustfs-transfer/center.env")
     Add-Failure "center service must load center.env for security key injection"
 }
 
+$edgeService = Get-Content -Raw (Join-Path $repo "deploy/systemd/rustfs-transfer-edge.service")
+if ($edgeService -notmatch "ExecStart=/opt/rustfs-transfer/rustfs-transfer-edge") {
+    Add-Failure "edge service ExecStart must use /opt/rustfs-transfer/rustfs-transfer-edge"
+}
+if ($edgeService -notmatch "RUSTFS_TRANSFER__CONFIG_PATH=/etc/rustfs-transfer/edge.toml") {
+    Add-Failure "edge service must load /etc/rustfs-transfer/edge.toml"
+}
+if ($edgeService -notmatch "EnvironmentFile=-/etc/rustfs-transfer/edge.env") {
+    Add-Failure "edge service must load edge.env for deploy-time toggles"
+}
+
 $centerToml = Get-Content -Raw (Join-Path $repo "deploy/config/center.example.toml")
 if ($centerToml -notmatch "control_api_token_env\s*=\s*`"RUSTFS_TRANSFER__SERVER__CONTROL_API_TOKEN`"") {
     Add-Failure "center config example must reference CENTER CONTROL API token env"
@@ -50,6 +61,37 @@ if ($centerEnv -notmatch "RUSTFS_TRANSFER__SECURITY__CENTER_SIGNATURE_KEY=CHANGE
     Add-Failure "center.env.example must include CENTER_SIGNATURE_KEY placeholder"
 }
 
+$edgeToml = Get-Content -Raw (Join-Path $repo "deploy/config/edge.example.toml")
+if ($edgeToml -notmatch "\[auto_export\]") {
+    Add-Failure "edge config example must include auto_export section"
+}
+if ($edgeToml -notmatch "enabled\s*=\s*false") {
+    Add-Failure "edge auto_export.enabled must default to false"
+}
+if ($edgeToml -notmatch "start_on_ready\s*=\s*false") {
+    Add-Failure "edge auto_export.start_on_ready must default to false"
+}
+if ($edgeToml -notmatch "min_ready_disk_count\s*=\s*1") {
+    Add-Failure "edge auto_export.min_ready_disk_count must default to 1"
+}
+if ($edgeToml -notmatch "cooldown_seconds\s*=\s*60") {
+    Add-Failure "edge auto_export.cooldown_seconds must default to 60"
+}
+
+$edgeEnv = Get-Content -Raw (Join-Path $repo "deploy/config/edge.env.example")
+if ($edgeEnv -notmatch "RUSTFS_TRANSFER__AUTO_EXPORT__ENABLED=false") {
+    Add-Failure "edge.env.example must keep auto export disabled by default"
+}
+if ($edgeEnv -notmatch "RUSTFS_TRANSFER__AUTO_EXPORT__START_ON_READY=false") {
+    Add-Failure "edge.env.example must keep start_on_ready disabled by default"
+}
+if ($edgeEnv -notmatch "RUSTFS_TRANSFER__AUTO_EXPORT__MIN_READY_DISK_COUNT=1") {
+    Add-Failure "edge.env.example must include min ready disk count"
+}
+if ($edgeEnv -notmatch "RUSTFS_TRANSFER__AUTO_EXPORT__COOLDOWN_SECONDS=60") {
+    Add-Failure "edge.env.example must include cooldown seconds"
+}
+
 $udevPath = Join-Path $repo "deploy/udev/99-rustfs-transfer-disk.rules"
 $udev = Get-Content -Raw $udevPath
 if ($udev -notmatch "rustfs-transfer-disk-rescan@%k.service") {
@@ -59,6 +101,9 @@ if ($udev -notmatch "rustfs-transfer-disk-rescan@%k.service") {
 $udevExecutableLines = ($udev -split "`n") | Where-Object { $_ -notmatch "^\s*#" }
 if (($udevExecutableLines -join "`n") -match "(?i)(export|import|cleanup|reinitializ|mkfs|format)") {
     Add-Failure "udev executable rule must not directly run business, formatting, cleanup, or reinit work"
+}
+if (($udevExecutableLines -join "`n") -match "(?i)(/api/edge/(scan|export-jobs)|/api/center|rustfs-transfer-edge|rustfs-transfer-center)") {
+    Add-Failure "udev rule must not call Edge/Center business APIs or daemons directly"
 }
 
 $rescanServicePath = Join-Path $repo "deploy/systemd/rustfs-transfer-disk-rescan@.service"
@@ -71,6 +116,9 @@ if ($rescanService -notmatch "EnvironmentFile=-/etc/rustfs-transfer/edge.env") {
 }
 if ($rescanService -match "(?i)(export-key|import-worker|cleanup|reinitializ|mkfs|format)") {
     Add-Failure "disk rescan service must not directly run business, formatting, cleanup, or reinit work"
+}
+if ($rescanService -match "(?i)(/api/edge/(scan|export-jobs)|/api/center)") {
+    Add-Failure "disk rescan service must not call business HTTP APIs directly"
 }
 
 $deployText = Get-ChildItem -Path (Join-Path $repo "deploy") -Recurse -File |
