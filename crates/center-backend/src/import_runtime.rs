@@ -617,7 +617,9 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::import_worker::{ImportOutcome, ImportProgressSnapshot};
+    use crate::import_worker::{
+        ImportError, ImportErrorCode, ImportOutcome, ImportProgressSnapshot,
+    };
 
     #[test]
     fn import_response_uses_prefixed_status_field() {
@@ -630,6 +632,34 @@ mod tests {
 
         assert_eq!(value["import_job_status"], "DONE");
         assert!(value.get("status").is_none());
+    }
+
+    #[test]
+    fn import_failure_message_keeps_real_error_when_progress_has_not_started() {
+        let snapshot = ImportProgressSnapshot::default();
+        let err = ImportError::new(
+            ImportErrorCode::ManifestInvalid,
+            "disk is not registered or enabled",
+        );
+
+        let message = import_failure_message(&snapshot, &err);
+
+        assert_eq!(
+            message,
+            "import_job_status=PENDING; MANIFEST_INVALID: disk is not registered or enabled"
+        );
+        assert!(!message.contains("import_job_status=;"));
+    }
+
+    #[test]
+    fn import_job_status_validation_keeps_task_status_separate_from_disk_lifecycle() {
+        for status in ["PENDING", "IMPORTING", "DONE", "FAILED", "CANCELLED"] {
+            assert!(is_import_job_status(status));
+        }
+
+        for status in ["", "INITIALIZED", "SEALED", "IMPORTED", "READY"] {
+            assert!(!is_import_job_status(status));
+        }
     }
 
     #[test]

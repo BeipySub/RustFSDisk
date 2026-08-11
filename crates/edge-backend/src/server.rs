@@ -277,6 +277,7 @@ async fn edge_dashboard_get_export_job(
         .control
         .export_job(export_job_id)
         .await
+        .map(browser_safe_export_job)
         .map(Json)
         .map_err(Into::into)
 }
@@ -290,6 +291,17 @@ fn browser_safe_summary(
         }
     }
     summary
+}
+
+fn browser_safe_export_job(
+    mut job: crate::control::ExportJobResponse,
+) -> crate::control::ExportJobResponse {
+    for disk in &mut job.disks {
+        if disk.disk_status_code.as_deref() == Some("IMPORTED") {
+            disk.disk_status_code = Some("ERROR".to_string());
+        }
+    }
+    job
 }
 
 async fn edge_copy_progress_ws(State(state): State<AppState>, ws: WebSocketUpgrade) -> Response {
@@ -565,7 +577,8 @@ mod tests {
             Clock, DatabaseAdapter, DiskAdapter, HealthFuture, IdGenerator, ObjectStoreAdapter,
         },
         control::{
-            ControlFuture, DiskRuntimeSummary, EdgeControlSummary, EdgeGlobalSummary,
+            ControlFuture, DashboardCurrentObject, DiskRuntimeSummary, EdgeControlSummary,
+            EdgeDiskProgressSummary, EdgeGlobalSummary, ExportJobDiskSummary, ExportJobEvent,
             ExportJobResponse, ScanTriggerResponse, StartExportJobResponse,
         },
         disk_detection::DiskDetectionError,
@@ -780,15 +793,37 @@ mod tests {
                     },
                     latest_export_job: Some(export_job_response(self.export_job_id)),
                     disks: vec![DiskRuntimeSummary {
+                        hardware_serial: "SN-A".to_string(),
                         disk_sn: "SN-A".to_string(),
                         disk_id: Some(Uuid::new_v4()),
                         device_path: "/dev/sdb1".to_string(),
                         mount_path: Some("/mnt/rustfs-transfer/disk-a".to_string()),
+                        filesystem_type: Some("ext4".to_string()),
+                        fs_uuid: Some("fs-uuid-a".to_string()),
                         disk_status_code: "IMPORTED".to_string(),
                         runtime_status: "READY".to_string(),
                         capacity_bytes: 100,
                         free_bytes: 80,
                         object_budget_bytes: 64,
+                        progress: EdgeDiskProgressSummary {
+                            total_bytes: 99,
+                            done_bytes: 10,
+                            remaining_bytes: 89,
+                            speed_bytes_per_sec: 5,
+                            object_total: 2,
+                            object_done: 1,
+                            object_remaining: 1,
+                        },
+                        current_object: Some(DashboardCurrentObject {
+                            bucket: "test".to_string(),
+                            key: "alpha.bin".to_string(),
+                            display_name: "alpha.bin".to_string(),
+                            size_bytes: 99,
+                            done_bytes: 10,
+                            remaining_bytes: 89,
+                            speed_bytes_per_sec: 5,
+                            object_status: "COPYING".to_string(),
+                        }),
                         last_error_code: None,
                         error_message: None,
                     }],
@@ -872,7 +907,25 @@ mod tests {
         assert_eq!(dashboard.status(), StatusCode::OK);
         let body = json_body(dashboard).await;
         assert_eq!(body["source"], "edge");
+        assert_eq!(body["edge_code"], "edge-a");
+        assert_eq!(body["edge_name"], "edge-a");
+        assert_eq!(body["export_job_status"], "PENDING");
+        assert_eq!(body["global_progress"]["total_bytes"], 99);
         assert_eq!(body["disks"][0]["disk_status_code"], "ERROR");
+        assert_eq!(body["disks"][0]["hardware_serial"], "SN-A");
+        assert_eq!(body["disks"][0]["device_path"], "/dev/sdb1");
+        assert_eq!(
+            body["disks"][0]["mount_path"],
+            "/mnt/rustfs-transfer/disk-a"
+        );
+        assert_eq!(body["disks"][0]["filesystem_type"], "ext4");
+        assert_eq!(body["disks"][0]["fs_uuid"], "fs-uuid-a");
+        assert_eq!(body["disks"][0]["runtime_status"], "READY");
+        assert_eq!(body["disks"][0]["progress"]["object_total"], 2);
+        assert_eq!(
+            body["disks"][0]["current_object"]["object_status"],
+            "COPYING"
+        );
         assert_ne!(body["disks"][0]["disk_status_code"], "IMPORTED");
         assert!(body.get("status").is_none());
         assert!(body.get("disk_data_key").is_none());
@@ -918,6 +971,8 @@ mod tests {
         assert_eq!(detail.status(), StatusCode::OK);
         let detail_body = json_body(detail).await;
         assert_eq!(detail_body["export_job_id"], export_job_id.to_string());
+        assert_eq!(detail_body["disks"][0]["disk_status_code"], "ERROR");
+        assert_eq!(detail_body["events"][0]["event_type"], "EXPORT_JOB_STARTED");
         assert!(detail_body.get("status").is_none());
         assert!(detail_body.get("disk_data_key").is_none());
         assert_eq!(
@@ -1240,6 +1295,31 @@ mod tests {
             finish_time: None,
             error_message: None,
             object_status_counts: BTreeMap::from([("PENDING".to_string(), 2)]),
+            disks: vec![ExportJobDiskSummary {
+                disk_id: Some(Uuid::new_v4()),
+                disk_sn: Some("SN-A".to_string()),
+                device_path: Some("/dev/sdb1".to_string()),
+                mount_path: Some("/mnt/rustfs-transfer/disk-a".to_string()),
+                disk_status_code: Some("IMPORTED".to_string()),
+                runtime_status: Some("READY".to_string()),
+                object_total: 2,
+                object_done: 0,
+                total_bytes: 99,
+                done_bytes: 0,
+                last_error_code: None,
+                error_message: None,
+            }],
+            events: vec![ExportJobEvent {
+                event_type: "EXPORT_JOB_STARTED".to_string(),
+                event_time: Some(Utc::now()),
+                export_job_status: Some("PENDING".to_string()),
+                object_status: None,
+                disk_id: None,
+                bucket: None,
+                key: None,
+                error_code: None,
+                message: None,
+            }],
         }
     }
 }

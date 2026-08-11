@@ -451,52 +451,7 @@ pub(crate) fn validate_center_signature_for_reinitialize(
             "disk_info center_signature is missing".to_string(),
         ));
     }
-    if security.verify_disk_info(disk_info).is_ok() {
-        return Ok(());
-    }
-    if !document.has_top_level_updated_at && is_legacy_imported_disk_info(&document.raw_value) {
-        return verify_raw_disk_info_for_reinitialize(&document.raw_value, security);
-    }
-    if has_legacy_updated_at_sentinel(&document.raw_value)
-        && is_imported_disk_info_raw(&document.raw_value)
-    {
-        let mut historical_value = document.raw_value.clone();
-        historical_value
-            .as_object_mut()
-            .ok_or_else(|| {
-                ReinitializeError::SignatureInvalid("disk_info root must be an object".to_string())
-            })?
-            .remove("updated_at");
-        return verify_raw_disk_info_for_reinitialize(&historical_value, security);
-    }
-    Err(ReinitializeError::SignatureInvalid(
-        "disk_info center_signature verification failed".to_string(),
-    ))
-}
-
-fn is_legacy_imported_disk_info(raw_disk_info: &Value) -> bool {
-    raw_disk_info.get("updated_at").is_none() && is_imported_disk_info_raw(raw_disk_info)
-}
-
-fn is_imported_disk_info_raw(raw_disk_info: &Value) -> bool {
-    raw_disk_info
-        .pointer("/status/code")
-        .and_then(Value::as_str)
-        == Some("IMPORTED")
-}
-
-fn has_legacy_updated_at_sentinel(raw_disk_info: &Value) -> bool {
-    raw_disk_info
-        .get("updated_at")
-        .and_then(Value::as_str)
-        .is_some_and(|updated_at| updated_at == LEGACY_UPDATED_AT_SENTINEL)
-}
-
-fn verify_raw_disk_info_for_reinitialize(
-    raw_disk_info: &Value,
-    security: &CenterSecurity,
-) -> Result<(), ReinitializeError> {
-    security.verify_disk_info(raw_disk_info).map_err(|_| {
+    security.verify_disk_info(&document.raw_value).map_err(|_| {
         ReinitializeError::SignatureInvalid(
             "disk_info center_signature verification failed".to_string(),
         )

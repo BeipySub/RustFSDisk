@@ -14,7 +14,9 @@ use anyhow::{anyhow, Context};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
-use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc};
+use std::{
+    collections::BTreeMap, future::Future, path::Path, pin::Pin, process::Command, sync::Arc,
+};
 use uuid::Uuid;
 
 pub type ControlFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ControlError>> + Send + 'a>>;
@@ -157,6 +159,37 @@ pub struct ExportJobResponse {
     pub finish_time: Option<DateTime<Utc>>,
     pub error_message: Option<String>,
     pub object_status_counts: BTreeMap<String, u64>,
+    pub disks: Vec<ExportJobDiskSummary>,
+    pub events: Vec<ExportJobEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ExportJobDiskSummary {
+    pub disk_id: Option<Uuid>,
+    pub disk_sn: Option<String>,
+    pub device_path: Option<String>,
+    pub mount_path: Option<String>,
+    pub disk_status_code: Option<String>,
+    pub runtime_status: Option<String>,
+    pub object_total: u64,
+    pub object_done: u64,
+    pub total_bytes: u64,
+    pub done_bytes: u64,
+    pub last_error_code: Option<String>,
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ExportJobEvent {
+    pub event_type: String,
+    pub event_time: Option<DateTime<Utc>>,
+    pub export_job_status: Option<String>,
+    pub object_status: Option<String>,
+    pub disk_id: Option<Uuid>,
+    pub bucket: Option<String>,
+    pub key: Option<String>,
+    pub error_code: Option<String>,
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -199,17 +232,59 @@ pub struct ExportJobRecord {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct DiskRuntimeSummary {
+    pub hardware_serial: String,
     pub disk_sn: String,
     pub disk_id: Option<Uuid>,
     pub device_path: String,
     pub mount_path: Option<String>,
+    pub filesystem_type: Option<String>,
+    pub fs_uuid: Option<String>,
     pub disk_status_code: String,
     pub runtime_status: String,
     pub capacity_bytes: u64,
     pub free_bytes: u64,
     pub object_budget_bytes: u64,
+    pub progress: EdgeDiskProgressSummary,
+    pub current_object: Option<DashboardCurrentObject>,
     pub last_error_code: Option<String>,
     pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct EdgeDiskProgressSummary {
+    pub total_bytes: u64,
+    pub done_bytes: u64,
+    pub remaining_bytes: u64,
+    pub speed_bytes_per_sec: u64,
+    pub object_total: u64,
+    pub object_done: u64,
+    pub object_remaining: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DashboardCurrentObject {
+    pub bucket: String,
+    pub key: String,
+    pub display_name: String,
+    pub size_bytes: u64,
+    pub done_bytes: u64,
+    pub remaining_bytes: u64,
+    pub speed_bytes_per_sec: u64,
+    pub object_status: String,
+}
+
+impl EdgeDiskProgressSummary {
+    fn idle() -> Self {
+        Self {
+            total_bytes: 0,
+            done_bytes: 0,
+            remaining_bytes: 0,
+            speed_bytes_per_sec: 0,
+            object_total: 0,
+            object_done: 0,
+            object_remaining: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -587,11 +662,24 @@ impl EdgeControlService for ProductionEdgeControlService {
                 Some(export_job_id) => Some(load_export_job(&self.pool, export_job_id).await?),
                 None => None,
             };
-            let disks = load_disk_runtime(&self.pool).await?;
-            let global_progress = global_from_latest_job(latest_export_job.as_ref());
-            let export_job_status = latest_export_job
+            let copy_progress =
+                self.copy_progress.read().await.as_ref().map(|progress| {
+                    progress.snapshot("COPY_PROGRESS", "edge copy progress snapshot")
+                });
+            let mut disks = load_disk_runtime(&self.pool).await?;
+            enrich_disks_from_copy_progress(&mut disks, copy_progress.as_ref());
+            let global_progress = copy_progress
                 .as_ref()
-                .map(|job| job.export_job_status.clone())
+                .map(global_from_copy_progress)
+                .unwrap_or_else(|| global_from_latest_job(latest_export_job.as_ref()));
+            let export_job_status = copy_progress
+                .as_ref()
+                .map(|event| event.export_job_status.clone())
+                .or_else(|| {
+                    latest_export_job
+                        .as_ref()
+                        .map(|job| job.export_job_status.clone())
+                })
                 .unwrap_or_else(|| "PENDING".to_string());
 
             Ok(EdgeControlSummary {
@@ -600,7 +688,10 @@ impl EdgeControlService for ProductionEdgeControlService {
                 edge_name: self.config.center.edge_code.clone(),
                 export_job_id: latest_export_job.as_ref().map(|job| job.export_job_id),
                 export_job_status,
-                disk_status_code: aggregate_disk_status_code(&disks),
+                disk_status_code: copy_progress
+                    .as_ref()
+                    .map(|event| event.disk_status_code.clone())
+                    .unwrap_or_else(|| aggregate_disk_status_code(&disks)),
                 scan: self.scan_progress.snapshot(),
                 global_progress,
                 latest_export_job,
@@ -651,6 +742,18 @@ async fn load_export_job(
     .context("load export job")?
     .ok_or_else(|| ControlError::bad_request("INVALID_REQUEST", "export_job_id was not found"))?;
 
+    let object_status_counts = load_object_status_counts(pool, export_job_id).await?;
+    let disks = load_export_job_disks(pool, export_job_id).await?;
+    let events = load_export_job_events(
+        pool,
+        export_job_id,
+        row.get("status"),
+        naive_utc(row.get("start_time")),
+        naive_utc(row.get("finish_time")),
+        row.get("error_message"),
+    )
+    .await?;
+
     Ok(ExportJobResponse {
         export_job_id: row.get("export_job_id"),
         edge_code: row.get("edge_code"),
@@ -662,7 +765,9 @@ async fn load_export_job(
         start_time: naive_utc(row.get("start_time")),
         finish_time: naive_utc(row.get("finish_time")),
         error_message: row.get("error_message"),
-        object_status_counts: load_object_status_counts(pool, export_job_id).await?,
+        object_status_counts,
+        disks,
+        events,
     })
 }
 
@@ -781,6 +886,140 @@ async fn load_object_status_counts(
         .collect())
 }
 
+async fn load_export_job_disks(
+    pool: &PgPool,
+    export_job_id: Uuid,
+) -> Result<Vec<ExportJobDiskSummary>, ControlError> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            eo.disk_id,
+            dr.sn,
+            dr.device_path,
+            dr.mount_path,
+            dr.status AS runtime_status,
+            dr.last_error_code,
+            dr.error_message,
+            COUNT(*) AS object_total,
+            COUNT(*) FILTER (WHERE eo.status = 'EXPORTED') AS object_done,
+            COALESCE(SUM(eo.chunk_size_bytes), 0) AS total_bytes,
+            COALESCE(SUM(CASE WHEN eo.status = 'EXPORTED' THEN eo.chunk_size_bytes ELSE 0 END), 0) AS done_bytes
+        FROM export_object eo
+        LEFT JOIN disk_runtime dr ON dr.disk_id = eo.disk_id
+        WHERE eo.export_job_id = $1
+        GROUP BY eo.disk_id, dr.sn, dr.device_path, dr.mount_path, dr.status,
+                 dr.last_error_code, dr.error_message
+        ORDER BY eo.disk_id NULLS LAST
+        "#,
+    )
+    .bind(export_job_id)
+    .fetch_all(pool)
+    .await
+    .context("load export job disk summaries")?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let mount_path: Option<String> = row.get("mount_path");
+            ExportJobDiskSummary {
+                disk_id: row.get("disk_id"),
+                disk_sn: row.get("sn"),
+                device_path: row.get("device_path"),
+                disk_status_code: disk_status_code_from_mount(mount_path.as_deref()),
+                mount_path,
+                runtime_status: row.get("runtime_status"),
+                object_total: row.get::<i64, _>("object_total").max(0) as u64,
+                object_done: row.get::<i64, _>("object_done").max(0) as u64,
+                total_bytes: row.get::<i64, _>("total_bytes").max(0) as u64,
+                done_bytes: row.get::<i64, _>("done_bytes").max(0) as u64,
+                last_error_code: row.get("last_error_code"),
+                error_message: row.get("error_message"),
+            }
+        })
+        .collect())
+}
+
+async fn load_export_job_events(
+    pool: &PgPool,
+    export_job_id: Uuid,
+    export_job_status: String,
+    start_time: Option<DateTime<Utc>>,
+    finish_time: Option<DateTime<Utc>>,
+    error_message: Option<String>,
+) -> Result<Vec<ExportJobEvent>, ControlError> {
+    let mut events = Vec::new();
+    if start_time.is_some() {
+        events.push(ExportJobEvent {
+            event_type: "EXPORT_JOB_STARTED".to_string(),
+            event_time: start_time,
+            export_job_status: Some(export_job_status.clone()),
+            object_status: None,
+            disk_id: None,
+            bucket: None,
+            key: None,
+            error_code: None,
+            message: None,
+        });
+    }
+    if finish_time.is_some() {
+        events.push(ExportJobEvent {
+            event_type: if export_job_status == "FAILED" {
+                "EXPORT_JOB_FAILED".to_string()
+            } else {
+                "EXPORT_JOB_FINISHED".to_string()
+            },
+            event_time: finish_time,
+            export_job_status: Some(export_job_status.clone()),
+            object_status: None,
+            disk_id: None,
+            bucket: None,
+            key: None,
+            error_code: None,
+            message: error_message.clone(),
+        });
+    }
+
+    let rows = sqlx::query(
+        r#"
+        SELECT disk_id, bucket, object_key, status, error_code, error_message
+        FROM export_object
+        WHERE export_job_id = $1
+          AND (status IN ('COPYING', 'FAILED', 'SOURCE_CHANGED', 'SKIPPED')
+               OR error_code IS NOT NULL)
+        ORDER BY id DESC
+        LIMIT 50
+        "#,
+    )
+    .bind(export_job_id)
+    .fetch_all(pool)
+    .await
+    .context("load export job object events")?;
+
+    events.extend(rows.into_iter().map(|row| {
+        let object_status: String = row.get("status");
+        ExportJobEvent {
+            event_type: match object_status.as_str() {
+                "COPYING" => "EXPORT_OBJECT_COPYING",
+                "FAILED" => "EXPORT_OBJECT_FAILED",
+                "SOURCE_CHANGED" => "EXPORT_OBJECT_SOURCE_CHANGED",
+                "SKIPPED" => "EXPORT_OBJECT_SKIPPED",
+                _ => "EXPORT_OBJECT_EVENT",
+            }
+            .to_string(),
+            event_time: None,
+            export_job_status: None,
+            object_status: Some(object_status),
+            disk_id: row.get("disk_id"),
+            bucket: row.get("bucket"),
+            key: row.get("object_key"),
+            error_code: row.get("error_code"),
+            message: row.get("error_message"),
+        }
+    }));
+
+    Ok(events)
+}
+
 async fn load_disk_runtime(pool: &PgPool) -> Result<Vec<DiskRuntimeSummary>, ControlError> {
     let rows = sqlx::query(LOAD_DISK_RUNTIME_SQL)
         .fetch_all(pool)
@@ -789,23 +1028,31 @@ async fn load_disk_runtime(pool: &PgPool) -> Result<Vec<DiskRuntimeSummary>, Con
 
     Ok(rows
         .into_iter()
-        .map(|row| DiskRuntimeSummary {
-            disk_sn: row.get("sn"),
-            disk_id: row.get("disk_id"),
-            device_path: row.get("device_path"),
-            mount_path: row.get("mount_path"),
-            disk_status_code: disk_status_code_from_mount(
-                row.get::<Option<String>, _>("mount_path").as_deref(),
-            )
-            .unwrap_or_else(|| {
-                disk_status_code_from_runtime(&row.get::<String, _>("status")).to_string()
-            }),
-            runtime_status: row.get("status"),
-            capacity_bytes: row.get::<i64, _>("capacity_bytes").max(0) as u64,
-            free_bytes: row.get::<i64, _>("free_bytes").max(0) as u64,
-            object_budget_bytes: row.get::<i64, _>("object_budget_bytes").max(0) as u64,
-            last_error_code: row.get("last_error_code"),
-            error_message: row.get("error_message"),
+        .map(|row| {
+            let disk_sn: String = row.get("sn");
+            let device_path: String = row.get("device_path");
+            let mount_path: Option<String> = row.get("mount_path");
+            let runtime_status: String = row.get("status");
+            let metadata = disk_runtime_filesystem_metadata(&device_path, mount_path.as_deref());
+            DiskRuntimeSummary {
+                hardware_serial: disk_sn.clone(),
+                disk_sn,
+                disk_id: row.get("disk_id"),
+                device_path,
+                mount_path: mount_path.clone(),
+                filesystem_type: metadata.filesystem_type,
+                fs_uuid: metadata.fs_uuid,
+                disk_status_code: disk_status_code_from_mount(mount_path.as_deref())
+                    .unwrap_or_else(|| disk_status_code_from_runtime(&runtime_status).to_string()),
+                runtime_status,
+                capacity_bytes: row.get::<i64, _>("capacity_bytes").max(0) as u64,
+                free_bytes: row.get::<i64, _>("free_bytes").max(0) as u64,
+                object_budget_bytes: row.get::<i64, _>("object_budget_bytes").max(0) as u64,
+                progress: EdgeDiskProgressSummary::idle(),
+                current_object: None,
+                last_error_code: row.get("last_error_code"),
+                error_message: row.get("error_message"),
+            }
         })
         .collect())
 }
@@ -868,6 +1115,61 @@ fn global_from_latest_job(job: Option<&ExportJobResponse>) -> EdgeGlobalSummary 
     }
 }
 
+fn global_from_copy_progress(event: &CopyProgressEvent) -> EdgeGlobalSummary {
+    EdgeGlobalSummary {
+        total_bytes: event.global_progress.total_bytes,
+        done_bytes: event.global_progress.done_bytes,
+        remaining_bytes: event.global_progress.remaining_bytes,
+        speed_bytes_per_sec: event.global_progress.speed_bytes_per_sec,
+        object_total: event.global_progress.object_total,
+        object_done: event.global_progress.object_done,
+        object_remaining: event.global_progress.object_remaining,
+    }
+}
+
+fn enrich_disks_from_copy_progress(
+    disks: &mut [DiskRuntimeSummary],
+    event: Option<&CopyProgressEvent>,
+) {
+    let Some(event) = event else {
+        return;
+    };
+    for disk in disks {
+        let disk_id = disk.disk_id.map(|id| id.to_string());
+        let Some(progress) = event
+            .disks
+            .iter()
+            .find(|progress| Some(progress.disk_id.as_str()) == disk_id.as_deref())
+        else {
+            continue;
+        };
+        disk.runtime_status = progress.runtime_status.clone();
+        disk.progress = EdgeDiskProgressSummary {
+            total_bytes: progress.total_bytes,
+            done_bytes: progress.done_bytes,
+            remaining_bytes: progress.remaining_bytes,
+            speed_bytes_per_sec: progress.speed_bytes_per_sec,
+            object_total: progress.object_total,
+            object_done: progress.object_done,
+            object_remaining: progress.object_remaining,
+        };
+        disk.current_object =
+            progress
+                .current_object
+                .as_ref()
+                .map(|current| DashboardCurrentObject {
+                    bucket: current.bucket.clone(),
+                    key: current.key.clone(),
+                    display_name: current.display_name.clone(),
+                    size_bytes: current.size_bytes,
+                    done_bytes: current.done_bytes,
+                    remaining_bytes: current.remaining_bytes,
+                    speed_bytes_per_sec: current.speed_bytes_per_sec,
+                    object_status: current.object_status.clone(),
+                });
+    }
+}
+
 fn aggregate_disk_status_code(disks: &[DiskRuntimeSummary]) -> String {
     if disks
         .iter()
@@ -878,6 +1180,48 @@ fn aggregate_disk_status_code(disks: &[DiskRuntimeSummary]) -> String {
         "ERROR".to_string()
     } else {
         "INITIALIZED".to_string()
+    }
+}
+
+struct DiskRuntimeFilesystemMetadata {
+    filesystem_type: Option<String>,
+    fs_uuid: Option<String>,
+}
+
+fn disk_runtime_filesystem_metadata(
+    device_path: &str,
+    mount_path: Option<&str>,
+) -> DiskRuntimeFilesystemMetadata {
+    DiskRuntimeFilesystemMetadata {
+        filesystem_type: mount_path
+            .and_then(filesystem_type_from_mount)
+            .or_else(|| blkid_value(device_path, "TYPE")),
+        fs_uuid: blkid_value(device_path, "UUID"),
+    }
+}
+
+fn filesystem_type_from_mount(mount_path: &str) -> Option<String> {
+    command_stdout("findmnt", &["-nro", "FSTYPE", "--target", mount_path])
+}
+
+fn blkid_value(device_path: &str, field: &str) -> Option<String> {
+    if device_path.trim().is_empty() || device_path == "unknown" || !Path::new(device_path).exists()
+    {
+        return None;
+    }
+    command_stdout("blkid", &["-o", "value", "-s", field, device_path])
+}
+
+fn command_stdout(command: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(command).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
     }
 }
 

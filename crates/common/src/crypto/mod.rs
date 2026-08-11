@@ -8,7 +8,10 @@ use hmac::{Hmac, Mac};
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use rand::rngs::OsRng;
 use rand::RngCore;
+use serde::Serialize;
+use serde_json::{json, Number, Value};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use thiserror::Error;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -65,6 +68,14 @@ pub enum CryptoError {
     Base64DecodeFailed(String),
     #[error("HMAC verification failed")]
     HmacVerificationFailed,
+    #[error("disk_info.security is missing")]
+    DiskInfoSecurityMissing,
+    #[error("disk_info center_signature is missing")]
+    CenterSignatureMissing,
+    #[error("disk_info center_signature verification failed")]
+    CenterSignatureVerificationFailed,
+    #[error("disk_info JSON serialization failed: {0}")]
+    DiskInfoJsonFailed(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -228,6 +239,105 @@ pub fn verify_hmac_base64(
     mac.update(canonical.string_to_sign().as_bytes());
     mac.verify_slice(&expected)
         .map_err(|_| CryptoError::HmacVerificationFailed)
+}
+
+pub fn center_signature_payload<T: Serialize>(disk_info: &T) -> Result<Value, CryptoError> {
+    let value = serde_json::to_value(disk_info)
+        .map_err(|err| CryptoError::DiskInfoJsonFailed(err.to_string()))?;
+    center_signature_payload_value(&value)
+}
+
+pub fn center_signature_payload_value(disk_info: &Value) -> Result<Value, CryptoError> {
+    let security = disk_info
+        .get("security")
+        .ok_or(CryptoError::DiskInfoSecurityMissing)?;
+    Ok(json!({
+        "disk": disk_info.get("disk").cloned().unwrap_or(Value::Null),
+        "protocol": disk_info.get("protocol").cloned().unwrap_or(Value::Null),
+        "security": {
+            "center_key_id": security.get("center_key_id").cloned().unwrap_or(Value::Null),
+            "data_key_id": security.get("data_key_id").cloned().unwrap_or(Value::Null),
+            "signature_alg": security.get("signature_alg").cloned().unwrap_or(Value::Null),
+        }
+    }))
+}
+
+pub fn center_signature_canonical_json<T: Serialize>(disk_info: &T) -> Result<String, CryptoError> {
+    let payload = center_signature_payload(disk_info)?;
+    Ok(canonical_json(&payload))
+}
+
+pub fn sign_center_signature<T: Serialize>(
+    signature_key: &[u8],
+    disk_info: &T,
+) -> Result<String, CryptoError> {
+    let canonical = center_signature_canonical_json(disk_info)?;
+    Ok(sign_string_hmac_base64(signature_key, &canonical))
+}
+
+pub fn verify_center_signature<T: Serialize>(
+    signature_key: &[u8],
+    disk_info: &T,
+) -> Result<(), CryptoError> {
+    let value = serde_json::to_value(disk_info)
+        .map_err(|err| CryptoError::DiskInfoJsonFailed(err.to_string()))?;
+    let signature = value
+        .get("security")
+        .and_then(|security| security.get("center_signature"))
+        .and_then(Value::as_str)
+        .filter(|signature| !signature.trim().is_empty())
+        .ok_or(CryptoError::CenterSignatureMissing)?;
+    let expected = sign_center_signature(signature_key, &value)?;
+    let expected_bytes = decode_base64(&expected)?;
+    let signature_bytes = decode_base64(signature)?;
+    if expected_bytes.len() != signature_bytes.len() {
+        return Err(CryptoError::CenterSignatureVerificationFailed);
+    }
+    let mut diff = 0_u8;
+    for (left, right) in expected_bytes.iter().zip(signature_bytes.iter()) {
+        diff |= left ^ right;
+    }
+    if diff == 0 {
+        Ok(())
+    } else {
+        Err(CryptoError::CenterSignatureVerificationFailed)
+    }
+}
+
+fn canonical_json(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Bool(value) => value.to_string(),
+        Value::Number(number) => canonical_number(number),
+        Value::String(value) => serde_json::to_string(value).expect("string serialization"),
+        Value::Array(values) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(canonical_json)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        Value::Object(map) => {
+            let sorted = map.iter().collect::<BTreeMap<_, _>>();
+            format!(
+                "{{{}}}",
+                sorted
+                    .into_iter()
+                    .map(|(key, value)| format!(
+                        "{}:{}",
+                        serde_json::to_string(key).expect("key serialization"),
+                        canonical_json(value)
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        }
+    }
+}
+
+fn canonical_number(number: &Number) -> String {
+    number.to_string()
 }
 
 pub fn object_aad(aad: ObjectAad<'_>) -> Vec<u8> {

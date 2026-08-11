@@ -1,9 +1,10 @@
 use rustfs_transfer_common::crypto::{
-    canonical_path_with_query, decode_base64, decode_hex, decrypt_aes256_gcm, encode_base64,
-    encode_hex_lower, encrypt_aes256_gcm, generate_nonce, object_aad, sha256_lower_hex,
-    sign_hmac_base64, verify_hmac_base64, CanonicalRequest, CryptoError, ObjectAad, QueryParam,
-    AES_GCM_NONCE_LEN,
+    canonical_path_with_query, center_signature_canonical_json, decode_base64, decode_hex,
+    decrypt_aes256_gcm, encode_base64, encode_hex_lower, encrypt_aes256_gcm, generate_nonce,
+    object_aad, sha256_lower_hex, sign_center_signature, sign_hmac_base64, verify_center_signature,
+    verify_hmac_base64, CanonicalRequest, CryptoError, ObjectAad, QueryParam, AES_GCM_NONCE_LEN,
 };
+use serde_json::json;
 
 #[test]
 fn sha256_returns_lowercase_hex() {
@@ -57,6 +58,57 @@ fn hmac_empty_body_uses_empty_byte_sha256() {
         request.body_sha256,
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     );
+}
+
+#[test]
+fn center_signature_covers_only_protocol_disk_and_key_references() {
+    let key = b"center-signature-key";
+    let mut disk_info = disk_info_for_center_signature();
+    let signature = sign_center_signature(key, &disk_info).unwrap();
+    disk_info["security"]["center_signature"] = json!(signature);
+
+    verify_center_signature(key, &disk_info).unwrap();
+    let canonical = center_signature_canonical_json(&disk_info).unwrap();
+    assert!(canonical.contains("\"protocol\""));
+    assert!(canonical.contains("\"disk\""));
+    assert!(canonical.contains("\"security\""));
+    assert!(!canonical.contains("\"center\""));
+    assert!(!canonical.contains("\"status\""));
+    assert!(!canonical.contains("\"edge\""));
+    assert!(!canonical.contains("\"manifest\""));
+    assert!(!canonical.contains("center_signature"));
+
+    for path in ["center", "status", "edge", "manifest"] {
+        let mut changed = disk_info.clone();
+        changed[path] = json!({"changed": true});
+        verify_center_signature(key, &changed).unwrap();
+    }
+}
+
+#[test]
+fn center_signature_rejects_any_covered_field_change() {
+    let key = b"center-signature-key";
+    let mut disk_info = disk_info_for_center_signature();
+    let signature = sign_center_signature(key, &disk_info).unwrap();
+    disk_info["security"]["center_signature"] = json!(signature);
+
+    for (path, value) in [
+        ("/protocol/name", json!("other-protocol")),
+        ("/protocol/version", json!("9.9.9")),
+        ("/disk/disk_id", json!("changed-disk")),
+        ("/disk/capacity_bytes", json!(2048)),
+        ("/security/center_key_id", json!("changed-center-key")),
+        ("/security/signature_alg", json!("OTHER")),
+        ("/security/data_key_id", json!("changed-data-key")),
+    ] {
+        let mut changed = disk_info.clone();
+        *changed.pointer_mut(path).expect("fixture field exists") = value;
+        assert_eq!(
+            verify_center_signature(key, &changed),
+            Err(CryptoError::CenterSignatureVerificationFailed),
+            "{path} must be covered"
+        );
+    }
 }
 
 #[test]
@@ -158,4 +210,53 @@ fn base64_hex_and_nonce_helpers_are_usable() {
     let second = generate_nonce();
     assert_eq!(first.len(), AES_GCM_NONCE_LEN);
     assert_ne!(first, second);
+}
+
+fn disk_info_for_center_signature() -> serde_json::Value {
+    json!({
+        "protocol": {
+            "name": "rustfs-offline-transfer",
+            "version": "1.0.0"
+        },
+        "disk": {
+            "disk_id": "disk-001",
+            "sn": "SN001",
+            "capacity_bytes": 1024,
+            "last_init_time": "2026-08-11T00:00:00Z",
+            "initialized_by": "center-a"
+        },
+        "center": {
+            "center_id": "center-a",
+            "import_job_id": "import-001",
+            "import_started_at": "2026-08-11T01:00:00Z",
+            "import_finished_at": "2026-08-11T01:01:00Z"
+        },
+        "edge": {
+            "edge_code": "edge-a",
+            "export_job_id": "export-001",
+            "seal_id": "seal-001"
+        },
+        "manifest": {
+            "manifest_path": "manifests/export_manifest.json",
+            "manifest_sha256_path": "manifests/export_manifest.sha256",
+            "object_count": 57,
+            "total_bytes": 951301462,
+            "manifest_sha256": "manifest-sha"
+        },
+        "security": {
+            "center_key_id": "center-key-001",
+            "data_key_id": "data-key-001",
+            "encryption_alg": "AES-256-GCM",
+            "signature_alg": "HMAC-SHA256",
+            "center_signature": ""
+        },
+        "status": {
+            "code": "IMPORTED",
+            "sealed": true,
+            "imported": true,
+            "reusable": true,
+            "last_error": null
+        },
+        "updated_at": "2026-08-11T01:01:00Z"
+    })
 }

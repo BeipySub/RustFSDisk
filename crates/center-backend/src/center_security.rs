@@ -1,14 +1,14 @@
-use std::{collections::BTreeMap, env};
+use std::env;
 
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use anyhow::{anyhow, bail, Context, Result};
 use rand::{rngs::OsRng, RngCore};
 use rustfs_transfer_common::crypto::{
-    decode_base64, decode_hex, encode_base64, generate_nonce, sha256_lower_hex, AES_GCM_TAG_LEN,
+    center_signature_canonical_json, decode_base64, decode_hex, encode_base64, generate_nonce,
+    sha256_lower_hex, sign_center_signature, verify_center_signature, AES_GCM_TAG_LEN,
 };
 use serde::Serialize;
-use serde_json::{json, Number, Value};
 use uuid::Uuid;
 
 use crate::config::SecurityConfig;
@@ -158,43 +158,15 @@ pub fn sign_disk_info_with_key<T: Serialize>(
     disk_info: &T,
     signature_key: &[u8],
 ) -> Result<String> {
-    let canonical = disk_info_canonical_json(disk_info)?;
-    Ok(rustfs_transfer_common::crypto::sign_string_hmac_base64(
-        signature_key,
-        &canonical,
-    ))
+    sign_center_signature(signature_key, disk_info).map_err(|err| anyhow!(err.to_string()))
 }
 
 pub fn verify_disk_info_with_key<T: Serialize>(disk_info: &T, signature_key: &[u8]) -> Result<()> {
-    let value = serde_json::to_value(disk_info)?;
-    let signature = value
-        .get("security")
-        .and_then(|security| security.get("center_signature"))
-        .and_then(Value::as_str)
-        .filter(|signature| !signature.trim().is_empty())
-        .ok_or_else(|| anyhow!("disk_info center_signature is missing"))?;
-    let expected = sign_disk_info_with_key(&value, signature_key)?;
-    if expected != signature {
-        bail!("disk_info center_signature verification failed");
-    }
-    Ok(())
+    verify_center_signature(signature_key, disk_info).map_err(|err| anyhow!(err.to_string()))
 }
 
 pub fn disk_info_canonical_json<T: Serialize>(disk_info: &T) -> Result<String> {
-    let value = serde_json::to_value(disk_info)?;
-    let security = value
-        .get("security")
-        .ok_or_else(|| anyhow!("disk_info.security is missing"))?;
-    let covered = json!({
-        "disk": value.get("disk").cloned().unwrap_or(Value::Null),
-        "protocol": value.get("protocol").cloned().unwrap_or(Value::Null),
-        "security": {
-            "center_key_id": security.get("center_key_id").cloned().unwrap_or(Value::Null),
-            "data_key_id": security.get("data_key_id").cloned().unwrap_or(Value::Null),
-            "signature_alg": security.get("signature_alg").cloned().unwrap_or(Value::Null),
-        }
-    });
-    Ok(canonical_json(&covered))
+    center_signature_canonical_json(disk_info).map_err(|err| anyhow!(err.to_string()))
 }
 
 pub fn disk_data_key_base64(key: &[u8; 32]) -> String {
@@ -228,42 +200,6 @@ fn data_key_aad(disk_id: Uuid, data_key_id: Uuid) -> String {
 fn decode_required_b64(value: Option<&str>, missing_message: &str) -> Result<Vec<u8>> {
     let value = value.ok_or_else(|| anyhow!(missing_message.to_string()))?;
     decode_base64(value).map_err(|error| anyhow!(error.to_string()))
-}
-
-fn canonical_json(value: &Value) -> String {
-    match value {
-        Value::Null => "null".to_string(),
-        Value::Bool(value) => value.to_string(),
-        Value::Number(number) => canonical_number(number),
-        Value::String(value) => serde_json::to_string(value).expect("string serialization"),
-        Value::Array(values) => format!(
-            "[{}]",
-            values
-                .iter()
-                .map(canonical_json)
-                .collect::<Vec<_>>()
-                .join(",")
-        ),
-        Value::Object(map) => {
-            let sorted = map.iter().collect::<BTreeMap<_, _>>();
-            format!(
-                "{{{}}}",
-                sorted
-                    .into_iter()
-                    .map(|(key, value)| format!(
-                        "{}:{}",
-                        serde_json::to_string(key).expect("key serialization"),
-                        canonical_json(value)
-                    ))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            )
-        }
-    }
-}
-
-fn canonical_number(number: &Number) -> String {
-    number.to_string()
 }
 
 pub fn signature_audit_context() -> &'static str {

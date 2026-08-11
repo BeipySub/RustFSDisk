@@ -760,6 +760,30 @@ mod tests {
     }
 
     #[test]
+    fn full_protocol_imported_signature_allows_reinitialize_preflight() {
+        let temp = TempDisk::new();
+        let disk_id = Uuid::new_v4();
+        let seal_id = Uuid::new_v4();
+        let old_key = Uuid::new_v4();
+        let disk_info = write_full_protocol_imported_disk(&temp, disk_id, seal_id, old_key);
+
+        crate::center_security::verify_disk_info_with_key(
+            &disk_info,
+            &security().center_signature_key_bytes(),
+        )
+        .unwrap();
+        validate_reinitialize_preflight(
+            &temp.path,
+            disk_id,
+            seal_id,
+            DiskStatusCode::Imported,
+            "ext4",
+            &security(),
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn signature_rejects_missing_wrong_signature_and_wrong_key_before_writing() {
         let temp = TempDisk::new();
         let disk_id = Uuid::new_v4();
@@ -821,7 +845,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_signature_requires_imported_shape_and_missing_updated_at() {
+    fn legacy_signature_ignores_updated_at_but_requires_imported_shape() {
         let temp = TempDisk::new();
         let disk_id = Uuid::new_v4();
         let seal_id = Uuid::new_v4();
@@ -837,7 +861,7 @@ mod tests {
             serde_json::to_vec_pretty(&with_updated_at).unwrap(),
         )
         .unwrap();
-        let error = validate_reinitialize_preflight(
+        validate_reinitialize_preflight(
             &temp.path,
             disk_id,
             seal_id,
@@ -845,10 +869,7 @@ mod tests {
             "ext4",
             &security(),
         )
-        .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("center_signature verification failed"));
+        .unwrap();
 
         let mut sealed = legacy_value;
         sealed["status"]["code"] = serde_json::Value::String("SEALED".to_string());
@@ -1359,6 +1380,71 @@ mod tests {
         disk_info.security.center_signature = String::new();
         disk_info.security.center_signature = security().sign_disk_info(&disk_info).unwrap();
         crate::reinitializer::write_disk_info(&temp.path, &disk_info).unwrap();
+    }
+
+    fn write_full_protocol_imported_disk(
+        temp: &TempDisk,
+        disk_id: Uuid,
+        seal_id: Uuid,
+        old_key: Uuid,
+    ) -> serde_json::Value {
+        let export_job_id = Uuid::new_v4();
+        let center_id = Uuid::new_v4();
+        let mut disk_info = serde_json::json!({
+            "protocol": {
+                "name": "rustfs-offline-transfer",
+                "version": "1.0.0"
+            },
+            "disk": {
+                "disk_id": disk_id,
+                "sn": "SN001",
+                "capacity_bytes": 1024,
+                "last_init_time": "2026-08-11T00:00:00Z",
+                "initialized_by": "center"
+            },
+            "center": {
+                "center_id": center_id,
+                "center_name": "center",
+                "import_job_id": Uuid::new_v4().to_string(),
+                "import_started_at": "2026-08-11T01:00:00Z",
+                "import_finished_at": "2026-08-11T01:01:00Z"
+            },
+            "edge": {
+                "edge_code": "edge-a",
+                "export_job_id": export_job_id,
+                "seal_id": seal_id
+            },
+            "manifest": {
+                "manifest_path": "manifests/export_manifest.json",
+                "manifest_sha256_path": "manifests/export_manifest.sha256",
+                "object_count": 0,
+                "total_bytes": 0,
+                "manifest_sha256": "manifest-sha"
+            },
+            "security": {
+                "center_key_id": security().center_key_id(),
+                "data_key_id": old_key,
+                "encryption_alg": "AES-256-GCM",
+                "signature_alg": SIGNATURE_ALG_HMAC_SHA256,
+                "center_signature": ""
+            },
+            "status": {
+                "code": "IMPORTED",
+                "sealed": true,
+                "imported": true,
+                "reusable": true,
+                "last_error": null
+            },
+            "updated_at": "2026-08-11T01:01:00Z"
+        });
+        disk_info["security"]["center_signature"] =
+            serde_json::Value::String(security().sign_disk_info(&disk_info).unwrap());
+        fs::write(
+            temp.root().join(DISK_INFO_FILE),
+            serde_json::to_vec_pretty(&disk_info).unwrap(),
+        )
+        .unwrap();
+        disk_info
     }
 
     fn sha256_hex(bytes: &[u8]) -> String {

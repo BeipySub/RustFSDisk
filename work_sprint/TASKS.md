@@ -120,6 +120,7 @@
 | TASK-S1-CENTER-HOTFIX-004 | Center reinitialize disk_info 失败原子性修补 | P0 解阻塞 | Center / Security | [x] | Day 2 VM 故障修补 | TASK-S1-P1-CENTER-REINIT-ADMISSION-006 |
 | TASK-S1-CENTER-HOTFIX-005 | Center 导入成功后 data_key 封盘生命周期绑定 | P0 解阻塞 | Center / DB | [x] | Day 2 真实导入修补 | TASK-S1-CENTER-004, TASK-S1-CENTER-005 |
 | TASK-S1-SECURITY-HOTFIX-006 | AES-GCM AAD 同源构造与全加密面审计 | P0 解阻塞 | Common / Edge / Center / Security | [x] | Day 3 审计修补 | TASK-S1-COMMON-002, TASK-S1-EDGE-005, TASK-S1-CENTER-004 |
+| TASK-S1-SECURITY-HOTFIX-007 | center_signature 同源签名/验签 API 与 reinitialize 分叉修复 | P0 解阻塞 | Common / Center / Edge / Security | [x] | Day 3 真实闭环阻塞修补 | TASK-S1-SECURITY-HOTFIX-006, TASK-S1-CENTER-005 |
 | TASK-S1-WEB-EDGE-001 | 边缘端 DashboardView、HTTP 汇总和 WS 进度展示 | P2 交付增强 | Web / Edge | [x] | Day 1-2 | TASK-S1-TEST-001 |
 | TASK-S1-WEB-CENTER-001 | 中控端 DashboardView、HTTP 汇总和 WS 进度展示 | P2 交付增强 | Web / Center | [x] | Day 1-2 | TASK-S1-TEST-001 |
 | TASK-S1-DASHBOARD-REALTIME-001 | 双端真实 Dashboard HTTP summary 与本端 WebSocket 推送 | P0 解阻塞 | Center / Edge / Web | [x] | Day 2 联调修补 | TASK-S1-WEB-EDGE-001, TASK-S1-WEB-CENTER-001 |
@@ -1540,6 +1541,55 @@
 - [x] Center ImportWorker 复算 manifest 对象 AAD，篡改 AAD 在解密前拒绝。
 - [x] 全加密面审计未发现整个 `center` 对象进入 `center_signature` 或其它签名/加密输入。
 - [x] 冻结文档未修改、未暂存。
+
+---
+
+# 开发任务卡片：TASK-S1-SECURITY-HOTFIX-007
+
+### 任务基本信息
+
+- **任务 ID**：TASK-S1-SECURITY-HOTFIX-007
+- **任务名称**：center_signature 同源签名/验签 API 与 reinitialize 分叉修复
+- **所属 Track / 模块**：
+  - [x] Track 1: Common (`crates/common`)
+  - [ ] Track 2: Edge (`crates/edge-backend`)
+  - [x] Track 3: Center (`crates/center-backend`)
+  - [ ] Track 4: Web
+- **任务状态**：[x] 开发完成
+- **负责人 / Role**：Codex 真实闭环阻塞修补窗口
+- **计划时间**：Day 3 真实闭环阻塞修补
+- **依赖任务**：TASK-S1-SECURITY-HOTFIX-006, TASK-S1-CENTER-005
+
+### 任务目标与范围
+
+- **核心目标**：修复真实闭环中同一 `IMPORTED` 盘在 Center 导入路径验签通过、但受控 reinitialize 前置验签失败的路径分叉；在 Common 抽出唯一 `center_signature` payload/canonicalize/sign/verify API，并迁移 Center 初始化、导入验签、清理/重初始化前验签和重新初始化签名路径复用该 API。
+- **对应代码位置**：`crates/common/src/crypto/mod.rs`、`crates/center-backend/src/center_security.rs`、`crates/center-backend/src/reinitializer.rs`、`crates/center-backend/src/reinitialize_runtime.rs`、相关测试。
+
+### 协议与数据结构约束
+
+- `center_signature` payload 只能覆盖 `protocol`、`disk`、`security.center_key_id`、`security.signature_alg`、`security.data_key_id`。
+- `center`、`status`、`edge`、`manifest`、`security.center_signature`、`updated_at` 均不属于签名覆盖字段。
+- Canonical JSON 使用 RFC 8785 语义，UTF-8 编码，签名为 HMAC-SHA256 标准 Base64。
+- 禁止各流程自行拼接 JSON、各自做局部过滤或跳过验签。
+
+### 安全与状态机边界
+
+- 本任务仅修改代码、测试、TASKS 与当天 dev log；不修改冻结文档，不部署 VM，不调用真实 API，不操作硬盘、数据库、RustFS 源对象、archive 或 object_ledger。
+- reinitialize 仍必须执行真实 `center_signature` 验签；修补目标是消除签名输入口径分叉，不是放宽或绕过验签。
+
+### 验收与检查清单
+
+- [x] Common 暴露唯一 `center_signature` payload/canonicalize/sign/verify API。
+- [x] Center 初始化、导入验签、清理/重初始化前验签、重新初始化签名路径均经 `CenterSecurity` 复用 Common API。
+- [x] 同一 `disk_info` 生成后可被导入路径与 reinitialize 前置验签共同验证。
+- [x] 修改 `center`、`status`、`edge`、`manifest` 等非覆盖字段不影响验签。
+- [x] 修改任一覆盖字段会导致验签失败。
+- [x] `center` 对象变化不影响验签。
+- [x] `cargo fmt --all -- --check` 通过。
+- [x] `cargo test -p rustfs-transfer-common` 通过。
+- [x] `cargo test -p rustfs-transfer-center` 通过。
+- [x] `cargo test -p rustfs-transfer-edge` 通过。
+- [x] 未修改 `docs/v1.0冻结/`，未部署、未调用真实 API、未操作硬盘或生产 SQL。
 
 ---
 
