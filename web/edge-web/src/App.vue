@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, provide, ref } from "vue";
 import DashboardView from "./views/DashboardView.vue";
 import SyncRecordsView from "./views/SyncRecordsView.vue";
 
@@ -32,6 +32,8 @@ function navigate(path: EdgeRoute) {
   window.history.pushState({}, "", path);
   currentPath.value = path;
 }
+
+provide("edgeNavigate", navigate);
 
 function handlePopState() {
   currentPath.value = normalizePath(window.location.pathname);

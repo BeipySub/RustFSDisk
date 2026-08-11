@@ -19,14 +19,34 @@
   --green: #12d983;
   --orange: #ffb22c;
   --red: #ff454d;
-  --line: rgb(110 150 188 / 28%);
-  --panel: linear-gradient(145deg, rgb(8 27 43 / 68%), rgb(1 12 23 / 76%));
+  --line: rgb(125 165 202 / 20%);
+  --panel: linear-gradient(145deg, rgb(8 27 43 / 50%), rgb(1 12 23 / 58%));
 }
 
 body {
   margin: 0;
   overflow: hidden;
   background: #01050a;
+}
+
+* {
+  scrollbar-color: rgb(31 160 255 / 54%) rgb(4 17 30 / 44%);
+  scrollbar-width: thin;
+}
+
+*::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+*::-webkit-scrollbar-track {
+  background: rgb(4 17 30 / 44%);
+  border-radius: 999px;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: linear-gradient(180deg, rgb(40 181 255 / 80%), rgb(6 88 168 / 72%));
+  border-radius: 999px;
 }
 
 button,
@@ -148,12 +168,12 @@ button:focus-visible {
 
 .glass-panel {
   background: var(--panel);
-  border: 1px solid rgb(102 146 187 / 34%);
+  border: 1px solid rgb(120 165 204 / 22%);
   border-radius: 8px;
   box-shadow:
-    inset 0 0 34px rgb(0 132 255 / 8%),
-    0 18px 48px rgb(0 0 0 / 30%);
-  backdrop-filter: blur(10px) saturate(128%);
+    inset 0 0 28px rgb(0 132 255 / 5%),
+    0 14px 38px rgb(0 0 0 / 24%);
+  backdrop-filter: blur(9px) saturate(118%);
 }
 
 .top-telemetry {
@@ -242,10 +262,13 @@ button:focus-visible {
   color: #d2dae4;
 }
 
-.source-meta button,
+.source-meta .records-shortcut,
 .records-title button,
 .dashboard-actions button,
 .record-controls button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   height: 38px;
   padding: 0 20px;
   color: #cdd9e5;
@@ -381,7 +404,7 @@ button:focus-visible {
 
 .nas-shell {
   position: absolute;
-  inset: 34px 0 0;
+  inset: 30px 0 0;
 }
 
 .nas-shell > img {
@@ -473,6 +496,16 @@ button:focus-visible {
   white-space: nowrap;
 }
 
+.disk-slot-matrix .slot-warning span,
+.disk-slot-matrix .slot-danger span,
+.disk-slot-matrix .slot-warning small,
+.disk-slot-matrix .slot-danger small {
+  line-height: 1.08;
+  overflow-wrap: anywhere;
+  text-overflow: clip;
+  white-space: normal;
+}
+
 .slot-success strong {
   color: var(--green);
 }
@@ -496,59 +529,28 @@ button:focus-visible {
   position: absolute;
   inset: 44.3% 22px auto;
   z-index: 23;
-  display: block;
-  height: 116px;
-  padding: 12px 18px 13px 20px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 18px;
+  align-items: center;
+  height: 88px;
+  padding: 12px 18px 12px 20px;
+}
+
+.selected-disk-strip.has-action {
+  grid-template-columns: minmax(0, 1fr) 168px;
 }
 
 .selected-disk-content {
   min-width: 0;
 }
 
-.selected-disk-head {
-  display: grid;
-  grid-template-columns: auto 78px minmax(0, 1fr);
-  gap: 12px;
-  align-items: center;
-  margin-bottom: 8px;
-}
-
-.selected-disk-head > strong {
-  min-width: 0;
-  overflow: hidden;
+.selected-disk-content > strong {
+  display: block;
+  margin-bottom: 7px;
   color: #e8eff6;
   font-size: 16px;
   font-weight: 700;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.selected-disk-head em {
-  min-width: 0;
-  overflow: hidden;
-  color: #adb9c5;
-  font-style: normal;
-  font-size: 13px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.remove-badge {
-  display: inline-flex;
-  justify-content: center;
-  align-items: center;
-  height: 24px;
-  color: #8f9ba6;
-  border: 1px solid rgb(133 151 169 / 42%);
-  border-radius: 4px;
-  font-size: 12px;
-  white-space: nowrap;
-}
-
-.remove-badge.ready {
-  color: var(--green);
-  border-color: rgb(18 217 131 / 56%);
-  background: rgb(18 217 131 / 10%);
 }
 
 .selected-disk-content dl {
@@ -583,87 +585,20 @@ button:focus-visible {
   white-space: nowrap;
 }
 
-.disk-timeline {
-  display: grid;
-  grid-template-columns: repeat(9, minmax(0, 1fr));
-  gap: 0;
-  padding: 0;
-  margin: 10px 0 0;
-  list-style: none;
-}
-
-.disk-timeline li {
-  position: relative;
-  display: grid;
-  justify-items: center;
-  gap: 5px;
-  min-width: 0;
-  color: #75818d;
-  font-size: 12px;
-  text-align: center;
-}
-
-.disk-timeline li::before {
-  position: absolute;
-  top: 6px;
-  right: 50%;
-  left: -50%;
-  height: 1px;
-  content: "";
-  background: rgb(101 132 162 / 36%);
-}
-
-.disk-timeline li:first-child::before {
-  display: none;
-}
-
-.disk-timeline i {
-  position: relative;
-  z-index: 1;
-  width: 13px;
-  height: 13px;
-  background: #273746;
-  border: 1px solid rgb(138 163 188 / 42%);
-  border-radius: 50%;
-}
-
-.disk-timeline span {
-  max-width: 100%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.timeline-done,
-.timeline-active {
-  color: #cfe6f7 !important;
-}
-
-.timeline-done i {
-  background: var(--green);
-  border-color: var(--green);
-  box-shadow: 0 0 12px rgb(18 217 131 / 56%);
-}
-
-.timeline-active i {
-  background: var(--cyan-2);
-  border-color: var(--cyan-2);
-  box-shadow: 0 0 14px rgb(19 188 255 / 78%);
-}
-
-.timeline-error {
-  color: var(--red) !important;
-}
-
-.timeline-error i {
-  background: var(--red);
-  border-color: var(--red);
-  box-shadow: 0 0 14px rgb(255 69 77 / 68%);
+.readonly-action {
+  height: 48px;
+  color: #dce5ee;
+  background: rgb(12 28 46 / 74%);
+  border: 1px solid rgb(132 159 188 / 58%);
+  border-radius: 6px;
+  font-size: 16px;
+  letter-spacing: 0;
+  box-shadow: inset 0 0 18px rgb(255 255 255 / 5%);
 }
 
 .global-progress {
   position: absolute;
-  inset: 55.9% 22px auto;
+  inset: 53.1% 22px auto;
   z-index: 20;
   display: grid;
   grid-template-columns: 142px minmax(0, 1fr);
@@ -680,7 +615,7 @@ button:focus-visible {
 .global-progress strong {
   display: block;
   color: var(--cyan);
-  font-size: 38px;
+  font-size: 36px;
   line-height: 1;
 }
 
@@ -691,6 +626,14 @@ button:focus-visible {
 .global-progress em {
   color: #a9b3bd;
   font-style: normal;
+}
+
+.global-progress.idle {
+  grid-template-columns: 132px minmax(0, 1fr);
+}
+
+.global-progress.idle strong {
+  color: #7f8d99;
 }
 
 .progress-main {
@@ -727,6 +670,18 @@ button:focus-visible {
   white-space: nowrap;
 }
 
+.progress-main.idle-copy {
+  display: grid;
+  grid-template-rows: auto auto;
+  align-content: center;
+  gap: 9px;
+}
+
+.progress-main.idle-copy p {
+  color: #d3dde6;
+  font-size: 14px;
+}
+
 .progress-main b {
   color: var(--cyan-2);
   font-weight: 500;
@@ -734,7 +689,7 @@ button:focus-visible {
 
 .progress-track {
   height: 7px;
-  margin: 9px 0 12px;
+  margin: 7px 0 10px;
   overflow: hidden;
   background: #203447;
   border-radius: 999px;
@@ -758,7 +713,7 @@ dd {
 .dashboard-grid,
 .dashboard-lower-grid {
   position: absolute;
-  inset: 67.2% 22px 12px;
+  inset: 64.1% 22px 12px;
   z-index: 18;
   display: grid;
   grid-template-columns: 34.2% minmax(0, 1fr);
@@ -766,7 +721,7 @@ dd {
 }
 
 .dashboard-lower-grid.compact {
-  inset: 70% 22px 12px;
+  inset: 61.2% 22px 12px;
 }
 
 .dashboard-grid article,
@@ -778,7 +733,7 @@ dd {
 
 .dashboard-grid h2,
 .dashboard-lower-grid h2 {
-  margin-bottom: 10px;
+  margin-bottom: 8px;
   font-size: 18px;
   font-weight: 650;
   color: #e2eaf2;
@@ -835,11 +790,11 @@ dd {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
   gap: 0;
-  margin-bottom: 14px;
+  margin-bottom: 10px;
 }
 
 .metric-strip div {
-  padding: 0 13px;
+  padding: 0 10px;
   border-left: 1px solid rgb(118 148 177 / 24%);
 }
 
@@ -849,9 +804,9 @@ dd {
 }
 
 .metric-strip dd {
-  margin: 5px 0 3px;
+  margin: 4px 0 2px;
   color: var(--cyan);
-  font-size: 17px;
+  font-size: 16px;
 }
 
 .metric-strip small {
@@ -861,11 +816,11 @@ dd {
 .check-list {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 10px 24px;
+  gap: 8px 20px;
   padding: 0;
   margin: 0;
   color: #c9d4de;
-  font-size: 14px;
+  font-size: 13px;
   list-style: none;
 }
 
@@ -883,6 +838,7 @@ dd {
 
 .dashboard-actions i,
 .records-note i,
+.records-inline-error i,
 .drawer-note i {
   display: inline-grid;
   flex: 0 0 auto;
@@ -897,27 +853,40 @@ dd {
   box-shadow: 0 0 14px rgb(0 139 255 / 55%);
 }
 
+.records-inline-error {
+  position: absolute;
+  top: 246px;
+  right: 30px;
+  left: 940px;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  height: 38px;
+  padding: 0 14px;
+  color: #d5dee7;
+}
+
 .warning-cards {
   display: grid;
   grid-template-columns: repeat(5, 1fr);
-  gap: 8px;
-  margin-bottom: 10px;
+  gap: 7px;
+  margin-bottom: 8px;
 }
 
 .warning-cards span {
   display: grid;
   place-items: center;
   align-content: center;
-  height: 58px;
+  height: 54px;
   color: #e8edf2;
   border: 1px solid rgb(255 178 44 / 70%);
   border-radius: 4px;
-  font-size: 13px;
+  font-size: 12px;
 }
 
 .warning-cards b {
   color: var(--orange);
-  font-size: 24px;
+  font-size: 22px;
 }
 
 .warning-cards .danger {
@@ -937,11 +906,11 @@ dd {
 
 .runtime-table button {
   display: grid;
-  grid-template-columns: 40px 1fr 92px 90px 80px;
-  gap: 8px;
+  grid-template-columns: 34px 1fr 74px 84px 74px;
+  gap: 7px;
   align-items: center;
   min-width: 0;
-  height: 24px;
+  height: 23px;
   padding: 0 6px;
   color: #aab6c3;
   text-align: left;
@@ -971,8 +940,8 @@ dd {
 .object-panel dl {
   display: grid;
   grid-template-columns: 112px minmax(0, 1fr);
-  gap: 9px 16px;
-  font-size: 13px;
+  gap: 6px 14px;
+  font-size: 12px;
 }
 
 .object-panel dd {
@@ -984,7 +953,7 @@ dd {
 
 .object-progress {
   width: 48%;
-  margin: 8px 0 0 36%;
+  margin: 5px 0 0 36%;
 }
 
 .object-percent {
@@ -1067,14 +1036,14 @@ dd {
 .dashboard-actions {
   position: absolute;
   right: 22px;
-  bottom: 16px;
+  bottom: 15px;
   left: 22px;
   z-index: 22;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 300px 280px 250px;
+  grid-template-columns: minmax(0, 1fr) 300px 280px 230px;
   gap: 12px;
   align-items: center;
-  height: 60px;
+  height: 58px;
   padding: 0 20px;
 }
 
@@ -1116,8 +1085,8 @@ dd {
 
 .records-title {
   position: absolute;
-  top: 68px;
-  right: 44px;
+  top: 66px;
+  right: 30px;
   left: 18px;
   z-index: 8;
   display: grid;
@@ -1142,7 +1111,7 @@ dd {
 
 .record-summary {
   position: absolute;
-  top: 140px;
+  top: 136px;
   right: 44px;
   left: 16px;
   z-index: 8;
@@ -1153,10 +1122,10 @@ dd {
 
 .record-summary .summary-card {
   display: grid;
-  grid-template-columns: 74px 1fr;
+  grid-template-columns: 62px 1fr;
   align-items: center;
-  height: 92px;
-  padding: 0 30px;
+  height: 88px;
+  padding: 0 26px;
   color: #dfe7ee;
   text-align: left;
   background: var(--panel);
@@ -1166,8 +1135,8 @@ dd {
 
 .record-summary img {
   grid-row: 1 / 3;
-  width: 46px;
-  height: 46px;
+  width: 42px;
+  height: 42px;
   object-fit: contain;
   filter: drop-shadow(0 0 12px rgb(0 139 255 / 38%));
 }
@@ -1179,24 +1148,24 @@ dd {
 
 .record-summary span {
   grid-column: 2;
-  font-size: 19px;
+  font-size: 18px;
 }
 
 .record-summary strong {
   grid-column: 2;
   color: var(--cyan);
-  font-size: 36px;
+  font-size: 34px;
   line-height: 1;
 }
 
 .record-controls {
   position: absolute;
-  top: 248px;
+  top: 240px;
   left: 16px;
   z-index: 8;
   display: grid;
-  grid-template-columns: 236px 360px 380px;
-  gap: 22px;
+  grid-template-columns: 236px 330px 360px;
+  gap: 20px;
   align-items: center;
 }
 
@@ -1232,28 +1201,29 @@ dd {
 
 .records-table {
   position: absolute;
-  top: 304px;
+  top: 296px;
   bottom: 22px;
   left: 16px;
   z-index: 8;
   display: flex;
   flex-direction: column;
-  width: 65.2%;
+  width: calc(100% - 490px);
   overflow: hidden;
 }
 
 .table-head,
 .record-row {
   display: grid;
-  grid-template-columns: 82px 120px 116px 88px 86px 55px minmax(92px, 1fr) 70px;
-  gap: 8px;
+  grid-template-columns: 112px 132px 116px 122px 92px 60px minmax(118px, 1fr) 82px;
+  gap: 6px;
   align-items: center;
-  min-height: 54px;
-  padding: 0 12px;
+  min-height: 52px;
+  padding: 0 10px;
+  font-size: 14px;
 }
 
 .table-head {
-  flex: 0 0 50px;
+  flex: 0 0 48px;
   color: #a8b3bf;
   background: rgb(13 31 47 / 64%);
   border-bottom: 1px solid var(--line);
@@ -1282,6 +1252,11 @@ dd {
   white-space: nowrap;
 }
 
+.record-row strong,
+.record-row .detail-link {
+  font-weight: 650;
+}
+
 .record-row i {
   display: inline-block;
   width: 9px;
@@ -1301,9 +1276,46 @@ dd {
   text-align: center;
 }
 
+.disk-slot-matrix .empty-result {
+  grid-column: 1 / -1;
+  align-self: center;
+  justify-self: center;
+  width: 46%;
+  min-width: 230px;
+  padding: 8px 14px;
+  color: #a3b0bc;
+  line-height: 1.45;
+  text-shadow: 0 2px 10px rgb(0 0 0 / 90%);
+  background: rgb(2 9 16 / 42%);
+  border: 1px solid rgb(90 125 155 / 22%);
+  border-radius: 6px;
+}
+
+.disk-slot-matrix .empty-result strong,
+.disk-slot-matrix .empty-result span {
+  display: block;
+}
+
+.disk-slot-matrix .empty-result strong {
+  color: #d6e0e8;
+  font-size: 13px;
+}
+
+.disk-slot-matrix .empty-result span {
+  margin-top: 2px;
+  font-size: 11px;
+}
+
+.object-empty {
+  margin-top: 14px;
+  color: #a6b2be;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
 .records-pagination {
   display: flex;
-  flex: 1 0 52px;
+  flex: 1 0 48px;
   align-items: center;
   justify-content: space-between;
   padding: 0 18px;
@@ -1336,12 +1348,12 @@ dd {
 
 .record-drawer {
   position: absolute;
-  top: 304px;
-  right: 44px;
+  top: 296px;
+  right: 30px;
   bottom: 22px;
   z-index: 9;
-  width: 30.2%;
-  padding: 18px 20px;
+  width: 430px;
+  padding: 18px 18px;
   overflow: hidden auto;
 }
 
@@ -1375,8 +1387,8 @@ dd {
 
 .drawer-overview {
   display: grid;
-  grid-template-columns: 150px minmax(0, 1fr);
-  gap: 13px 18px;
+  grid-template-columns: 142px minmax(0, 1fr);
+  gap: 12px 16px;
 }
 
 .drawer-overview dd {
@@ -1401,8 +1413,8 @@ dd {
 
 .drawer-disk-list p {
   display: grid;
-  grid-template-columns: 88px 70px minmax(0, 1fr);
-  gap: 12px;
+  grid-template-columns: 92px 74px minmax(0, 1fr);
+  gap: 10px;
   color: #cfd7df;
 }
 
@@ -1432,7 +1444,7 @@ dd {
 
 .records-note {
   position: absolute;
-  right: 44px;
+  right: 30px;
   bottom: 26px;
   left: 16px;
   z-index: 8;

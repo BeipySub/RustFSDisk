@@ -18,13 +18,6 @@ import {
 } from "../ws/edgeCopyProgress";
 
 type EdgeRoute = "/dashboard" | "/sync-records";
-type TimelineNodeState = "done" | "active" | "waiting" | "error";
-
-interface DiskTimelineNode {
-  key: string;
-  label: string;
-  state: TimelineNodeState;
-}
 
 function emptySummary(): EdgeDashboardSummary {
   const now = new Date().toISOString();
@@ -105,17 +98,6 @@ const selectedSlotLabel = computed(() => (selectedDiskIndex.value >= 0 ? String(
 const selectedDiskTitle = computed(() =>
   selectedDisk.value ? `选中磁盘详情（盘位 ${selectedSlotLabel.value}）` : "选中磁盘详情（未选中）",
 );
-const selectedTimeline = computed(() => diskTimeline(selectedDisk.value, viewSummary.value));
-const selectedCanRemove = computed(() => (selectedDisk.value ? canRemoveDisk(selectedDisk.value) : false));
-const selectedDiskNotice = computed(() => {
-  const disk = selectedDisk.value;
-  if (!disk) return "等待 Edge 后端检测运输盘";
-  if (disk.runtime_status === "ERROR" || disk.runtime_status === "REJECTED") {
-    return `${disk.last_error_code ?? "EDGE_DISK_ERROR"}：${disk.error_message ?? disk.message}`;
-  }
-  if (selectedCanRemove.value) return "封盘完成，可拔盘";
-  return disk.message || "等待后端更新";
-});
 const selectedDiskFreeLabel = computed(() => {
   const disk = selectedDisk.value;
   if (!disk) return "未返回";
@@ -186,12 +168,6 @@ const exportStatusNotice = computed(() => {
   if (isEmpty.value) return "未检测到运输盘；插入未注册盘或异常盘后会显示在盘位区。";
   return "运输盘已被探测，但当前没有运行中的导出任务。";
 });
-const scanCapacityLabel = computed(() =>
-  `${formatBytes(viewSummary.value.scan.scanned_bytes)} / ${viewSummary.value.scan.stable_object_count.toLocaleString()} 稳定对象`,
-);
-const scanObjectLabel = computed(() =>
-  `${viewSummary.value.scan.scanned_object_count.toLocaleString()} 对象 · ${viewSummary.value.scan.scanned_bucket_count.toLocaleString()} bucket`,
-);
 
 watch(
   () => disks.value.map((disk) => disk.disk_id).join("|"),
@@ -273,62 +249,6 @@ function diskTone(disk: EdgeDiskProgress): string {
   if (disk.runtime_status === "REMOVED") return "removed";
   if (disk.runtime_status === "ERROR") return "danger";
   return "muted";
-}
-
-function diskTimeline(
-  disk: EdgeDiskProgress | null,
-  currentSummary: EdgeDashboardSummary,
-): DiskTimelineNode[] {
-  const hasDisk = Boolean(disk);
-  const runtimeStatus = disk?.runtime_status;
-  const diskStatusCode = disk?.disk_status_code;
-  const exportJobStatus = currentSummary.export_job_status;
-  const lastEventType = disk?.last_event_type;
-  const isScanActive =
-    currentSummary.scan.scan_event_type === "SCAN_STARTED" ||
-    currentSummary.scan.scan_event_type === "SCAN_PROGRESS" ||
-    exportJobStatus === "SCANNING";
-  const isScanDone = currentSummary.scan.scan_event_type === "SCAN_DONE" || isActiveExportJobStatus(exportJobStatus) || exportJobStatus === "SEALED";
-  const isCopyActive =
-    runtimeStatus === "COPYING" ||
-    exportJobStatus === "COPYING" ||
-    lastEventType === "COPY_STARTED" ||
-    lastEventType === "COPY_PROGRESS";
-  const isCopyDone = lastEventType === "COPY_DONE" || lastEventType === "SEAL_DONE" || exportJobStatus === "SEALING" || exportJobStatus === "SEALED";
-  const isSealed = lastEventType === "SEAL_DONE" || canRemoveDisk(disk);
-  const hasError = runtimeStatus === "ERROR" || runtimeStatus === "REJECTED";
-
-  const node = (key: string, label: string, state: TimelineNodeState): DiskTimelineNode => ({
-    key,
-    label,
-    state: hasError && (state === "active" || state === "waiting") ? "error" : state,
-  });
-
-  return [
-    node("detected", "已检测", hasDisk ? "done" : "waiting"),
-    node("checking", "校验中", runtimeStatus === "CHECKING" ? "active" : hasDisk && runtimeStatus !== "DETECTED" ? "done" : "waiting"),
-    node(
-      "authorized",
-      "已授权",
-      runtimeStatus === "READY" || runtimeStatus === "COPYING" || runtimeStatus === "DONE" || diskStatusCode === "INITIALIZED" || diskStatusCode === "EDGE_COPYING" || diskStatusCode === "SEALED"
-        ? "done"
-        : "waiting",
-    ),
-    node("scanning", "扫描 RustFS", isScanActive ? "active" : isScanDone ? "done" : "waiting"),
-    node("assigned", "分配对象", exportJobStatus === "PENDING" && isScanDone ? "active" : isCopyActive || isCopyDone ? "done" : "waiting"),
-    node("copying", "写盘中", isCopyActive ? "active" : isCopyDone ? "done" : "waiting"),
-    node("manifest", "生成清单", exportJobStatus === "SEALING" || lastEventType === "COPY_DONE" ? "active" : isSealed ? "done" : "waiting"),
-    node("sealed", "封盘完成", isSealed ? "done" : "waiting"),
-    node("removable", "可拔盘", canRemoveDisk(disk) ? "done" : "waiting"),
-  ];
-}
-
-function canRemoveDisk(disk: EdgeDiskProgress | null): boolean {
-  return Boolean(
-    disk &&
-      (disk.last_event_type === "SEAL_DONE" ||
-        (disk.disk_status_code === "SEALED" && disk.runtime_status === "DONE")),
-  );
 }
 
 function formatBytes(bytes: number): string {
@@ -455,35 +375,59 @@ onBeforeUnmount(() => progressSocket?.close());
       </div>
     </section>
 
+    <section v-if="false" :class="['global-progress', 'glass-panel', { idle: !hasCurrentExport }]">
+      <div>
+        <span>{{ exportStatusTitle }}</span>
+        <strong v-if="hasCurrentExport">{{ globalProgressPercent.toFixed(0) }}<small>%</small></strong>
+        <strong v-else>--<small></small></strong>
+        <em>{{ hasCurrentExport ? viewSummary.export_job_status : "IDLE" }}</em>
+      </div>
+      <div v-if="hasCurrentExport" class="progress-main">
+        <p>
+          <span>已完成 <b>{{ formatBytes(viewSummary.global_progress.done_bytes) }}</b> / {{ formatBytes(viewSummary.global_progress.total_bytes) }}</span>
+          <span>剩余 <b>{{ formatBytes(viewSummary.global_progress.remaining_bytes) }}</b></span>
+          <span>速度 <b>{{ formatSpeed(viewSummary.global_progress.speed_bytes_per_sec) }}</b></span>
+        </p>
+        <div class="progress-track"><b :style="{ width: `${globalProgressPercent}%` }"></b></div>
+        <dl>
+          <div><dt>文件</dt><dd>{{ viewSummary.global_progress.object_total.toLocaleString() }}</dd></div>
+          <div><dt>对象</dt><dd>{{ viewSummary.global_progress.object_done.toLocaleString() }}</dd></div>
+          <div><dt>批次</dt><dd>{{ viewSummary.export_job_id || "暂无" }}</dd></div>
+          <div><dt>预计完成</dt><dd>{{ estimatedDone }}</dd></div>
+        </dl>
+      </div>
+      <div v-else class="progress-main idle-copy">
+        <p>{{ exportStatusNotice }}</p>
+        <dl>
+          <div><dt>现场盘位</dt><dd>{{ disks.length }} 盘位</dd></div>
+          <div><dt>未注册盘</dt><dd>会展示</dd></div>
+          <div><dt>历史批次</dt><dd>同步记录</dd></div>
+          <div><dt>浏览器权限</dt><dd>只读</dd></div>
+        </dl>
+      </div>
+    </section>
+
     <section
       v-if="selectedDisk"
       :class="['selected-disk-strip', 'glass-panel', { 'has-action': showRecoveryCheckAction }]"
       aria-label="选中磁盘详情"
     >
       <div class="selected-disk-content">
-        <div class="selected-disk-head">
-          <strong>{{ selectedDiskTitle }}</strong>
-          <span :class="['remove-badge', selectedCanRemove ? 'ready' : 'waiting']">{{ selectedCanRemove ? "可拔盘" : "不可拔盘" }}</span>
-          <em>{{ selectedDiskNotice }}</em>
-        </div>
-        <div class="selected-disk-main">
-          <dl>
-            <div><dt>disk_id</dt><dd>{{ selectedDisk?.disk_id ?? "未返回" }}</dd></div>
-            <div><dt>mount_path</dt><dd>{{ selectedDisk?.mount_path ?? "未返回" }}</dd></div>
-            <div><dt>disk_sn</dt><dd>{{ selectedDisk?.disk_sn ?? "未返回" }}</dd></div>
-            <div><dt>filesystem</dt><dd>{{ selectedDisk?.filesystem ?? "未返回" }}</dd></div>
-            <div><dt>runtime_status</dt><dd class="tone-running">{{ selectedDisk?.runtime_status ?? "未返回" }}</dd></div>
-            <div><dt>disk_status_code</dt><dd class="tone-running">{{ diskStatusDisplay(selectedDisk?.disk_status_code) }}</dd></div>
-            <div><dt>object_budget_bytes</dt><dd>{{ formatBytes(selectedDisk?.total_bytes ?? 0) }}</dd></div>
-            <div><dt>free_bytes</dt><dd>{{ selectedDiskFreeLabel }}</dd></div>
-          </dl>
-          <ol class="disk-timeline" aria-label="选中盘时间线">
-            <li v-for="node in selectedTimeline" :key="node.key" :class="`timeline-${node.state}`">
-              <i></i><span>{{ node.label }}</span>
-            </li>
-          </ol>
-        </div>
+        <strong>{{ selectedDiskTitle }}</strong>
+        <dl>
+          <div><dt>disk_id</dt><dd>{{ selectedDisk?.disk_id ?? "未返回" }}</dd></div>
+          <div><dt>mount_path</dt><dd>{{ selectedDisk?.mount_path ?? "未返回" }}</dd></div>
+          <div><dt>disk_sn</dt><dd>{{ selectedDisk?.disk_sn ?? "未返回" }}</dd></div>
+          <div><dt>filesystem</dt><dd>{{ selectedDisk?.filesystem ?? "未返回" }}</dd></div>
+          <div><dt>runtime_status</dt><dd class="tone-running">{{ selectedDisk?.runtime_status ?? "未返回" }}</dd></div>
+          <div><dt>disk_status_code</dt><dd class="tone-running">{{ diskStatusDisplay(selectedDisk?.disk_status_code) }}</dd></div>
+          <div><dt>object_budget_bytes</dt><dd>{{ formatBytes(selectedDisk?.total_bytes ?? 0) }}</dd></div>
+          <div><dt>free_bytes</dt><dd>{{ selectedDiskFreeLabel }}</dd></div>
+        </dl>
       </div>
+      <button v-if="showRecoveryCheckAction" class="readonly-action" type="button" disabled title="恢复检查由 Edge 后端受控执行，浏览器不直接调用">
+        执行恢复检查
+      </button>
     </section>
 
     <section v-if="hasCurrentExport" class="global-progress glass-panel" aria-label="导出任务总进度">
@@ -500,7 +444,7 @@ onBeforeUnmount(() => progressSocket?.close());
         </p>
         <div class="progress-track"><b :style="{ width: `${globalProgressPercent}%` }"></b></div>
         <dl>
-          <div><dt>扫描态</dt><dd>{{ viewSummary.scan.scan_event_type }}</dd></div>
+          <div><dt>扫描字节</dt><dd>{{ formatBytes(viewSummary.scan.scanned_bytes) }} / {{ formatBytes(viewSummary.global_progress.total_bytes) }}</dd></div>
           <div><dt>跳过对象</dt><dd>{{ viewSummary.scan.skipped_object_count.toLocaleString() }}（{{ skippedObjectPercent.toFixed(2) }}%）</dd></div>
           <div><dt>批次</dt><dd>{{ viewSummary.export_job_id || "暂无" }}</dd></div>
           <div><dt>预计完成</dt><dd>{{ estimatedDone }}</dd></div>
@@ -515,8 +459,8 @@ onBeforeUnmount(() => progressSocket?.close());
           <div><dt>已发现对象</dt><dd>{{ viewSummary.scan.scanned_object_count.toLocaleString() }}</dd></div>
           <div><dt>已导出对象</dt><dd>{{ viewSummary.global_progress.object_done.toLocaleString() }}</dd></div>
           <div><dt>导出进度</dt><dd>{{ exportedObjectPercent.toFixed(2) }}%</dd></div>
-          <div><dt>扫描容量</dt><dd>{{ scanCapacityLabel }}</dd></div>
-          <div><dt>扫描范围</dt><dd>{{ scanObjectLabel }}</dd></div>
+          <div><dt>扫描字节</dt><dd>{{ formatBytes(viewSummary.scan.scanned_bytes) }}</dd></div>
+          <div><dt>导出字节</dt><dd>{{ formatBytes(viewSummary.global_progress.done_bytes) }}</dd></div>
           <div><dt>跳过对象</dt><dd>{{ viewSummary.scan.skipped_object_count.toLocaleString() }}（{{ skippedObjectPercent.toFixed(2) }}%）</dd></div>
         </dl>
       </article>
@@ -554,38 +498,6 @@ onBeforeUnmount(() => progressSocket?.close());
           <span><b>{{ otherWarningDisks }}</b><em>其他告警</em><small>硬盘</small></span>
         </div>
       </article>
-    </section>
-
-    <section v-if="false" :class="['global-progress', 'glass-panel', { idle: !hasCurrentExport }]">
-      <div>
-        <span>{{ exportStatusTitle }}</span>
-        <strong v-if="hasCurrentExport">{{ globalProgressPercent.toFixed(0) }}<small>%</small></strong>
-        <strong v-else>--<small></small></strong>
-        <em>{{ hasCurrentExport ? viewSummary.export_job_status : "IDLE" }}</em>
-      </div>
-      <div v-if="hasCurrentExport" class="progress-main">
-        <p>
-          <span>已完成 <b>{{ formatBytes(viewSummary.global_progress.done_bytes) }}</b> / {{ formatBytes(viewSummary.global_progress.total_bytes) }}</span>
-          <span>剩余 <b>{{ formatBytes(viewSummary.global_progress.remaining_bytes) }}</b></span>
-          <span>速度 <b>{{ formatSpeed(viewSummary.global_progress.speed_bytes_per_sec) }}</b></span>
-        </p>
-        <div class="progress-track"><b :style="{ width: `${globalProgressPercent}%` }"></b></div>
-        <dl>
-          <div><dt>文件</dt><dd>{{ viewSummary.global_progress.object_total.toLocaleString() }}</dd></div>
-          <div><dt>对象</dt><dd>{{ viewSummary.global_progress.object_done.toLocaleString() }}</dd></div>
-          <div><dt>批次</dt><dd>{{ viewSummary.export_job_id || "暂无" }}</dd></div>
-          <div><dt>预计完成</dt><dd>{{ estimatedDone }}</dd></div>
-        </dl>
-      </div>
-      <div v-else class="progress-main idle-copy">
-        <p>{{ exportStatusNotice }}</p>
-        <dl>
-          <div><dt>现场盘位</dt><dd>{{ disks.length }} 盘位</dd></div>
-          <div><dt>未注册盘</dt><dd>会展示</dd></div>
-          <div><dt>历史批次</dt><dd>同步记录</dd></div>
-          <div><dt>浏览器权限</dt><dd>只读</dd></div>
-        </dl>
-      </div>
     </section>
 
     <section v-if="false" class="dashboard-grid">

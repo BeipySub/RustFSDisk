@@ -80,8 +80,6 @@ export interface EdgeDiskProgress {
   object_done: number;
   object_remaining: number;
   current_object: EdgeCurrentObject | null;
-  last_event_type?: string;
-  last_event_time?: string;
   last_error_code?: string;
   error_message?: string;
   message: string;
@@ -493,7 +491,6 @@ function isNormalizedDashboardSummary(
 export function normalizeDiskProgress(disk: EdgeDiskProgress): EdgeDiskProgress {
   return {
     ...disk,
-    disk_id: disk.disk_id || disk.mount_path || disk.disk_sn || "unidentified-disk",
     disk_status_code: visibleDiskStatusCode(disk.disk_status_code),
     runtime_status: runtimeStatus(disk.runtime_status, "DETECTED"),
     current_object: normalizeCurrentObject(disk.current_object),
@@ -509,7 +506,7 @@ export function visibleDiskStatusCode(
 }
 
 export function diskStatusDisplay(value: EdgeVisibleDiskStatusCode | undefined): string {
-  return value ?? "中控侧状态，Edge 不展示";
+  return value ?? "未返回";
 }
 
 export function isActiveExportJobStatus(value: ExportJobStatus | undefined): boolean {
@@ -584,17 +581,17 @@ function normalizeObjectStatusCounts(
 
 function normalizeGlobalProgress(
   value: Partial<EdgeGlobalProgress> | undefined,
-  fallback: EdgeGlobalProgress,
+  defaultValue: EdgeGlobalProgress,
 ): EdgeGlobalProgress {
-  const totalBytes = numberValue(value?.total_bytes, fallback.total_bytes);
-  const doneBytes = numberValue(value?.done_bytes, fallback.done_bytes);
-  const objectTotal = numberValue(value?.object_total, fallback.object_total);
-  const objectDone = numberValue(value?.object_done, fallback.object_done);
+  const totalBytes = numberValue(value?.total_bytes, defaultValue.total_bytes);
+  const doneBytes = numberValue(value?.done_bytes, defaultValue.done_bytes);
+  const objectTotal = numberValue(value?.object_total, defaultValue.object_total);
+  const objectDone = numberValue(value?.object_done, defaultValue.object_done);
   return {
     total_bytes: totalBytes,
     done_bytes: doneBytes,
     remaining_bytes: numberValue(value?.remaining_bytes, Math.max(0, totalBytes - doneBytes)),
-    speed_bytes_per_sec: numberValue(value?.speed_bytes_per_sec, fallback.speed_bytes_per_sec),
+    speed_bytes_per_sec: numberValue(value?.speed_bytes_per_sec, defaultValue.speed_bytes_per_sec),
     object_total: objectTotal,
     object_done: objectDone,
     object_remaining: numberValue(value?.object_remaining, Math.max(0, objectTotal - objectDone)),
@@ -651,23 +648,23 @@ async function getJson<T>(path: string): Promise<T> {
   }
 }
 
-function envValue(key: string, fallback: string): string {
+function envValue(key: string, defaultPath: string): string {
   return localEdgePath(
     (import.meta as unknown as { env?: Record<string, string | undefined> }).env?.[key],
-    fallback,
+    defaultPath,
   );
 }
 
-export function localEdgePath(value: string | undefined, fallback: string): string {
+export function localEdgePath(value: string | undefined, defaultPath: string): string {
   const trimmed = value?.trim();
-  if (!trimmed || trimmed.startsWith("//")) return fallback;
+  if (!trimmed || trimmed.startsWith("//")) return defaultPath;
 
   try {
     const url = new URL(trimmed, browserOrigin());
-    if (url.origin !== browserOrigin()) return fallback;
+    if (url.origin !== browserOrigin()) return defaultPath;
     return url.pathname + url.search;
   } catch {
-    return fallback;
+    return defaultPath;
   }
 }
 
@@ -687,30 +684,30 @@ function edgeStatus(value: string | undefined): EdgeStatus | undefined {
 
 function exportJobStatus<T extends ExportJobStatus | undefined>(
   value: string | undefined,
-  fallback: T,
+  defaultStatus: T,
 ): ExportJobStatus | T {
-  return exportJobStatuses.includes(value as ExportJobStatus) ? (value as ExportJobStatus) : fallback;
+  return exportJobStatuses.includes(value as ExportJobStatus) ? (value as ExportJobStatus) : defaultStatus;
 }
 
 function runtimeStatus<T extends RuntimeStatus | undefined>(
   value: string | undefined | null,
-  fallback: T,
+  defaultStatus: T,
 ): RuntimeStatus | T {
-  return runtimeStatuses.includes(value as RuntimeStatus) ? (value as RuntimeStatus) : fallback;
+  return runtimeStatuses.includes(value as RuntimeStatus) ? (value as RuntimeStatus) : defaultStatus;
 }
 
-function objectStatus(value: string | undefined, fallback: ObjectStatus): ObjectStatus {
-  return objectStatuses.includes(value as ObjectStatus) ? (value as ObjectStatus) : fallback;
+function objectStatus(value: string | undefined, defaultStatus: ObjectStatus): ObjectStatus {
+  return objectStatuses.includes(value as ObjectStatus) ? (value as ObjectStatus) : defaultStatus;
 }
 
-function scanEventType(value: string | undefined, fallback: ScanEventType): ScanEventType {
-  return scanEventTypes.includes(value as ScanEventType) ? (value as ScanEventType) : fallback;
+function scanEventType(value: string | undefined, defaultStatus: ScanEventType): ScanEventType {
+  return scanEventTypes.includes(value as ScanEventType) ? (value as ScanEventType) : defaultStatus;
 }
 
 function nullableString(value: string | null | undefined): string | undefined {
   return value ?? undefined;
 }
 
-function numberValue(value: unknown, fallback = 0): number {
-  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+function numberValue(value: unknown, defaultValue = 0): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : defaultValue;
 }
