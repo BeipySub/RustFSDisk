@@ -49,25 +49,6 @@ COMMENT ON COLUMN edge_site.create_time IS '站点首次注册的 UTC 时间。'
 CREATE UNIQUE INDEX IF NOT EXISTS uq_edge_site_edge_code ON edge_site(edge_code);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_edge_site_auth_key_id ON edge_site(auth_key_id);
 
-CREATE TABLE IF NOT EXISTS center_config (
-  id BIGSERIAL PRIMARY KEY,
-  center_id UUID NOT NULL,
-  center_name VARCHAR(255),
-  protocol_version VARCHAR(64) NOT NULL,
-  create_time TIMESTAMP NOT NULL DEFAULT (NOW() AT TIME ZONE 'UTC'),
-  update_time TIMESTAMP
-);
-
-COMMENT ON TABLE center_config IS '中控系统身份和默认协议版本配置表；通常只有一条有效记录。';
-COMMENT ON COLUMN center_config.id IS '数据库自增主键。';
-COMMENT ON COLUMN center_config.center_id IS '中控系统 ID；写入 disk_info.json.center.center_id，部署后保持稳定。';
-COMMENT ON COLUMN center_config.center_name IS '中控系统展示名称或审计名称。';
-COMMENT ON COLUMN center_config.protocol_version IS '当前默认运输盘协议版本；写入 disk_info.json.protocol.version。';
-COMMENT ON COLUMN center_config.create_time IS '中控配置创建的 UTC 时间。';
-COMMENT ON COLUMN center_config.update_time IS '中控配置最近更新的 UTC 时间。';
-
-CREATE UNIQUE INDEX IF NOT EXISTS uq_center_config_center_id ON center_config(center_id);
-
 CREATE TABLE IF NOT EXISTS signature_key (
   id BIGSERIAL PRIMARY KEY,
   key_id UUID NOT NULL,
@@ -87,7 +68,7 @@ COMMENT ON TABLE signature_key IS '中控协议签名密钥元数据表；只用
 COMMENT ON COLUMN signature_key.id IS '数据库自增主键。';
 COMMENT ON COLUMN signature_key.key_id IS '中控签名密钥编号；写入 disk_info.json.security.center_key_id。';
 COMMENT ON COLUMN signature_key.owner_type IS '密钥所属方类型；固定为 CENTER。';
-COMMENT ON COLUMN signature_key.owner_code IS '密钥所属方编码；对应 center_config.center_id。';
+COMMENT ON COLUMN signature_key.owner_code IS '密钥所属方编码；对应部署配置中的 center_id / 中控系统 ID。';
 COMMENT ON COLUMN signature_key.signature_alg IS '签名算法；固定为 HMAC-SHA256。';
 COMMENT ON COLUMN signature_key.encrypted_key IS '加密后的签名密钥；不得明文落库。';
 COMMENT ON COLUMN signature_key.status IS '签名密钥状态；ACTIVE 表示可用于签名和验签，DISABLED 表示停用，REVOKED 表示吊销且默认不可用。';

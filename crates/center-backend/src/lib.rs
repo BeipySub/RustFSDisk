@@ -34,7 +34,7 @@ pub mod reinitializer;
 use center_security::{
     disk_data_key_base64, CenterSecurity, ENCRYPTION_ALG_AES_256_GCM, KEY_WRAP_ALG_LOCAL_MASTER_KEY,
 };
-pub use config::CenterConfig;
+pub use config::{CenterConfig, CenterIdentityConfig};
 use disk_info_document::{
     write_initialized_disk_info, DiskInfoStatus, InitializedDiskInfoDocument,
 };
@@ -245,10 +245,21 @@ pub struct DataKeyRecord {
     pub status: DataKeyStatus,
 }
 
-#[derive(Debug, Clone)]
-pub struct CenterConfigRecord {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CenterIdentity {
     pub center_id: Uuid,
+    pub center_name: String,
     pub protocol_version: String,
+}
+
+impl From<&CenterIdentityConfig> for CenterIdentity {
+    fn from(config: &CenterIdentityConfig) -> Self {
+        Self {
+            center_id: config.center_id,
+            center_name: config.center_name.clone(),
+            protocol_version: config.protocol_version.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -344,7 +355,6 @@ impl PgCenterStore {
 
 #[derive(Debug, Default)]
 pub struct MemoryCenterStore {
-    pub center_config: Option<CenterConfigRecord>,
     pub disks: HashMap<Uuid, DiskRecord>,
     pub disks_by_sn: HashMap<String, Uuid>,
     pub edges: HashMap<String, EdgeRecord>,
@@ -355,17 +365,27 @@ pub struct MemoryCenterStore {
 pub struct CenterService {
     store: CenterStore,
     security: CenterSecurity,
+    center_identity: CenterIdentity,
 }
 
 impl CenterService {
-    pub fn new(store: CenterStore, security: CenterSecurity) -> Self {
-        Self { store, security }
+    pub fn new(
+        store: CenterStore,
+        security: CenterSecurity,
+        center_identity: CenterIdentity,
+    ) -> Self {
+        Self {
+            store,
+            security,
+            center_identity,
+        }
     }
 
     pub fn memory(store: MemoryCenterStore) -> Self {
         Self::new(
             CenterStore::Memory(Arc::new(RwLock::new(store))),
             CenterSecurity::test(),
+            CenterIdentity::test(),
         )
     }
 
@@ -422,7 +442,6 @@ impl CenterService {
             return Err(anyhow!("capacity_bytes must be positive"));
         }
 
-        let center_config = self.store.center_config().await?;
         let data_key_id = Uuid::new_v4();
         let plaintext_key = self.security.generate_disk_data_key();
         let encrypted_key =
@@ -439,7 +458,7 @@ impl CenterService {
 
         self.store.stage_initializing_data_key(key).await?;
         let disk_info = InitializedDiskInfoDocument::initialized(
-            &center_config,
+            &self.center_identity,
             &disk,
             req.capacity_bytes,
             data_key_id,
@@ -494,7 +513,7 @@ impl CenterService {
                 "disk is disabled",
             ));
         }
-        if req.protocol_version != PROTOCOL_VERSION {
+        if req.protocol_version != self.center_identity.protocol_version {
             return Ok(VerifyDiskResponse::reject(
                 disk.disk_id,
                 true,
@@ -627,22 +646,31 @@ impl CenterService {
     }
 
     pub async fn ready(&self) -> bool {
-        self.store.center_config().await.is_ok()
+        true
     }
 
     pub async fn dashboard_summary(&self) -> Result<CenterDashboardSummary> {
-        let center = self.store.center_config().await.ok();
         let disks = self.store.center_dashboard_disks().await?;
         Ok(CenterDashboardSummary {
             source: "center",
-            center_id: center.as_ref().map(|center| center.center_id),
-            center_name: "RustFS Transfer Center".to_string(),
+            center_id: Some(self.center_identity.center_id),
+            center_name: self.center_identity.center_name.clone(),
             global_progress: center_global_progress(&disks),
             disks,
             ws_connected: false,
             last_http_refresh_at: Utc::now(),
             message: "center HTTP dashboard summary".to_string(),
         })
+    }
+}
+
+impl CenterIdentity {
+    pub fn test() -> Self {
+        Self {
+            center_id: Uuid::new_v4(),
+            center_name: "RustFS Transfer Center".to_string(),
+            protocol_version: PROTOCOL_VERSION.to_string(),
+        }
     }
 }
 
@@ -732,18 +760,6 @@ impl CenterStore {
         match self {
             Self::Pg(pg) => pg.edge_for_auth(edge_code).await,
             Self::Memory(mem) => Ok(mem.read().await.edges.get(edge_code).cloned()),
-        }
-    }
-
-    async fn center_config(&self) -> Result<CenterConfigRecord> {
-        match self {
-            Self::Pg(pg) => pg.center_config().await,
-            Self::Memory(mem) => mem
-                .read()
-                .await
-                .center_config
-                .clone()
-                .ok_or_else(|| anyhow!("center_config is not initialized")),
         }
     }
 
@@ -892,18 +908,6 @@ impl PgCenterStore {
         .await?;
 
         Ok(row.map(edge_record_from_row))
-    }
-
-    async fn center_config(&self) -> Result<CenterConfigRecord> {
-        let row = sqlx::query(
-            "SELECT center_id, protocol_version FROM center_config ORDER BY id ASC LIMIT 1",
-        )
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(CenterConfigRecord {
-            center_id: row.get("center_id"),
-            protocol_version: row.get("protocol_version"),
-        })
     }
 
     async fn center_dashboard_disks(&self) -> Result<Vec<CenterDiskSummary>> {
@@ -1501,13 +1505,7 @@ mod tests {
         let data_key_id = Uuid::new_v4();
         let export_job_id = Uuid::new_v4();
         let security = CenterSecurity::test();
-        let mut store = MemoryCenterStore {
-            center_config: Some(CenterConfigRecord {
-                center_id: Uuid::new_v4(),
-                protocol_version: PROTOCOL_VERSION.to_string(),
-            }),
-            ..Default::default()
-        };
+        let mut store = MemoryCenterStore::default();
         store.disks.insert(
             disk_id,
             DiskRecord {
@@ -1541,7 +1539,11 @@ mod tests {
                 status: DataKeyStatus::Active,
             },
         );
-        CenterService::new(CenterStore::Memory(Arc::new(RwLock::new(store))), security)
+        CenterService::new(
+            CenterStore::Memory(Arc::new(RwLock::new(store))),
+            security,
+            CenterIdentity::test(),
+        )
     }
 
     async fn ids(service: &CenterService) -> (Uuid, Uuid) {
@@ -1765,6 +1767,85 @@ mod tests {
             .verify_disk_info(&disk_info)
             .expect("initialized disk_info has a real center signature");
         assert!(disk_info_path.exists());
+
+        fs::remove_dir_all(&mount_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn initialize_uses_configured_center_identity_without_db_identity_row() {
+        let disk_id = Uuid::new_v4();
+        let configured_center_id = Uuid::new_v4();
+        let mut store = MemoryCenterStore::default();
+        store.disks.insert(
+            disk_id,
+            DiskRecord {
+                disk_id,
+                sn: "SN-CONFIG".to_string(),
+                capacity_bytes: 4096,
+                disk_enabled: true,
+            },
+        );
+        store.edges.insert(
+            "edge-a".to_string(),
+            EdgeRecord {
+                edge_code: "edge-a".to_string(),
+                edge_name: "Edge A".to_string(),
+                auth_key_id: "edge-a-key".to_string(),
+                auth_secret: "edge-a-secret".to_string(),
+                edge_status: "ACTIVE".to_string(),
+            },
+        );
+        let configured_protocol_version = "1.0-configured".to_string();
+        let service = CenterService::new(
+            CenterStore::Memory(Arc::new(RwLock::new(store))),
+            CenterSecurity::test(),
+            CenterIdentity {
+                center_id: configured_center_id,
+                center_name: "Configured Center".to_string(),
+                protocol_version: configured_protocol_version.clone(),
+            },
+        );
+        assert!(service.ready().await);
+
+        let mount_path = test_disk_mount_path(format!("rustfs-center-config-{disk_id}"));
+        let _ = fs::remove_dir_all(&mount_path);
+        let response = service
+            .initialize_disk(InitializeDiskRequest {
+                disk_id,
+                sn: Some("SN-CONFIG".to_string()),
+                capacity_bytes: 4096,
+                mount_path: mount_path.clone(),
+            })
+            .await
+            .unwrap();
+
+        let disk_info: serde_json::Value = serde_json::from_slice(
+            &fs::read(mount_path.join("rustfs-transfer").join("disk_info.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(response.status_code, DiskStatusCode::Initialized);
+        assert_eq!(
+            disk_info["center"]["center_id"],
+            configured_center_id.to_string()
+        );
+        assert_eq!(
+            disk_info["protocol"]["version"],
+            configured_protocol_version
+        );
+
+        let verify_response = service
+            .verify_disk(VerifyDiskRequest {
+                edge_code: "edge-a".to_string(),
+                disk_id,
+                sn: Some("SN-CONFIG".to_string()),
+                capacity_bytes: 4096,
+                free_bytes: 2048,
+                status_code: DiskStatusCode::Initialized,
+                protocol_version: "1.0-configured".to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(verify_response.allowed);
 
         fs::remove_dir_all(&mount_path).unwrap();
     }

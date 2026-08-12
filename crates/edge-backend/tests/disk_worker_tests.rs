@@ -104,7 +104,6 @@ struct MemoryRepo {
     exported: RefCell<Vec<ExportedObjectUpdate>>,
     failed: RefCell<Vec<(i64, String, String)>>,
     runtime: RefCell<Vec<(String, Option<String>)>>,
-    cleared_runtime: RefCell<Vec<Uuid>>,
 }
 
 impl ExportObjectRepository for MemoryRepo {
@@ -161,8 +160,8 @@ impl ExportObjectRepository for MemoryRepo {
         Ok(())
     }
 
-    fn clear_disk_runtime(&self, disk_id: Uuid) -> Result<()> {
-        self.cleared_runtime.borrow_mut().push(disk_id);
+    fn mark_disk_runtime_done_after_seal(&self, _disk_id: Uuid) -> Result<()> {
+        self.runtime.borrow_mut().push(("DONE".to_string(), None));
         Ok(())
     }
 
@@ -284,9 +283,8 @@ fn worker_encrypts_writes_manifest_and_seals_disk() {
     assert!(repo.failed.borrow().is_empty());
     assert_eq!(
         repo.runtime.borrow().as_slice(),
-        &[("COPYING".to_string(), None)]
+        &[("COPYING".to_string(), None), ("DONE".to_string(), None)]
     );
-    assert_eq!(repo.cleared_runtime.borrow().as_slice(), &[disk_id]);
     assert_eq!(repo.exported.borrow().len(), 1);
     assert_eq!(
         progress

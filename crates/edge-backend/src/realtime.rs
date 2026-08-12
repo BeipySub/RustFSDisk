@@ -12,6 +12,7 @@ use crate::{
 pub struct EdgeRealtimeHub {
     edge_code: Arc<str>,
     latest_disk_event: Arc<RwLock<Option<CopyProgressEvent>>>,
+    current_disks: Arc<RwLock<Vec<DiskProgressSnapshot>>>,
 }
 
 impl EdgeRealtimeHub {
@@ -19,6 +20,7 @@ impl EdgeRealtimeHub {
         Self {
             edge_code: Arc::<str>::from(edge_code.into()),
             latest_disk_event: Arc::new(RwLock::new(None)),
+            current_disks: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -30,14 +32,37 @@ impl EdgeRealtimeHub {
 impl DiskRuntimeEventPublisher for EdgeRealtimeHub {
     fn publish_disk_runtime(&self, record: &DiskRuntimeRecord) {
         let hub = self.latest_disk_event.clone();
-        let event = disk_runtime_event(&self.edge_code, record);
+        let current_disks = self.current_disks.clone();
+        let edge_code = self.edge_code.clone();
+        let record = record.clone();
         tokio::spawn(async move {
+            let message = disk_runtime_message(&record);
+            let mut disks = current_disks.write().await;
+            if record.runtime_status == "REMOVED" {
+                disks.retain(|snapshot| !same_disk_snapshot(snapshot, &record));
+            } else {
+                let snapshot = disk_progress_snapshot(&record, message.clone());
+                if let Some(existing) = disks
+                    .iter_mut()
+                    .find(|snapshot| same_disk_snapshot(snapshot, &record))
+                {
+                    *existing = snapshot;
+                } else {
+                    disks.push(snapshot);
+                }
+            }
+            let event = disk_runtime_event(&edge_code, &record, disks.clone(), message);
             *hub.write().await = Some(event);
         });
     }
 }
 
-fn disk_runtime_event(edge_code: &str, record: &DiskRuntimeRecord) -> CopyProgressEvent {
+fn disk_runtime_event(
+    edge_code: &str,
+    record: &DiskRuntimeRecord,
+    disks: Vec<DiskProgressSnapshot>,
+    message: String,
+) -> CopyProgressEvent {
     let event_type = match record.runtime_status.as_str() {
         "DETECTED" => "DISK_DETECTED",
         "CHECKING" => "DISK_CHECKING",
@@ -53,13 +78,6 @@ fn disk_runtime_event(edge_code: &str, record: &DiskRuntimeRecord) -> CopyProgre
         .status_code
         .clone()
         .unwrap_or_else(|| "UNREGISTERED".to_string());
-    let message = match (&record.last_error_code, &record.error_message) {
-        (Some(code), Some(message)) => format!("{code}: {message}"),
-        (Some(code), None) => code.clone(),
-        (None, Some(message)) => message.clone(),
-        (None, None) => format!("disk runtime_status={}", record.runtime_status),
-    };
-
     CopyProgressEvent {
         event_type: event_type.to_string(),
         event_time: Utc::now(),
@@ -77,23 +95,49 @@ fn disk_runtime_event(edge_code: &str, record: &DiskRuntimeRecord) -> CopyProgre
             object_done: 0,
             object_remaining: 0,
         },
-        disks: vec![DiskProgressSnapshot {
-            disk_id: record.disk_id.clone().unwrap_or_default(),
-            disk_sn: record.sn.clone(),
-            mount_path: record.mount_path.clone().unwrap_or_default(),
-            runtime_status: record.runtime_status.clone(),
-            total_bytes: 0,
-            done_bytes: 0,
-            remaining_bytes: 0,
-            free_bytes: record.free_bytes,
-            speed_bytes_per_sec: 0,
-            object_total: 0,
-            object_done: 0,
-            object_remaining: 0,
-            current_object: None,
-            message: message.clone(),
-        }],
+        disks,
         message,
+    }
+}
+
+fn disk_runtime_message(record: &DiskRuntimeRecord) -> String {
+    match (&record.last_error_code, &record.error_message) {
+        (Some(code), Some(message)) => format!("{code}: {message}"),
+        (Some(code), None) => code.clone(),
+        (None, Some(message)) => message.clone(),
+        (None, None) => format!("disk runtime_status={}", record.runtime_status),
+    }
+}
+
+fn disk_progress_snapshot(record: &DiskRuntimeRecord, message: String) -> DiskProgressSnapshot {
+    DiskProgressSnapshot {
+        disk_id: record.disk_id.clone().unwrap_or_default(),
+        disk_sn: record.sn.clone(),
+        mount_path: record.mount_path.clone().unwrap_or_default(),
+        runtime_status: record.runtime_status.clone(),
+        total_bytes: 0,
+        done_bytes: 0,
+        remaining_bytes: 0,
+        free_bytes: record.free_bytes,
+        speed_bytes_per_sec: 0,
+        object_total: 0,
+        object_done: 0,
+        object_remaining: 0,
+        current_object: None,
+        message,
+    }
+}
+
+fn same_disk_snapshot(snapshot: &DiskProgressSnapshot, record: &DiskRuntimeRecord) -> bool {
+    match record.disk_id.as_deref().filter(|value| !value.is_empty()) {
+        Some(disk_id) => snapshot.disk_id == disk_id,
+        None => {
+            snapshot.disk_sn == record.sn
+                && record
+                    .mount_path
+                    .as_deref()
+                    .is_some_and(|mount_path| snapshot.mount_path == mount_path)
+        }
     }
 }
 
@@ -177,5 +221,77 @@ mod tests {
             .unwrap()
             .contains("FILESYSTEM_UNSUPPORTED"));
         assert!(value.get("status").is_none());
+    }
+
+    #[tokio::test]
+    async fn removed_disk_event_publishes_remaining_current_disk_snapshot() {
+        let hub = EdgeRealtimeHub::new("edge-a");
+        let disk_a = runtime_record(
+            "SN-A",
+            "11111111-1111-1111-1111-111111111111",
+            "/mnt/rustfs-transfer/disk-a",
+            "READY",
+        );
+        let disk_b = runtime_record(
+            "SN-B",
+            "22222222-2222-2222-2222-222222222222",
+            "/mnt/rustfs-transfer/disk-b",
+            "READY",
+        );
+        let mut removed_a = disk_a.clone();
+        removed_a.runtime_status = "REMOVED".to_string();
+        removed_a.last_error_code = Some("DISK_REMOVED".to_string());
+        removed_a.error_message = Some("transport disk removed".to_string());
+
+        hub.publish_disk_runtime(&disk_a);
+        tokio::task::yield_now().await;
+        hub.publish_disk_runtime(&disk_b);
+        tokio::task::yield_now().await;
+        hub.publish_disk_runtime(&removed_a);
+        tokio::task::yield_now().await;
+
+        let value = serde_json::to_value(hub.latest_disk_event().await.unwrap()).unwrap();
+
+        assert_eq!(value["event_type"], "DISK_REMOVED");
+        assert_eq!(value["disks"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            value["disks"][0]["mount_path"],
+            "/mnt/rustfs-transfer/disk-b"
+        );
+        assert_ne!(
+            value["disks"][0]["mount_path"],
+            "/mnt/rustfs-transfer/disk-a"
+        );
+    }
+
+    fn runtime_record(
+        sn: &str,
+        disk_id: &str,
+        mount_path: &str,
+        runtime_status: &str,
+    ) -> DiskRuntimeRecord {
+        DiskRuntimeRecord {
+            sn: sn.to_string(),
+            fs_uuid: Some(format!("fs-uuid-{sn}")),
+            label: Some(format!("RUSTFS-{sn}")),
+            id_serial: Some(format!("USB-{sn}")),
+            id_serial_short: Some(sn.to_string()),
+            disk_id: (!disk_id.is_empty()).then(|| disk_id.to_string()),
+            device_path: "/dev/sdb1".to_string(),
+            mount_path: Some(mount_path.to_string()),
+            capacity_bytes: 100,
+            free_bytes: 80,
+            reserve_bytes: 10,
+            object_budget_bytes: 70,
+            runtime_status: runtime_status.to_string(),
+            last_error_code: None,
+            error_message: None,
+            partial_residue_count: 0,
+            partial_residue_bytes: 0,
+            last_seen_at: Utc::now(),
+            task_pool_eligible: runtime_status == "READY",
+            status_code: Some("INITIALIZED".to_string()),
+            disk_enabled: Some(true),
+        }
     }
 }

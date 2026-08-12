@@ -8,14 +8,14 @@ use std::{
 
 use anyhow::{anyhow, Context};
 use aws_sdk_s3::{primitives::DateTime as SmithyDateTime, Client};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::{DateTime, NaiveDateTime, Utc};
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use sqlx::{PgPool, Row};
 use tokio::{runtime::Handle, task};
 use uuid::Uuid;
 
 use crate::{
-    center_client::{CenterHmacClient, ExportKeyRequest},
     config::EdgeConfig,
     disk_worker::{
         DiskWorker, DiskWorkerConfig, DiskWorkerError, ExportObjectRepository, ExportObjectTask,
@@ -24,10 +24,19 @@ use crate::{
     progress::ProgressAggregator,
 };
 
+type HmacSha256 = Hmac<Sha256>;
+
 pub type ExportWorkerFuture<'a> =
     Pin<Box<dyn Future<Output = anyhow::Result<ExportWorkerReport>> + Send + 'a>>;
 
-const CLEAR_DISK_RUNTIME_AFTER_SEAL_SQL: &str = "DELETE FROM disk_runtime WHERE disk_id = $1";
+const MARK_DISK_RUNTIME_DONE_AFTER_SEAL_SQL: &str = r#"
+    UPDATE disk_runtime
+    SET status = 'DONE',
+        last_error_code = NULL,
+        error_message = NULL,
+        last_seen_at = NOW() AT TIME ZONE 'UTC'
+    WHERE disk_id = $1
+    "#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExportWorkerReport {
@@ -49,21 +58,14 @@ pub struct ProductionExportWorkerLauncher {
     config: std::sync::Arc<EdgeConfig>,
     pool: PgPool,
     s3_client: Client,
-    center_client: CenterHmacClient,
 }
 
 impl ProductionExportWorkerLauncher {
-    pub fn new(
-        config: std::sync::Arc<EdgeConfig>,
-        pool: PgPool,
-        s3_client: Client,
-        center_client: CenterHmacClient,
-    ) -> Self {
+    pub fn new(config: std::sync::Arc<EdgeConfig>, pool: PgPool, s3_client: Client) -> Self {
         Self {
             config,
             pool,
             s3_client,
-            center_client,
         }
     }
 }
@@ -91,25 +93,15 @@ impl ExportWorkerLauncher for ProductionExportWorkerLauncher {
                     );
                 }
 
-                let response = self
-                    .center_client
-                    .export_key(ExportKeyRequest {
-                        edge_code: self.config.center.edge_code.clone(),
-                        disk_id: disk.disk_id,
-                        data_key_id: disk_info.data_key_id,
-                        export_job_id,
-                        status_code: disk_info.status_code.clone(),
-                    })
-                    .await
-                    .with_context(|| format!("request export key for disk {}", disk.disk_id))?;
-                if !response.allowed || response.encryption_alg != "AES-256-GCM" {
-                    anyhow::bail!(
-                        "center denied export key for disk {}: {}",
-                        disk.disk_id,
-                        response.message.unwrap_or_else(|| "denied".to_string())
-                    );
-                }
-                let key = decode_disk_data_key(response.disk_data_key.as_deref())?;
+                let seal_id = Uuid::new_v4();
+                let key = derive_offline_disk_data_key(
+                    &self.config.center.edge_auth_secret,
+                    &self.config.center.edge_code,
+                    disk.disk_id,
+                    disk_info.data_key_id,
+                    export_job_id,
+                    seal_id,
+                )?;
 
                 let config = DiskWorkerConfig {
                     disk_id: disk.disk_id,
@@ -118,7 +110,7 @@ impl ExportWorkerLauncher for ProductionExportWorkerLauncher {
                     edge_code: self.config.center.edge_code.clone(),
                     edge_name: self.config.center.edge_code.clone(),
                     export_job_id,
-                    seal_id: Uuid::new_v4(),
+                    seal_id,
                     data_key_id: disk_info.data_key_id,
                     disk_data_key: key,
                     free_bytes: disk.free_bytes,
@@ -241,12 +233,28 @@ impl DiskInfoForExport {
     }
 }
 
-fn decode_disk_data_key(value: Option<&str>) -> anyhow::Result<[u8; 32]> {
-    let value = value.ok_or_else(|| anyhow!("center allowed export key without disk_data_key"))?;
-    let bytes = BASE64.decode(value)?;
-    let key: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| anyhow!("disk_data_key must decode to 32 bytes"))?;
+fn derive_offline_disk_data_key(
+    edge_auth_secret: &str,
+    edge_code: &str,
+    disk_id: Uuid,
+    data_key_id: Uuid,
+    export_job_id: Uuid,
+    seal_id: Uuid,
+) -> anyhow::Result<[u8; 32]> {
+    let secret = edge_auth_secret.trim();
+    if secret.is_empty() {
+        anyhow::bail!("center.edge_auth_secret is required for offline export key derivation");
+    }
+
+    let message = format!(
+        "rustfs-transfer:offline-disk-data-key:v1\nedge_code={edge_code}\ndisk_id={disk_id}\ndata_key_id={data_key_id}\nexport_job_id={export_job_id}\nseal_id={seal_id}"
+    );
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(secret.as_bytes())
+        .expect("HMAC-SHA256 accepts any key length");
+    mac.update(message.as_bytes());
+    let bytes = mac.finalize().into_bytes();
+    let mut key = [0_u8; 32];
+    key.copy_from_slice(&bytes);
     Ok(key)
 }
 
@@ -575,17 +583,17 @@ impl ExportObjectRepository for PgExportObjectRepository {
         })
     }
 
-    fn clear_disk_runtime(&self, disk_id: Uuid) -> Result<(), DiskWorkerError> {
+    fn mark_disk_runtime_done_after_seal(&self, disk_id: Uuid) -> Result<(), DiskWorkerError> {
         self.handle.block_on(async {
-            let result = sqlx::query(CLEAR_DISK_RUNTIME_AFTER_SEAL_SQL)
+            let result = sqlx::query(MARK_DISK_RUNTIME_DONE_AFTER_SEAL_SQL)
                 .bind(disk_id)
                 .execute(&self.pool)
                 .await
                 .map_err(sqlx_err)?;
             tracing::info!(
                 disk_id = %disk_id,
-                removed_runtime_rows = result.rows_affected(),
-                "cleared edge disk runtime after successful seal"
+                updated_runtime_rows = result.rows_affected(),
+                "marked edge disk runtime DONE after successful seal"
             );
             Ok(())
         })
@@ -682,18 +690,42 @@ mod tests {
     use std::io;
 
     #[test]
-    fn rejects_missing_plaintext_export_key() {
-        let err = decode_disk_data_key(None).unwrap_err();
-        assert!(err.to_string().contains("disk_data_key"));
+    fn derives_offline_disk_data_key_from_fixed_hmac_message() {
+        let disk_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let data_key_id = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+        let export_job_id = Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap();
+        let seal_id = Uuid::parse_str("44444444-4444-4444-4444-444444444444").unwrap();
+
+        let key = derive_offline_disk_data_key(
+            "edge-secret",
+            "edge-a",
+            disk_id,
+            data_key_id,
+            export_job_id,
+            seal_id,
+        )
+        .unwrap();
+
+        assert_eq!(key.len(), 32);
+        assert_eq!(
+            hex::encode(key),
+            "691765633e6b8fdd0d5a8c0911da21ce4516eba1bec5e200217064a3a86702aa"
+        );
     }
 
     #[test]
-    fn decodes_center_export_key_only_in_memory_shape() {
-        let key = [3_u8; 32];
-        assert_eq!(
-            decode_disk_data_key(Some(&BASE64.encode(key))).unwrap(),
-            key
-        );
+    fn rejects_missing_edge_auth_secret_for_offline_export() {
+        let err = derive_offline_disk_data_key(
+            " ",
+            "edge-a",
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("center.edge_auth_secret"));
     }
 
     #[test]
@@ -724,13 +756,12 @@ mod tests {
     }
 
     #[test]
-    fn seal_success_runtime_cleanup_keeps_export_history_sql_out_of_scope() {
-        assert_eq!(
-            CLEAR_DISK_RUNTIME_AFTER_SEAL_SQL,
-            "DELETE FROM disk_runtime WHERE disk_id = $1"
-        );
-        assert!(!CLEAR_DISK_RUNTIME_AFTER_SEAL_SQL.contains("export_job"));
-        assert!(!CLEAR_DISK_RUNTIME_AFTER_SEAL_SQL.contains("export_object"));
-        assert!(!CLEAR_DISK_RUNTIME_AFTER_SEAL_SQL.contains("manifest"));
+    fn seal_success_runtime_marks_done_without_deleting_summary_source() {
+        assert!(MARK_DISK_RUNTIME_DONE_AFTER_SEAL_SQL.contains("UPDATE disk_runtime"));
+        assert!(MARK_DISK_RUNTIME_DONE_AFTER_SEAL_SQL.contains("status = 'DONE'"));
+        assert!(!MARK_DISK_RUNTIME_DONE_AFTER_SEAL_SQL.contains("DELETE FROM disk_runtime"));
+        assert!(!MARK_DISK_RUNTIME_DONE_AFTER_SEAL_SQL.contains("export_job"));
+        assert!(!MARK_DISK_RUNTIME_DONE_AFTER_SEAL_SQL.contains("export_object"));
+        assert!(!MARK_DISK_RUNTIME_DONE_AFTER_SEAL_SQL.contains("manifest"));
     }
 }

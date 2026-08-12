@@ -1,7 +1,6 @@
 use crate::{
     adapters::AdapterBundle,
     auto_export::{AutoExportOrchestrator, AutoExportRescanRunner},
-    center_client::CenterHmacClient,
     config::EdgeConfig,
     control::{
         missing_control_service, validate_export_job_id, ControlError, CreateExportJobRequest,
@@ -35,7 +34,6 @@ use uuid::Uuid;
 pub struct AppState {
     pub config: Arc<EdgeConfig>,
     pub adapters: AdapterBundle,
-    pub center_client: CenterHmacClient,
     pub disk_rescan: DiskRescanCoordinator,
     control: Arc<dyn EdgeControlService>,
     realtime: EdgeRealtimeHub,
@@ -43,12 +41,6 @@ pub struct AppState {
 
 impl AppState {
     pub async fn from_config(config: EdgeConfig) -> anyhow::Result<Self> {
-        let center_client = CenterHmacClient::new(
-            config.center.base_url.clone(),
-            config.center.edge_code.clone(),
-            config.center.auth_key_id.clone(),
-            config.center.edge_auth_secret.clone(),
-        );
         let adapters = AdapterBundle::from_config(&config).await?;
         let pg_pool = adapters
             .pg_pool
@@ -74,14 +66,12 @@ impl AppState {
             config.clone(),
             pg_pool,
             s3_client,
-            center_client.clone(),
         ));
         let realtime = EdgeRealtimeHub::new(config.center.edge_code.clone());
         let auto_export = AutoExportOrchestrator::new(config.auto_export.clone(), control.clone());
         let detector = EdgeDiskDetector::new_with_event_publisher(
             EdgeDiskDetectorConfig::new(config.center.edge_code.clone()),
             probe,
-            center_client.clone(),
             ledger,
             realtime.clone(),
         );
@@ -93,7 +83,6 @@ impl AppState {
         Ok(Self {
             config,
             adapters,
-            center_client,
             disk_rescan,
             control,
             realtime,
@@ -259,6 +248,7 @@ async fn edge_summary(
 async fn edge_dashboard_summary(
     State(state): State<AppState>,
 ) -> Result<Json<crate::control::EdgeControlSummary>, ApiError> {
+    refresh_transport_runtime_before_control(&state).await?;
     state
         .control
         .summary()
@@ -295,24 +285,14 @@ async fn edge_dashboard_get_export_job(
 }
 
 fn browser_safe_summary(
-    mut summary: crate::control::EdgeControlSummary,
+    summary: crate::control::EdgeControlSummary,
 ) -> crate::control::EdgeControlSummary {
-    for disk in &mut summary.disks {
-        if disk.disk_status_code == "IMPORTED" {
-            disk.disk_status_code = "ERROR".to_string();
-        }
-    }
     summary
 }
 
 fn browser_safe_export_job(
-    mut job: crate::control::ExportJobResponse,
+    job: crate::control::ExportJobResponse,
 ) -> crate::control::ExportJobResponse {
-    for disk in &mut job.disks {
-        if disk.disk_status_code.as_deref() == Some("IMPORTED") {
-            disk.disk_status_code = Some("ERROR".to_string());
-        }
-    }
     job
 }
 
@@ -992,7 +972,7 @@ mod tests {
         assert_eq!(body["edge_name"], "edge-a");
         assert_eq!(body["export_job_status"], "PENDING");
         assert_eq!(body["global_progress"]["total_bytes"], 99);
-        assert_eq!(body["disks"][0]["disk_status_code"], "ERROR");
+        assert_eq!(body["disks"][0]["disk_status_code"], "IMPORTED");
         assert_eq!(body["disks"][0]["hardware_serial"], "SN-A");
         assert_eq!(body["disks"][0]["device_path"], "/dev/sdb1");
         assert_eq!(
@@ -1007,7 +987,7 @@ mod tests {
             body["disks"][0]["current_object"]["object_status"],
             "COPYING"
         );
-        assert_ne!(body["disks"][0]["disk_status_code"], "IMPORTED");
+        assert_eq!(body["disks"][0]["disk_status_code"], "IMPORTED");
         assert!(body.get("status").is_none());
         assert!(body.get("disk_data_key").is_none());
         assert_eq!(control.calls.lock().unwrap().as_slice(), &["summary"]);
@@ -1052,7 +1032,7 @@ mod tests {
         assert_eq!(detail.status(), StatusCode::OK);
         let detail_body = json_body(detail).await;
         assert_eq!(detail_body["export_job_id"], export_job_id.to_string());
-        assert_eq!(detail_body["disks"][0]["disk_status_code"], "ERROR");
+        assert_eq!(detail_body["disks"][0]["disk_status_code"], "IMPORTED");
         assert_eq!(detail_body["events"][0]["event_type"], "EXPORT_JOB_STARTED");
         assert!(detail_body.get("status").is_none());
         assert!(detail_body.get("disk_data_key").is_none());
@@ -1392,12 +1372,9 @@ mod tests {
             pg_pool: None,
             s3_client: None,
         };
-        let center_client =
-            CenterHmacClient::new("http://center.local", "edge-a", "auth-key", "edge-secret");
         AppState {
             config: Arc::new(config),
             adapters,
-            center_client,
             disk_rescan,
             control,
             realtime: EdgeRealtimeHub::new("edge-a"),

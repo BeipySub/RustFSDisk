@@ -33,9 +33,30 @@ const READY_DISKS_SQL: &str = r#"
     ORDER BY id ASC
     "#;
 const LOAD_DISK_RUNTIME_SQL: &str = r#"
+    WITH latest AS (
+        SELECT DISTINCT ON (
+            COALESCE(disk_id::text, device_path || '|' || COALESCE(mount_path, ''))
+        )
+            id,
+            sn,
+            disk_id,
+            device_path,
+            mount_path,
+            status,
+            capacity_bytes,
+            free_bytes,
+            object_budget_bytes,
+            last_error_code,
+            error_message
+        FROM disk_runtime
+        ORDER BY
+            COALESCE(disk_id::text, device_path || '|' || COALESCE(mount_path, '')),
+            id DESC
+    )
     SELECT sn, disk_id, device_path, mount_path, status, capacity_bytes, free_bytes, object_budget_bytes,
            last_error_code, error_message
-    FROM disk_runtime
+    FROM latest
+    WHERE status <> 'REMOVED'
     ORDER BY id ASC
     "#;
 const DAILY_SCAN_WINDOW_HOURS: i64 = 24;
@@ -397,17 +418,11 @@ pub struct ProductionEdgeControlService {
 }
 
 impl ProductionEdgeControlService {
-    pub fn new(
-        config: Arc<EdgeConfig>,
-        pool: PgPool,
-        s3_client: aws_sdk_s3::Client,
-        center_client: crate::center_client::CenterHmacClient,
-    ) -> Self {
+    pub fn new(config: Arc<EdgeConfig>, pool: PgPool, s3_client: aws_sdk_s3::Client) -> Self {
         let worker_launcher = Arc::new(ProductionExportWorkerLauncher::new(
             config.clone(),
             pool.clone(),
             s3_client.clone(),
-            center_client,
         ));
         Self::new_with_worker_launcher(config, pool, s3_client, worker_launcher)
     }
@@ -1062,8 +1077,8 @@ async fn load_export_job_disks(
             dr.error_message,
             COUNT(*) AS object_total,
             COUNT(*) FILTER (WHERE eo.status = 'EXPORTED') AS object_done,
-            COALESCE(SUM(eo.chunk_size_bytes), 0) AS total_bytes,
-            COALESCE(SUM(CASE WHEN eo.status = 'EXPORTED' THEN eo.chunk_size_bytes ELSE 0 END), 0) AS done_bytes
+            COALESCE(SUM(eo.chunk_size_bytes), 0)::BIGINT AS total_bytes,
+            COALESCE(SUM(CASE WHEN eo.status = 'EXPORTED' THEN eo.chunk_size_bytes ELSE 0 END), 0)::BIGINT AS done_bytes
         FROM export_object eo
         LEFT JOIN disk_runtime dr ON dr.disk_id = eo.disk_id
         WHERE eo.export_job_id = $1
@@ -1377,7 +1392,12 @@ fn command_stdout(command: &str, args: &[&str]) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    let value = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    let value = String::from_utf8(output.stdout)
+        .ok()?
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?
+        .to_string();
     if value.is_empty() {
         None
     } else {
@@ -1399,7 +1419,8 @@ fn disk_status_code_from_mount(mount_path: Option<&str>) -> Option<String> {
 fn disk_status_code_from_runtime(runtime_status: &str) -> &'static str {
     match runtime_status {
         "COPYING" => "EDGE_COPYING",
-        "REJECTED" | "ERROR" | "REMOVED" => "ERROR",
+        "REJECTED" => "UNREGISTERED",
+        "ERROR" | "REMOVED" => "ERROR",
         _ => "INITIALIZED",
     }
 }
@@ -2007,6 +2028,11 @@ mod tests {
     }
 
     #[test]
+    fn rejected_runtime_without_disk_info_uses_unregistered_disk_status_code() {
+        assert_eq!(disk_status_code_from_runtime("REJECTED"), "UNREGISTERED");
+    }
+
+    #[test]
     fn recovery_protocol_root_accepts_clean_initialized_original_disk() {
         let disk_id = Uuid::new_v4();
         let mount = test_mount("clean", disk_id);
@@ -2112,17 +2138,18 @@ mod tests {
 
     #[test]
     fn ready_queries_use_current_rebuildable_runtime_only() {
-        for sql in [
-            DEFAULT_MAX_BUDGET_SQL,
-            READY_DISKS_SQL,
-            LOAD_DISK_RUNTIME_SQL,
-        ] {
+        for sql in [DEFAULT_MAX_BUDGET_SQL, READY_DISKS_SQL] {
             assert!(!sql.contains("DISTINCT ON"));
             assert!(!sql.contains("DELETE FROM export_job"));
             assert!(!sql.contains("DELETE FROM export_object"));
         }
         assert!(READY_DISKS_SQL.contains("WHERE status = 'READY'"));
         assert!(READY_DISKS_SQL.contains("ORDER BY id ASC"));
+        assert!(LOAD_DISK_RUNTIME_SQL.contains("DISTINCT ON"));
+        assert!(LOAD_DISK_RUNTIME_SQL.contains("WHERE status <> 'REMOVED'"));
+        assert!(LOAD_DISK_RUNTIME_SQL.contains("ORDER BY id ASC"));
+        assert!(!LOAD_DISK_RUNTIME_SQL.contains("DELETE FROM export_job"));
+        assert!(!LOAD_DISK_RUNTIME_SQL.contains("DELETE FROM export_object"));
     }
 
     fn test_mount(case: &str, disk_id: Uuid) -> std::path::PathBuf {

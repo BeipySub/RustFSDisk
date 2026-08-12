@@ -4,13 +4,15 @@ import test from "node:test";
 import {
   buildExportJobsUrl,
   diskStatusDisplay,
+  edgeScanPath,
   isActiveExportJobStatus,
   localEdgePath,
   normalizeEdgeDashboardSummary,
+  normalizeExportJobDetail,
   normalizeExportJobsResponse,
   visibleDiskStatusCode,
 } from "../api/edgeDashboard.ts";
-import { applyCopyProgressEvent } from "../ws/edgeCopyProgress.ts";
+import { applyCopyProgressEvent, parseCopyProgressEvent } from "../ws/edgeCopyProgress.ts";
 
 test("builds final export job list URL without empty filters", () => {
   assert.equal(
@@ -36,6 +38,17 @@ test("keeps browser API paths local to the Edge origin", () => {
     }),
     "/api/edge/dashboard/export-jobs?page=1&page_size=8",
   );
+});
+
+test("uses local Edge scan path for manual RustFS scan", () => {
+  assert.equal(edgeScanPath(), "/api/edge/scan");
+});
+
+test("displays Edge visible disk lifecycle codes in Chinese", () => {
+  assert.equal(diskStatusDisplay("UNREGISTERED"), "未注册");
+  assert.equal(diskStatusDisplay("INITIALIZED"), "已初始化");
+  assert.equal(diskStatusDisplay("SEALED"), "已封盘");
+  assert.equal(diskStatusDisplay(undefined), "未返回");
 });
 
 test("normalizes summary and hides imported disk lifecycle from Edge UI", () => {
@@ -127,6 +140,85 @@ test("normalizes deployed export job list wire shape", () => {
   assert.equal(response.items[0]?.export_job_id, "job-2");
 });
 
+test("marks sealed historical export disks as removable when runtime was cleared", () => {
+  const detail = normalizeExportJobDetail({
+    export_job_id: "job-sealed",
+    edge_code: "edge-demo",
+    export_job_status: "SEALED",
+    object_count: 1,
+    copied_count: 1,
+    total_bytes: 1024,
+    copied_bytes: 1024,
+    disk_count: 1,
+    disks: [
+      {
+        disk_id: "disk-a",
+        disk_sn: "",
+        mount_path: "",
+        runtime_status: undefined,
+        total_bytes: 1024,
+        done_bytes: 1024,
+        remaining_bytes: 0,
+        free_bytes: 0,
+        speed_bytes_per_sec: 0,
+        object_total: 1,
+        object_done: 1,
+        object_remaining: 0,
+        current_object: null,
+        message: "",
+      },
+    ],
+  });
+
+  assert.equal(detail.disks[0]?.disk_status_code, "SEALED");
+  assert.equal(detail.disks[0]?.runtime_status, "DONE");
+  assert.equal(detail.disks[0]?.message, "已封盘，可拔盘");
+});
+
+test("accepts scan and copy start websocket events from Edge realtime stream", () => {
+  const scan = parseCopyProgressEvent(
+    JSON.stringify({
+      event_type: "SCAN_PROGRESS",
+      source: "edge",
+      edge_code: "edge-demo",
+      export_job_id: "",
+      export_job_status: "SCANNING",
+      global_progress: {
+        total_bytes: 0,
+        done_bytes: 0,
+        remaining_bytes: 0,
+        speed_bytes_per_sec: 0,
+        object_total: 0,
+        object_done: 0,
+        object_remaining: 0,
+      },
+      disks: [],
+    }),
+  );
+  const copyStarted = parseCopyProgressEvent(
+    JSON.stringify({
+      event_type: "COPY_STARTED",
+      source: "edge",
+      edge_code: "edge-demo",
+      export_job_id: "job-copying",
+      export_job_status: "COPYING",
+      global_progress: {
+        total_bytes: 100,
+        done_bytes: 0,
+        remaining_bytes: 100,
+        speed_bytes_per_sec: 0,
+        object_total: 1,
+        object_done: 0,
+        object_remaining: 1,
+      },
+      disks: [],
+    }),
+  );
+
+  assert.equal(scan?.event_type, "SCAN_PROGRESS");
+  assert.equal(copyStarted?.event_type, "COPY_STARTED");
+});
+
 test("keeps production export statuses from the shared contract", () => {
   const response = normalizeExportJobsResponse(
     [
@@ -195,7 +287,7 @@ test("normalizes deployed dashboard summary wire shape", () => {
   assert.equal(summary.global_progress.object_total, 173);
 });
 
-test("merges websocket disks without dropping restored HTTP disk list", () => {
+test("replaces dashboard disks with the latest websocket disk list", () => {
   const summary = normalizeEdgeDashboardSummary({
     source: "edge",
     edge_code: "edge-demo",
@@ -299,9 +391,9 @@ test("merges websocket disks without dropping restored HTTP disk list", () => {
     message: "copying",
   });
 
-  assert.equal(merged.disks.length, 2);
+  assert.equal(merged.disks.length, 1);
   assert.equal(merged.disks.find((disk) => disk.disk_id === "disk-a")?.runtime_status, "COPYING");
-  assert.equal(merged.disks.find((disk) => disk.disk_id === "disk-b")?.runtime_status, "READY");
+  assert.equal(merged.disks.find((disk) => disk.disk_id === "disk-b"), undefined);
 });
 
 test("does not regress a terminal HTTP export job from stale websocket progress", () => {

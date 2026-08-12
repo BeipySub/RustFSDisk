@@ -13,10 +13,9 @@ pub trait DiskRescanRunner: Send + Sync + 'static {
     ) -> BoxFuture<'a, Result<usize, DiskDetectionError>>;
 }
 
-impl<P, V, L, E> DiskRescanRunner for EdgeDiskDetector<P, V, L, E>
+impl<P, L, E> DiskRescanRunner for EdgeDiskDetector<P, L, E>
 where
     P: DiskProbe + 'static,
-    V: crate::disk_detection::CenterDiskVerifier + 'static,
     L: DiskRuntimeLedger + 'static,
     E: DiskRuntimeEventPublisher,
 {

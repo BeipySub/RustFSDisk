@@ -11,7 +11,7 @@ use crate::center_security::{
     CenterSecurity, ENCRYPTION_ALG_AES_256_GCM, SIGNATURE_ALG_HMAC_SHA256,
 };
 use crate::disk_info_document::{write_initialized_disk_info, InitializedDiskInfoDocument};
-use crate::{CenterConfigRecord, DiskRecord};
+use crate::{CenterIdentity, DiskRecord};
 
 pub const PROTOCOL_ROOT: &str = "rustfs-transfer";
 pub const DISK_INFO_FILE: &str = "disk_info.json";
@@ -381,8 +381,13 @@ where
                     "disk capacity exceeds supported i64 range".to_string(),
                 )
             })?;
-        let center_config = CenterConfigRecord {
+        let center_identity = CenterIdentity {
             center_id: self.template.center_id,
+            center_name: self
+                .template
+                .center_name
+                .clone()
+                .unwrap_or_else(|| "RustFS Transfer Center".to_string()),
             protocol_version: self.template.protocol_version.clone(),
         };
         let disk = DiskRecord {
@@ -392,7 +397,7 @@ where
             disk_enabled: true,
         };
         InitializedDiskInfoDocument::initialized(
-            &center_config,
+            &center_identity,
             &disk,
             capacity_bytes,
             new_key.data_key_id,

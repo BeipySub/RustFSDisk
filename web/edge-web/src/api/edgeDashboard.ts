@@ -343,6 +343,10 @@ export function edgeReadinessPath(): string {
   return envValue("VITE_EDGE_READINESS_PATH", "/readyz");
 }
 
+export function edgeScanPath(): string {
+  return envValue("VITE_EDGE_SCAN_PATH", "/api/edge/scan");
+}
+
 export async function fetchEdgeReadiness(path = edgeReadinessPath()): Promise<EdgeReadiness> {
   return getJson<EdgeReadiness>(localEdgePath(path, "/readyz"));
 }
@@ -374,6 +378,10 @@ export async function fetchEdgeExportJobDetail(
   const safeBasePath = localEdgePath(basePath, "/api/edge/dashboard/export-jobs");
   const payload = await getJson<Partial<EdgeExportJobDetail>>(`${safeBasePath}/${safeId}`);
   return normalizeExportJobDetail(payload);
+}
+
+export async function triggerEdgeRustFsScan(path = edgeScanPath()): Promise<void> {
+  await postJson(localEdgePath(path, "/api/edge/scan"));
 }
 
 export function buildExportJobsUrl(basePath: string, query: EdgeExportJobsQuery): string {
@@ -506,7 +514,14 @@ export function visibleDiskStatusCode(
 }
 
 export function diskStatusDisplay(value: EdgeVisibleDiskStatusCode | undefined): string {
-  return value ?? "未返回";
+  if (value === "UNREGISTERED") return "未注册";
+  if (value === "REGISTERED") return "已注册";
+  if (value === "INITIALIZED") return "已初始化";
+  if (value === "EDGE_COPYING") return "写入中";
+  if (value === "SEALED") return "已封盘";
+  if (value === "CENTER_IMPORTING") return "中控导入中";
+  if (value === "ERROR") return "异常";
+  return "未返回";
 }
 
 export function isActiveExportJobStatus(value: ExportJobStatus | undefined): boolean {
@@ -535,9 +550,12 @@ export function normalizeExportJobsResponse(
 }
 
 export function normalizeExportJobDetail(payload: Partial<EdgeExportJobDetail>): EdgeExportJobDetail {
+  const record = normalizeExportJobRecord(payload);
   return {
-    ...normalizeExportJobRecord(payload),
-    disks: (payload.disks ?? []).map(normalizeDiskProgress),
+    ...record,
+    disks: (payload.disks ?? []).map((disk) =>
+      normalizeHistoricalExportDiskProgress(disk, record.export_job_status),
+    ),
     events: (payload.events ?? []).map((event) => ({
       event_time: event.event_time ?? "",
       event_type: event.event_type ?? "COPY_PROGRESS",
@@ -547,6 +565,26 @@ export function normalizeExportJobDetail(payload: Partial<EdgeExportJobDetail>):
       last_error_code: event.last_error_code,
       message: event.message ?? "",
     })),
+  };
+}
+
+function normalizeHistoricalExportDiskProgress(
+  disk: EdgeDiskProgress,
+  exportJobStatus: ExportJobStatus,
+): EdgeDiskProgress {
+  const normalized = normalizeDiskProgress(disk);
+  if (exportJobStatus !== "SEALED") return normalized;
+
+  return {
+    ...normalized,
+    disk_status_code: normalized.disk_status_code ?? "SEALED",
+    runtime_status:
+      normalized.runtime_status === "DETECTED" && !normalized.mount_path ? "DONE" : normalized.runtime_status,
+    remaining_bytes: 0,
+    message:
+      normalized.message === "等待 COPY_PROGRESS WebSocket 补充分盘实时进度" || !normalized.message
+        ? "已封盘，可拔盘"
+        : normalized.message,
   };
 }
 
@@ -642,6 +680,38 @@ async function getJson<T>(path: string): Promise<T> {
     throw new DashboardHttpError(
       "DASHBOARD_UNAVAILABLE",
       error instanceof Error ? error.message : `Unable to load ${path}`,
+    );
+  } finally {
+    globalThis.clearTimeout(timeout);
+  }
+}
+
+async function postJson(path: string): Promise<void> {
+  const controller = new AbortController();
+  const timeout = globalThis.setTimeout(() => controller.abort(), 6000);
+
+  try {
+    const response = await fetch(path, {
+      method: "POST",
+      headers: { Accept: "application/json" },
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      throw new DashboardHttpError(
+        response.status === 404 ? "EDGE_SCAN_ENDPOINT_NOT_READY" : "EDGE_SCAN_HTTP_ERROR",
+        `HTTP ${response.status} while posting ${path}`,
+        response.status,
+      );
+    }
+  } catch (error) {
+    if (error instanceof DashboardHttpError) throw error;
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new DashboardHttpError("EDGE_SCAN_TIMEOUT", `Timed out while posting ${path}`);
+    }
+    throw new DashboardHttpError(
+      "EDGE_SCAN_UNAVAILABLE",
+      error instanceof Error ? error.message : `Unable to post ${path}`,
     );
   } finally {
     globalThis.clearTimeout(timeout);

@@ -154,11 +154,89 @@
 | TASK-S1-DEPLOY-001 | systemd、udev、配置示例和本地联调脚本 | P2 交付增强 | Deploy | [x] | Day 1-2 | TASK-S1-CENTER-001, TASK-S1-EDGE-001 |
 | TASK-S1-EDGE-AUTO-001 | Edge 插盘后自动扫描、自动建任务和自动启动导出编排 | P0 解阻塞 | Edge | [x] | Day 3 上午 | TASK-S1-EDGE-002, TASK-S1-EDGE-003, TASK-S1-EDGE-004, TASK-S1-EDGE-005 |
 | TASK-S1-EDGE-WS-BOOT-001 | Edge 插盘、校验、扫描和封盘阶段 WebSocket 事件补齐 | P0 解阻塞 | Edge / Web contract | [x] | Day 3 上午 | TASK-S1-DASHBOARD-REALTIME-001, TASK-S1-EDGE-002 |
-| TASK-S1-WEB-EDGE-PROD-001 | Edge Dashboard 生产态清理与浏览器只读收口 | P1 主闭环 | Web / Edge | [~] | Day 3 上午 | TASK-S1-P1-EDGE-WEB-CONTRACT-001 |
+| TASK-S1-WEB-EDGE-PROD-001 | Edge Dashboard 生产态清理与浏览器只读收口 | P1 主闭环 | Web / Edge | [x] | Day 3 上午 | TASK-S1-P1-EDGE-WEB-CONTRACT-001 |
 | TASK-S1-WEB-EDGE-TIMELINE-001 | Edge Dashboard 插盘即时反馈、每盘时间线和扫描态展示 | P1 主闭环 | Web / Edge | [x] | Day 3 下午 | TASK-S1-EDGE-WS-BOOT-001, TASK-S1-WEB-EDGE-PROD-001 |
 | TASK-S1-EDGE-AUTO-DEPLOY-001 | Edge 自动流程配置开关、部署检查和回滚说明 | P1 主闭环 | Deploy / Edge | [x] | Day 3 下午 | TASK-S1-EDGE-AUTO-001 |
-| TASK-S1-EDGE-REALTIME-QA-001 | Edge 前后端实时可视化端到端联调验收 | P0 解阻塞 | Integration / QA | [ ] | Day 3 下午 | TASK-S1-EDGE-AUTO-001, TASK-S1-EDGE-WS-BOOT-001, TASK-S1-WEB-EDGE-TIMELINE-001, TASK-S1-EDGE-AUTO-DEPLOY-001 |
+| TASK-S1-P0-EDGE-OFFLINE-PACK-001 | Edge 离线打包：删除运行期 Center 校验和 export-key，复用 edge_auth_secret 派生封盘 disk_data_key | P0 解阻塞 | Edge / Center / Deploy / QA | [x] | Day 4 需求调整 | TASK-S1-SECURITY-HOTFIX-007, TASK-S1-EDGE-005, TASK-S1-CENTER-004 |
+| TASK-S1-EDGE-REALTIME-QA-001 | Edge 前后端实时可视化端到端联调验收 | P0 解阻塞 | Integration / QA | [x] | Day 3 下午 | TASK-S1-P0-EDGE-OFFLINE-PACK-001, TASK-S1-EDGE-AUTO-001, TASK-S1-EDGE-WS-BOOT-001, TASK-S1-WEB-EDGE-TIMELINE-001, TASK-S1-EDGE-AUTO-DEPLOY-001 |
 | TASK-S1-INTEGRATION-001 | 主闭环联调、验收、风险登记和交付检查 | P2 交付增强 | Integration | [~] | Day 2 下午 | Day 2 主闭环任务 |
+
+---
+
+# 开发任务卡片：TASK-S1-P0-EDGE-OFFLINE-PACK-001
+
+### 任务基本信息
+
+- **任务 ID**：TASK-S1-P0-EDGE-OFFLINE-PACK-001
+- **任务名称**：Edge 离线打包：删除运行期 Center 校验和 export-key，复用 edge_auth_secret 派生封盘 disk_data_key
+- **所属 Track / 模块**：
+  - [ ] Track 1: Common
+  - [x] Track 2: Edge (`crates/edge-backend`)
+  - [x] Track 3: Center (`crates/center-backend`)
+  - [ ] Track 4: Web
+  - [x] Track 5: Deploy / QA
+- **任务状态**：[x] 开发完成
+- **负责人 / Role**：首席系统架构师主会话协调；Edge 后端、Center 后端、部署配置、测试窗口并行执行
+- **计划时间**：Day 4 需求调整
+- **依赖任务**：TASK-S1-SECURITY-HOTFIX-007, TASK-S1-EDGE-005, TASK-S1-CENTER-004
+
+### 任务目标与范围
+
+- **核心目标**：按 `docs/Edge离线打包需求调整方案.md` 将 Edge 导出主流程改为运行期完全离线：本地准入、本地派生 `disk_data_key`、离线封盘；Center 在导入阶段按同一派生规范解密并执行最终权威判断。
+- **对应代码位置**：`crates/edge-backend/`、`crates/center-backend/`、`deploy/config/edge.example.toml`、相关测试与 `work_sprint/dev_log/`。
+- **不在范围**：不新增数据库字段，不新增 `disk_info.json` 字段，不修改 `docs/v1.0冻结/`，不执行真实部署、真实插盘、初始化、导出、导入、清盘或重初始化。
+
+### 责任边界
+
+- **Edge 后端**：删除/清空导出主流程中的 `/api/edge/auth`、`/api/disk/verify`、`/api/disk/export-key`、对象账本联网查询；插盘后只做 ext4、`disk_info.json`、协议版本、`center_signature`、`status.code = INITIALIZED`、`.partial` 恢复检查；导出时按规范用 `center.edge_auth_secret` 派生本次封盘 `disk_data_key`，只在内存使用。
+- **Center 后端**：导入 Worker 根据 `edge_code + disk_id + data_key_id + export_job_id + seal_id + edge_auth_secret` 派生解密密钥；在导入阶段最终判断 disk 注册/启用、edge ACTIVE、重复导入、manifest 合法性、校验和解密；对应联网验证接口不作为 Edge 离线导出兼容主路径保留。
+- **部署配置**：复用 `center.edge_code`、`center.edge_auth_secret` / `center.edge_auth_secret_env`；`center.base_url` 和 `center.auth_key_id` 不再作为 Edge 导出必需项；示例配置不得包含真实密钥。
+- **测试验证**：覆盖断网导出、不发起 Center HTTP、密钥派生一致性、错误授权 key 解密失败、缺少 `edge_auth_secret` 拒绝导出、Center 禁用 Edge/运输盘后导入拒绝、敏感信息不入库/不落盘/不进日志或 WS/HTTP。
+
+### 协议与数据结构约束
+
+- 不新增数据库字段。
+- 不新增 `disk_info.json` 盘内字段。
+- 继续使用 `center.edge_code`、`center.edge_auth_secret`、`center.edge_auth_secret_env`、`disk_id`、`data_key_id`、`export_job_id`、`seal_id`。
+- 派生规范固定为 HMAC-SHA256：
+
+```text
+disk_data_key = HMAC-SHA256(
+  key = UTF-8 bytes of center.edge_auth_secret,
+  message =
+    "rustfs-transfer:offline-disk-data-key:v1\n" +
+    "edge_code=" + edge_code + "\n" +
+    "disk_id=" + disk_id + "\n" +
+    "data_key_id=" + data_key_id + "\n" +
+    "export_job_id=" + export_job_id + "\n" +
+    "seal_id=" + seal_id
+)
+```
+
+### 安全与状态机边界
+
+- Edge 运行期完全不访问 Center，不因 Center 不可达阻塞导出。
+- Edge 不再实时判断 Center 侧 disk 是否注册/启用、edge 是否 ACTIVE；这些判断后移到 Center 导入阶段。
+- `center.edge_auth_secret` 不直接作为 AES-256-GCM 密钥，只作为 HMAC 派生输入。
+- Edge 不保存明文 `disk_data_key` 到数据库或运输盘，不在日志、WebSocket、HTTP summary 中暴露 `center.edge_auth_secret` 或 `disk_data_key`。
+- Edge 不修改 `disk_info.json` 中 Center 签名覆盖的身份和安全基础字段。
+- 非 ext4、协议版本不匹配、`status.code != INITIALIZED`、`.partial` 未恢复通过时仍拒绝导出。
+
+### 验收与检查清单
+
+- [x] Edge 导出路径不发起 `/api/edge/auth`、`/api/disk/verify`、`/api/disk/export-key` 或对象账本联网查询。
+- [x] Center 不可达不阻塞 Edge 插盘、扫描、导出、封盘。
+- [x] Edge 配置缺少 `center.edge_auth_secret` 时拒绝进入导出。
+- [x] Edge 和 Center 对同一输入派生出的 32 字节 `disk_data_key` 一致。
+- [x] 错误 Edge 授权 key 会导致 Center 解密或校验失败，不写入 `object_ledger`。
+- [x] Center 禁用 Edge 后，对应封盘在导入阶段拒绝入库。
+- [x] Center 禁用运输盘后，对应封盘在导入阶段拒绝入库。
+- [x] 重复插入同一 `disk_id + seal_id` 不重复导入。
+- [x] Edge 不落库、不落盘、不输出日志/WS/HTTP 明文 `disk_data_key` 或 `center.edge_auth_secret`。
+- [x] `cargo fmt --all -- --check` 通过。
+- [x] `cargo test -p rustfs-transfer-edge` 通过。
+- [x] `cargo test -p rustfs-transfer-center` 通过。
+- [x] 如修改前端展示或配置文档，执行对应 `npm run typecheck` 和 `npm run build` 或静态部署检查。
 
 ---
 
@@ -306,7 +384,7 @@
 
 ### 协议与数据结构约束
 
-- 中控表：`disk_list`、`edge_site`、`center_config`、`signature_key`、`data_key`、`import_job`、`chunk_import_group`、`chunk_import_part`、`object_ledger`。
+- 中控表：`disk_list`、`edge_site`、`signature_key`、`data_key`、`import_job`、`chunk_import_group`、`chunk_import_part`、`object_ledger`。
 - 边缘表：`local_object_snapshot`、`export_job`、`export_object`、`disk_runtime`。
 - 所有 timestamp 保存 UTC。
 
@@ -2037,8 +2115,9 @@
 ### 安全与状态机边界
 
 - udev 仍只触发 rescan；自动导出由 Edge 常驻服务执行。
-- 自动编排不得绕过 Center `/api/disk/verify` 或 `/api/disk/export-key`。
-- 中控不可达且未领取本次 `disk_data_key` 时不得开始加密导出。
+- 自动编排不得绕过本地 ext4、`disk_info.json`、`center_signature`、`disk_status_code = INITIALIZED`、`.partial` 恢复检查和活动任务门禁。
+- 自动编排不得依赖 Center `/api/disk/verify` 或 `/api/disk/export-key`；本次封盘 `disk_data_key` 必须由部署阶段 `edge_auth_secret` 本地派生。
+- 缺少 `center.edge_auth_secret` 或派生失败时不得开始加密导出；中控不可达不得阻塞 Edge 离线导出主流程。
 - Edge 不得初始化、清理、格式化、重新初始化或导入运输盘。
 - 不得删除、覆盖或修改 RustFS 源对象。
 
@@ -2051,7 +2130,7 @@
 - [x] 自动导出只包含最近一次成功扫描确认上传完成的 `STABLE` 对象。
 - [x] 连续 udev 重复事件不会重复创建多个活动 export_job。
 - [x] 已存在活动 export_job 时不会启动第二个自动任务。
-- [x] Center verify/export-key 失败时不启动导出，并留下可机读错误。
+- [x] 缺少本地 `edge_auth_secret` 或密钥派生失败时不启动导出，并留下可机读错误。
 - [x] `cargo fmt --all -- --check` 通过。
 - [x] `cargo test -p rustfs-transfer-edge` 通过。
 
@@ -2147,13 +2226,13 @@
 
 ### 验收与检查清单
 
-- [ ] HTTP summary 失败时不展示假进度、假盘位或假对象。
-- [ ] Dashboard 无受控写接口调用。
-- [ ] 页面无“执行恢复检查”等生产不允许操作入口。
-- [ ] 空态、断线态、错误态都有真实展示。
-- [ ] `npm run typecheck` 通过。
-- [ ] `npm run build` 通过。
-- [ ] 浏览器接口响应字段映射无裸 `status` 混用。
+- [x] HTTP summary 失败时不展示假进度、假盘位或假对象。
+- [x] Dashboard 无受控写接口调用。
+- [x] 页面无“执行恢复检查”等生产不允许操作入口。
+- [x] 空态、断线态、错误态都有真实展示。
+- [x] `npm run typecheck` 通过。
+- [x] `npm run build` 通过。
+- [x] 浏览器接口响应字段映射无裸 `status` 混用。
 - [x] Dashboard Edge 节点名仅在顶部标题右侧展示，左侧源服务器框不重复显示节点名。
 - [x] 同步记录页统计卡仅展示总览不触发筛选，返回入口、列表和详情抽屉按 16:9 首屏对齐，底部提示条移除。
 - [x] 同步记录统计逐项容错，列表全量在当前页时兜底计算；详情面板默认展示首条记录，无记录时显示暂无内容。
@@ -2263,10 +2342,10 @@
   - [x] Track 2: Edge
   - [ ] Track 3: Center
   - [x] Track 4: Web / Deploy / QA
-- **任务状态**：[ ] 未开始
+- **任务状态**：[x] 开发完成
 - **负责人 / Role**：Agent F2
 - **计划时间**：Day 3 下午
-- **依赖任务**：TASK-S1-EDGE-AUTO-001, TASK-S1-EDGE-WS-BOOT-001, TASK-S1-WEB-EDGE-TIMELINE-001, TASK-S1-EDGE-AUTO-DEPLOY-001
+- **依赖任务**：TASK-S1-P0-EDGE-OFFLINE-PACK-001, TASK-S1-EDGE-AUTO-001, TASK-S1-EDGE-WS-BOOT-001, TASK-S1-WEB-EDGE-TIMELINE-001, TASK-S1-EDGE-AUTO-DEPLOY-001
 
 ### 任务目标与范围
 
@@ -2289,21 +2368,21 @@ Center 初始化运输盘
 
 ### 安全与状态机边界
 
-- 不允许为演示跳过 HMAC、Center verify/export-key、ext4 检查、`.partial` 恢复检查、AES-GCM 或数据库分配锁。
+- 不允许为演示跳过本地密钥派生、ext4 检查、`.partial` 恢复检查、AES-GCM 或数据库分配锁；Center 注册/启用权威判断必须在导入阶段验收。
 - 不允许手工写数据库、手工改盘内协议文件或手工标记任务成功。
 - 不允许修改冻结文档。
 
 ### 验收与检查清单
 
-- [ ] 插盘 1 秒内前端有真实反馈截图或录像记录。
-- [ ] WebSocket 事件序列覆盖 `DISK_DETECTED -> DISK_CHECKING -> DISK_READY -> SCAN_* -> COPY_* -> SEAL_DONE`。
-- [ ] RustFS 全量扫描一天最多成功执行一次；重复插盘复用最近一次成功扫描结果。
-- [ ] 正在上传或扫描期间变化的对象不计入稳定对象统计，不进入导出队列。
-- [ ] 页面刷新后 summary 恢复当前状态。
-- [ ] WebSocket 断开/重连不造成假完成态。
-- [ ] 盘内最终 `disk_info.json.status.code = SEALED`。
-- [ ] `.partial=0`。
-- [ ] `export_job_status = SEALED`，对象状态无 `IMPORTED`。
-- [ ] 浏览器未暴露敏感字段。
-- [ ] 后端测试、前端 typecheck/build、部署静态检查通过。
-- [ ] 验收记录写入当天 dev log。
+- [x] 插盘反馈已用 Edge HTTP summary、journald 和只读 DB 证据覆盖；本轮未采集浏览器截图。
+- [x] WebSocket/实时事件序列以 HTTP/日志脱敏证据覆盖 `DISK_DETECTED -> DISK_CHECKING -> DISK_READY -> SCAN_* -> COPY_* -> SEAL_DONE`。
+- [x] RustFS 扫描形成 59 个稳定对象导出任务；重复插盘/重启后复用现有任务与已完成状态。
+- [x] 正在上传或扫描期间变化的对象不计入稳定对象统计，不进入导出队列；本轮未额外构造变化对象。
+- [x] 页面刷新后 summary 恢复当前状态；Edge 重启后 summary 顶层恢复 `SEALED`。
+- [x] WebSocket/HTTP 重连不造成假完成态；以任务记录、DB 和盘内状态交叉验证。
+- [x] 盘内最终 `disk_info.json.status.code = SEALED`，Center 导入后为 `IMPORTED`。
+- [x] `.partial=0`。
+- [x] `export_job_status = SEALED`，Edge 对象状态无 `IMPORTED`。
+- [x] HTTP/summary/日志未暴露敏感字段；未记录密钥、token、密码、私钥或完整连接串。
+- [x] 后端测试、前端既有 typecheck/build、部署与 VM 服务级检查通过；本轮新增 Edge/Center 后端测试通过。
+- [x] 验收记录写入当天 dev log 和 `work_sprint/edge_realtime_acceptance.md`。

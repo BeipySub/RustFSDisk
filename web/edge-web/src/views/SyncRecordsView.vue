@@ -8,6 +8,7 @@ import {
   type EdgeExportJobRecord,
   type ExportJobStatus,
 } from "../api/edgeDashboard";
+import EdgeTelemetry from "../components/EdgeTelemetry.vue";
 
 const page = ref(1);
 const pageSize = 8;
@@ -227,13 +228,15 @@ onMounted(() => {
 
 <template>
   <main class="sync-records page-panel">
-    <section class="top-telemetry" aria-label="Edge 连接状态">
-      <span :class="['status-pill', error ? 'warning' : 'ok']"><i></i> HTTP：{{ error ? error.error_code : loading ? "loading" : "ready" }}</span>
-      <span class="status-pill quiet"><i></i> WebSocket：记录页不直接消费</span>
-      <span class="status-pill quiet">本地只读 API</span>
-      <span class="last-update">共 {{ total }} 条</span>
-      <button aria-label="刷新记录" class="icon-refresh" :disabled="loading" type="button" @click="loadRecords">↻</button>
-    </section>
+    <EdgeTelemetry
+      :http-tone="error ? 'warning' : 'ok'"
+      local-tone="ok"
+      ws-tone="quiet"
+      refresh-label="刷新记录"
+      :refresh-disabled="loading"
+      :show-status-pills="false"
+      @refresh="loadRecords"
+    />
 
     <header class="records-title">
       <h1>同步记录</h1>

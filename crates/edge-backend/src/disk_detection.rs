@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
@@ -7,7 +8,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{postgres::PgPoolOptions, PgPool};
+use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -65,9 +66,10 @@ pub enum DiskErrorCode {
     HardwareSnUnavailable,
     ProtocolVersionUnsupported,
     ManifestInvalid,
+    SignatureInvalid,
     RecoveryRequired,
     PartialFileFound,
-    CenterRejected,
+    DiskRemoved,
 }
 
 impl DiskErrorCode {
@@ -77,9 +79,10 @@ impl DiskErrorCode {
             Self::HardwareSnUnavailable => "HARDWARE_SN_UNAVAILABLE",
             Self::ProtocolVersionUnsupported => "PROTOCOL_VERSION_UNSUPPORTED",
             Self::ManifestInvalid => "MANIFEST_INVALID",
+            Self::SignatureInvalid => "SIGNATURE_INVALID",
             Self::RecoveryRequired => "RECOVERY_REQUIRED",
             Self::PartialFileFound => "PARTIAL_FILE_FOUND",
-            Self::CenterRejected => "CENTER_REJECTED",
+            Self::DiskRemoved => "DISK_REMOVED",
         }
     }
 }
@@ -168,6 +171,8 @@ pub struct DiskInfoStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct DiskInfoSecurity {
     pub data_key_id: Option<String>,
+    #[serde(default)]
+    pub center_signature: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -219,43 +224,12 @@ pub struct DiskRuntimeRecord {
     pub disk_enabled: Option<bool>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct DiskVerifyRequest {
-    pub edge_code: String,
-    pub disk_id: String,
-    pub sn: Option<String>,
-    pub capacity_bytes: u64,
-    pub free_bytes: u64,
-    pub status_code: String,
-    pub protocol_version: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DiskVerifyResponse {
-    pub allowed: bool,
-    pub disk_id: String,
-    pub disk_enabled: bool,
-    pub expected_status: String,
-    pub action: VerifyAction,
-    pub message: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum VerifyAction {
-    AllowExport,
-    Reject,
-    NeedInit,
-    NeedImportFirst,
-}
-
 #[derive(Debug, Error)]
 pub enum DiskDetectionError {
     #[error("disk probe failed: {0}")]
     Probe(String),
     #[error("disk runtime ledger failed: {0}")]
     Ledger(String),
-    #[error("center disk verify failed: {0}")]
-    CenterVerify(String),
     #[error("failed to read disk_info.json at {path}: {source}")]
     ReadDiskInfo {
         path: PathBuf,
@@ -279,18 +253,18 @@ pub trait DiskProbe: Send + Sync {
     ) -> BoxFuture<'a, Result<Vec<DetectedDisk>, DiskDetectionError>>;
 }
 
-pub trait CenterDiskVerifier: Send + Sync {
-    fn verify_disk<'a>(
-        &'a self,
-        request: DiskVerifyRequest,
-    ) -> BoxFuture<'a, Result<DiskVerifyResponse, DiskDetectionError>>;
-}
-
 pub trait DiskRuntimeLedger: Send + Sync {
     fn record_disk_runtime<'a>(
         &'a self,
         record: DiskRuntimeRecord,
     ) -> BoxFuture<'a, Result<(), DiskDetectionError>>;
+
+    fn mark_missing_disks_removed<'a>(
+        &'a self,
+        _current_records: &'a [DiskRuntimeRecord],
+    ) -> BoxFuture<'a, Result<Vec<DiskRuntimeRecord>, DiskDetectionError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
 }
 
 pub trait DiskRuntimeEventPublisher: Clone + Send + Sync + 'static {
@@ -319,10 +293,9 @@ impl EdgeDiskDetectorConfig {
     }
 }
 
-pub struct EdgeDiskDetector<P, V, L, E = NoopDiskRuntimeEventPublisher> {
+pub struct EdgeDiskDetector<P, L, E = NoopDiskRuntimeEventPublisher> {
     config: EdgeDiskDetectorConfig,
     probe: P,
-    verifier: V,
     ledger: L,
     event_publisher: E,
 }
@@ -357,9 +330,7 @@ impl DiskProbe for ConfiguredMountProbe {
             let mut disks = Vec::new();
             for mount_path in discover_transport_mounts(&self.mount_roots) {
                 let protocol_root = mount_path.join(PROTOCOL_ROOT);
-                if !protocol_root.join(DISK_INFO_FILE).exists() {
-                    continue;
-                }
+                let has_protocol_info = protocol_root.join(DISK_INFO_FILE).exists();
 
                 let (device_path, filesystem) = mount_info(&mount_path)
                     .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
@@ -372,6 +343,9 @@ impl DiskProbe for ConfiguredMountProbe {
                 } else {
                     filesystem
                 };
+                if !has_protocol_info && filesystem != SUPPORTED_FILESYSTEM {
+                    continue;
+                }
 
                 disks.push(DetectedDisk {
                     sn,
@@ -388,38 +362,6 @@ impl DiskProbe for ConfiguredMountProbe {
             }
             Ok(disks)
         })
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct StaticCenterDiskVerifier {
-    response: DiskVerifyResponse,
-}
-
-impl StaticCenterDiskVerifier {
-    pub fn reject_without_center_adapter() -> Self {
-        Self {
-            response: DiskVerifyResponse {
-                allowed: false,
-                disk_id: String::new(),
-                disk_enabled: false,
-                expected_status: DiskStatusCode::Initialized.as_protocol_value().to_string(),
-                action: VerifyAction::Reject,
-                message: Some(
-                    "center /api/disk/verify adapter is not configured; export is blocked"
-                        .to_string(),
-                ),
-            },
-        }
-    }
-}
-
-impl CenterDiskVerifier for StaticCenterDiskVerifier {
-    fn verify_disk<'a>(
-        &'a self,
-        _request: DiskVerifyRequest,
-    ) -> BoxFuture<'a, Result<DiskVerifyResponse, DiskDetectionError>> {
-        Box::pin(async move { Ok(self.response.clone()) })
     }
 }
 
@@ -541,43 +483,186 @@ impl DiskRuntimeLedger for PgDiskRuntimeLedger {
             Ok(())
         })
     }
-}
 
-impl<P, V, L> EdgeDiskDetector<P, V, L>
-where
-    P: DiskProbe,
-    V: CenterDiskVerifier,
-    L: DiskRuntimeLedger,
-{
-    pub fn new(config: EdgeDiskDetectorConfig, probe: P, verifier: V, ledger: L) -> Self {
-        Self::new_with_event_publisher(
-            config,
-            probe,
-            verifier,
-            ledger,
-            NoopDiskRuntimeEventPublisher,
-        )
+    fn mark_missing_disks_removed<'a>(
+        &'a self,
+        current_records: &'a [DiskRuntimeRecord],
+    ) -> BoxFuture<'a, Result<Vec<DiskRuntimeRecord>, DiskDetectionError>> {
+        Box::pin(async move {
+            let current_disk_ids = current_records
+                .iter()
+                .filter_map(|record| record.disk_id.as_deref())
+                .filter_map(|value| Uuid::parse_str(value).ok())
+                .collect::<HashSet<_>>();
+            let current_locations = current_records
+                .iter()
+                .map(|record| (record.device_path.clone(), record.mount_path.clone()))
+                .collect::<HashSet<_>>();
+
+            let rows = sqlx::query(
+                r#"
+                SELECT DISTINCT ON (
+                    COALESCE(disk_id::text, device_path || '|' || COALESCE(mount_path, ''))
+                )
+                    sn,
+                    disk_id,
+                    device_path,
+                    mount_path,
+                    capacity_bytes,
+                    free_bytes,
+                    reserve_bytes,
+                    object_budget_bytes,
+                    status,
+                    last_error_code,
+                    error_message,
+                    partial_residue_count,
+                    partial_residue_bytes,
+                    last_seen_at
+                FROM disk_runtime
+                ORDER BY
+                    COALESCE(disk_id::text, device_path || '|' || COALESCE(mount_path, '')),
+                    id DESC
+                "#,
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|err| DiskDetectionError::Ledger(err.to_string()))?;
+
+            let mut removed = Vec::new();
+            for row in rows {
+                let status: String = row.get("status");
+                if status == RuntimeStatus::Removed.as_db_value() {
+                    continue;
+                }
+
+                let disk_id: Option<Uuid> = row.get("disk_id");
+                let device_path: String = row.get("device_path");
+                let mount_path: Option<String> = row.get("mount_path");
+                let is_present = disk_id
+                    .as_ref()
+                    .is_some_and(|disk_id| current_disk_ids.contains(disk_id))
+                    || current_locations.contains(&(device_path.clone(), mount_path.clone()));
+                if is_present {
+                    continue;
+                }
+
+                let record = DiskRuntimeRecord {
+                    sn: row.get("sn"),
+                    fs_uuid: None,
+                    label: None,
+                    id_serial: None,
+                    id_serial_short: None,
+                    disk_id: disk_id.map(|value| value.to_string()),
+                    device_path,
+                    mount_path,
+                    capacity_bytes: row.get::<i64, _>("capacity_bytes").max(0) as u64,
+                    free_bytes: 0,
+                    reserve_bytes: 0,
+                    object_budget_bytes: 0,
+                    runtime_status: RuntimeStatus::Removed.as_db_value().to_string(),
+                    last_error_code: Some(DiskErrorCode::DiskRemoved.as_db_value().to_string()),
+                    error_message: Some(
+                        "transport disk is no longer detected by edge rescan".to_string(),
+                    ),
+                    partial_residue_count: row.get::<i32, _>("partial_residue_count").max(0) as u32,
+                    partial_residue_bytes: row.get::<i64, _>("partial_residue_bytes").max(0) as u64,
+                    last_seen_at: Utc::now(),
+                    task_pool_eligible: false,
+                    status_code: None,
+                    disk_enabled: None,
+                };
+                insert_disk_runtime_record(&self.pool, &record).await?;
+                tracing::info!(
+                    disk_sn = record.sn.as_str(),
+                    disk_id = record.disk_id.as_deref(),
+                    device_path = record.device_path.as_str(),
+                    mount_path = record.mount_path.as_deref(),
+                    runtime_status = record.runtime_status,
+                    last_error_code = record.last_error_code.as_deref(),
+                    "marked missing edge disk runtime snapshot as removed"
+                );
+                removed.push(record);
+            }
+
+            Ok(removed)
+        })
     }
 }
 
-impl<P, V, L, E> EdgeDiskDetector<P, V, L, E>
+async fn insert_disk_runtime_record(
+    pool: &PgPool,
+    record: &DiskRuntimeRecord,
+) -> Result<(), DiskDetectionError> {
+    let disk_id = record
+        .disk_id
+        .as_deref()
+        .and_then(|value| Uuid::parse_str(value).ok());
+    sqlx::query(
+        r#"
+        INSERT INTO disk_runtime (
+            sn,
+            disk_id,
+            device_path,
+            mount_path,
+            capacity_bytes,
+            free_bytes,
+            reserve_bytes,
+            object_budget_bytes,
+            status,
+            last_error_code,
+            error_message,
+            partial_residue_count,
+            partial_residue_bytes,
+            last_seen_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+        "#,
+    )
+    .bind(&record.sn)
+    .bind(disk_id)
+    .bind(&record.device_path)
+    .bind(&record.mount_path)
+    .bind(record.capacity_bytes as i64)
+    .bind(record.free_bytes as i64)
+    .bind(record.reserve_bytes as i64)
+    .bind(record.object_budget_bytes as i64)
+    .bind(&record.runtime_status)
+    .bind(&record.last_error_code)
+    .bind(&record.error_message)
+    .bind(record.partial_residue_count as i32)
+    .bind(record.partial_residue_bytes as i64)
+    .bind(record.last_seen_at.naive_utc())
+    .execute(pool)
+    .await
+    .map_err(|err| DiskDetectionError::Ledger(err.to_string()))?;
+    Ok(())
+}
+
+impl<P, L> EdgeDiskDetector<P, L>
 where
     P: DiskProbe,
-    V: CenterDiskVerifier,
+    L: DiskRuntimeLedger,
+{
+    pub fn new(config: EdgeDiskDetectorConfig, probe: P, ledger: L) -> Self {
+        Self::new_with_event_publisher(config, probe, ledger, NoopDiskRuntimeEventPublisher)
+    }
+}
+
+impl<P, L, E> EdgeDiskDetector<P, L, E>
+where
+    P: DiskProbe,
     L: DiskRuntimeLedger,
     E: DiskRuntimeEventPublisher,
 {
     pub fn new_with_event_publisher(
         config: EdgeDiskDetectorConfig,
         probe: P,
-        verifier: V,
         ledger: L,
         event_publisher: E,
     ) -> Self {
         Self {
             config,
             probe,
-            verifier,
             ledger,
             event_publisher,
         }
@@ -597,6 +682,12 @@ where
             self.event_publisher.publish_disk_runtime(&record);
             records.push(record);
         }
+
+        let removed_records = self.ledger.mark_missing_disks_removed(&records).await?;
+        for record in &removed_records {
+            self.event_publisher.publish_disk_runtime(record);
+        }
+        records.extend(removed_records);
 
         Ok(records)
     }
@@ -631,7 +722,30 @@ where
 
         let protocol_root = disk.mount_path.join(PROTOCOL_ROOT);
         let disk_info_path = protocol_root.join(DISK_INFO_FILE);
-        let disk_info = read_disk_info(&disk_info_path)?;
+        if !disk_info_path.exists() {
+            record.status_code = Some(DiskStatusCode::Unregistered.as_protocol_value().to_string());
+            record.disk_enabled = Some(false);
+            reject(
+                &mut record,
+                RuntimeStatus::Rejected,
+                DiskErrorCode::ManifestInvalid,
+                "transport candidate is not initialized by Center: missing rustfs-transfer/disk_info.json".to_string(),
+            );
+            return Ok(record);
+        }
+
+        let disk_info = match read_disk_info(&disk_info_path) {
+            Ok(disk_info) => disk_info,
+            Err(err) => {
+                reject(
+                    &mut record,
+                    RuntimeStatus::Rejected,
+                    DiskErrorCode::ManifestInvalid,
+                    err.to_string(),
+                );
+                return Ok(record);
+            }
+        };
         record.disk_id = Some(disk_info.disk.disk_id.clone());
         record.status_code = Some(disk_info.status.code.clone());
 
@@ -644,6 +758,16 @@ where
                     "protocol version {} is not supported",
                     disk_info.protocol.version
                 ),
+            );
+            return Ok(record);
+        }
+
+        if !has_center_signature(&disk_info) {
+            reject(
+                &mut record,
+                RuntimeStatus::Rejected,
+                DiskErrorCode::SignatureInvalid,
+                "disk_info security.center_signature is missing".to_string(),
             );
             return Ok(record);
         }
@@ -671,61 +795,57 @@ where
             return Ok(record);
         };
 
-        let partial = scan_partial_residue(&protocol_root)?;
+        let partial = match scan_partial_residue(&protocol_root) {
+            Ok(partial) => partial,
+            Err(err) => {
+                reject(
+                    &mut record,
+                    RuntimeStatus::Rejected,
+                    DiskErrorCode::RecoveryRequired,
+                    err.to_string(),
+                );
+                return Ok(record);
+            }
+        };
         record.partial_residue_count = partial.count;
         record.partial_residue_bytes = partial.bytes;
 
         if status_code == DiskStatusCode::EdgeCopying || partial.count > 0 {
             reject(
                 &mut record,
-                RuntimeStatus::Error,
+                RuntimeStatus::Rejected,
                 DiskErrorCode::RecoveryRequired,
                 recovery_message(status_code, &partial),
             );
             return Ok(record);
         }
 
-        let verify = self
-            .verifier
-            .verify_disk(DiskVerifyRequest {
-                edge_code: self.config.edge_code.clone(),
-                disk_id: disk_info.disk.disk_id,
-                sn: if disk.sn.is_empty() {
-                    None
-                } else {
-                    Some(disk.sn.clone())
-                },
-                capacity_bytes: disk.capacity_bytes,
-                free_bytes: disk.free_bytes,
-                status_code: disk_info.status.code,
-                protocol_version: disk_info.protocol.version,
-            })
-            .await?;
-
-        record.disk_enabled = Some(verify.disk_enabled);
-
-        if verify.allowed
-            && verify.disk_enabled
-            && verify.action == VerifyAction::AllowExport
-            && verify.expected_status == DiskStatusCode::Initialized.as_protocol_value()
-            && status_code == DiskStatusCode::Initialized
-        {
+        record.disk_enabled = Some(true);
+        if status_code == DiskStatusCode::Initialized {
             record.runtime_status = RuntimeStatus::Ready.as_db_value().to_string();
             record.task_pool_eligible = true;
         } else {
             reject(
                 &mut record,
                 RuntimeStatus::Rejected,
-                DiskErrorCode::CenterRejected,
-                verify.message.unwrap_or_else(|| {
-                    "center verify rejected disk; it must not enter the export task pool"
-                        .to_string()
-                }),
+                DiskErrorCode::ManifestInvalid,
+                format!(
+                    "disk status_code {} is not eligible for offline edge export; expected INITIALIZED",
+                    status_code.as_protocol_value()
+                ),
             );
         }
 
         Ok(record)
     }
+}
+
+fn has_center_signature(disk_info: &DiskInfo) -> bool {
+    disk_info
+        .security
+        .as_ref()
+        .and_then(|security| security.center_signature.as_deref())
+        .is_some_and(|value| !value.trim().is_empty())
 }
 
 fn base_record(disk: &DetectedDisk) -> DiskRuntimeRecord {
@@ -846,7 +966,7 @@ pub fn calculate_object_budget_bytes(free_bytes: u64) -> u64 {
 
 fn mount_info(mount_path: &Path) -> Option<(String, String)> {
     let output = Command::new("findmnt")
-        .args(["-n", "-o", "SOURCE,FSTYPE", "--target"])
+        .args(["-n", "-o", "SOURCE,FSTYPE", "--mountpoint"])
         .arg(mount_path)
         .output()
         .ok()?;
@@ -957,9 +1077,8 @@ fn disk_space_for_mount(mount_path: &Path) -> Option<(u64, u64)> {
 fn discover_transport_mounts(mount_roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut mounts = Vec::new();
     for root in mount_roots {
-        if root.join(PROTOCOL_ROOT).join(DISK_INFO_FILE).exists() {
+        if root.is_dir() {
             mounts.push(root.clone());
-            continue;
         }
 
         let Ok(entries) = std::fs::read_dir(root) else {
@@ -967,7 +1086,7 @@ fn discover_transport_mounts(mount_roots: &[PathBuf]) -> Vec<PathBuf> {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.join(PROTOCOL_ROOT).join(DISK_INFO_FILE).exists() {
+            if path.is_dir() {
                 mounts.push(path);
             }
         }
@@ -998,30 +1117,19 @@ mod tests {
         }
     }
 
-    #[derive(Clone)]
-    struct MockVerifier {
-        response: DiskVerifyResponse,
-        requests: Arc<Mutex<Vec<DiskVerifyRequest>>>,
-    }
-
-    impl CenterDiskVerifier for MockVerifier {
-        fn verify_disk<'a>(
-            &'a self,
-            request: DiskVerifyRequest,
-        ) -> BoxFuture<'a, Result<DiskVerifyResponse, DiskDetectionError>> {
-            Box::pin(async move {
-                self.requests
-                    .lock()
-                    .expect("requests mutex poisoned")
-                    .push(request);
-                Ok(self.response.clone())
-            })
-        }
-    }
-
     #[derive(Clone, Default)]
     struct MockLedger {
         records: Arc<Mutex<Vec<DiskRuntimeRecord>>>,
+        existing: Arc<Mutex<Vec<DiskRuntimeRecord>>>,
+    }
+
+    impl MockLedger {
+        fn with_existing(existing: Vec<DiskRuntimeRecord>) -> Self {
+            Self {
+                records: Arc::new(Mutex::new(Vec::new())),
+                existing: Arc::new(Mutex::new(existing)),
+            }
+        }
     }
 
     impl DiskRuntimeLedger for MockLedger {
@@ -1035,6 +1143,52 @@ mod tests {
                     .expect("records mutex poisoned")
                     .push(record);
                 Ok(())
+            })
+        }
+
+        fn mark_missing_disks_removed<'a>(
+            &'a self,
+            current_records: &'a [DiskRuntimeRecord],
+        ) -> BoxFuture<'a, Result<Vec<DiskRuntimeRecord>, DiskDetectionError>> {
+            Box::pin(async move {
+                let current_ids = current_records
+                    .iter()
+                    .filter_map(|record| record.disk_id.clone())
+                    .collect::<HashSet<_>>();
+                let current_locations = current_records
+                    .iter()
+                    .map(|record| (record.device_path.clone(), record.mount_path.clone()))
+                    .collect::<HashSet<_>>();
+                let removed = self
+                    .existing
+                    .lock()
+                    .expect("existing mutex poisoned")
+                    .iter()
+                    .filter(|record| record.runtime_status != "REMOVED")
+                    .filter(|record| {
+                        !record
+                            .disk_id
+                            .as_ref()
+                            .is_some_and(|disk_id| current_ids.contains(disk_id))
+                            && !current_locations
+                                .contains(&(record.device_path.clone(), record.mount_path.clone()))
+                    })
+                    .map(|record| {
+                        let mut removed = record.clone();
+                        removed.runtime_status = RuntimeStatus::Removed.as_db_value().to_string();
+                        removed.last_error_code =
+                            Some(DiskErrorCode::DiskRemoved.as_db_value().to_string());
+                        removed.error_message =
+                            Some("transport disk is no longer detected by edge rescan".to_string());
+                        removed.task_pool_eligible = false;
+                        removed
+                    })
+                    .collect::<Vec<_>>();
+                self.records
+                    .lock()
+                    .expect("records mutex poisoned")
+                    .extend(removed.clone());
+                Ok(removed)
             })
         }
     }
@@ -1056,14 +1210,8 @@ mod tests {
     #[tokio::test]
     async fn rejects_non_ext4_before_center_verify() {
         let mount = temp_mount("non-ext4");
-        let requests = Arc::new(Mutex::new(Vec::new()));
         let ledger = MockLedger::default();
-        let detector = detector(
-            vec![disk(&mount, "xfs")],
-            verifier_response(true),
-            requests.clone(),
-            ledger.clone(),
-        );
+        let detector = detector(vec![disk(&mount, "xfs")], ledger.clone());
 
         let records = detector.scan_existing_transport_disks().await.unwrap();
 
@@ -1073,7 +1221,6 @@ mod tests {
             Some("FILESYSTEM_UNSUPPORTED")
         );
         assert!(!records[0].task_pool_eligible);
-        assert!(requests.lock().unwrap().is_empty());
         assert_eq!(ledger.records.lock().unwrap().len(), 1);
         fs::remove_dir_all(mount).ok();
     }
@@ -1082,23 +1229,16 @@ mod tests {
     async fn records_recovery_required_for_edge_copying_residue() {
         let mount = temp_mount("edge-copying");
         write_disk_info(&mount, "EDGE_COPYING");
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let detector = detector(
-            vec![disk(&mount, "ext4")],
-            verifier_response(true),
-            requests.clone(),
-            MockLedger::default(),
-        );
+        let detector = detector(vec![disk(&mount, "ext4")], MockLedger::default());
 
         let records = detector.scan_existing_transport_disks().await.unwrap();
 
-        assert_eq!(records[0].runtime_status, "ERROR");
+        assert_eq!(records[0].runtime_status, "REJECTED");
         assert_eq!(
             records[0].last_error_code.as_deref(),
             Some("RECOVERY_REQUIRED")
         );
         assert!(!records[0].task_pool_eligible);
-        assert!(requests.lock().unwrap().is_empty());
         fs::remove_dir_all(mount).ok();
     }
 
@@ -1112,16 +1252,11 @@ mod tests {
             .join("object.bin.partial");
         fs::create_dir_all(partial_path.parent().unwrap()).unwrap();
         fs::write(&partial_path, b"partial-bytes").unwrap();
-        let detector = detector(
-            vec![disk(&mount, "ext4")],
-            verifier_response(true),
-            Arc::new(Mutex::new(Vec::new())),
-            MockLedger::default(),
-        );
+        let detector = detector(vec![disk(&mount, "ext4")], MockLedger::default());
 
         let records = detector.scan_existing_transport_disks().await.unwrap();
 
-        assert_eq!(records[0].runtime_status, "ERROR");
+        assert_eq!(records[0].runtime_status, "REJECTED");
         assert_eq!(
             records[0].last_error_code.as_deref(),
             Some("RECOVERY_REQUIRED")
@@ -1133,17 +1268,101 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ready_after_initialized_disk_passes_center_verify() {
+    async fn rejects_uninitialized_ext4_candidate_without_protocol_marker() {
+        let mount = temp_mount("uninitialized-candidate");
+        fs::remove_file(mount.join(PROTOCOL_ROOT).join(DISK_INFO_FILE)).ok();
+        let ledger = MockLedger::default();
+        let detector = detector(vec![disk(&mount, "ext4")], ledger.clone());
+
+        let records = detector.scan_existing_transport_disks().await.unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].runtime_status, "REJECTED");
+        assert_eq!(records[0].status_code.as_deref(), Some("UNREGISTERED"));
+        assert_eq!(
+            records[0].last_error_code.as_deref(),
+            Some("MANIFEST_INVALID")
+        );
+        assert!(records[0]
+            .error_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("missing rustfs-transfer/disk_info.json"));
+        assert!(!records[0].task_pool_eligible);
+        assert_eq!(records[0].disk_enabled, Some(false));
+        assert!(records[0].disk_id.is_none());
+        assert_eq!(ledger.records.lock().unwrap().len(), 1);
+        fs::remove_dir_all(mount).ok();
+    }
+
+    #[tokio::test]
+    async fn mixed_protocol_and_uninitialized_candidates_keep_distinct_identity() {
+        let protocol_mount = temp_mount("mixed-protocol-imported");
+        write_disk_info(&protocol_mount, "IMPORTED");
+        let fresh_mount = temp_mount("mixed-uninitialized");
+        fs::remove_file(fresh_mount.join(PROTOCOL_ROOT).join(DISK_INFO_FILE)).ok();
+
+        let mut protocol_disk = disk(&protocol_mount, "ext4");
+        protocol_disk.sn = "SN-PROTOCOL".to_string();
+        protocol_disk.device_path = "/dev/sdb1".to_string();
+        protocol_disk.capacity_bytes = 100 * GIB;
+        protocol_disk.free_bytes = 40 * GIB;
+
+        let mut fresh_disk = disk(&fresh_mount, "ext4");
+        fresh_disk.sn = "SN-FRESH".to_string();
+        fresh_disk.device_path = "/dev/sdc1".to_string();
+        fresh_disk.capacity_bytes = 200 * GIB;
+        fresh_disk.free_bytes = 120 * GIB;
+        fresh_disk.fs_uuid = Some("fresh-fs-uuid".to_string());
+        fresh_disk.label = Some("FRESH-NOT-INIT".to_string());
+
+        let detector = detector(
+            vec![protocol_disk.clone(), fresh_disk.clone()],
+            MockLedger::default(),
+        );
+
+        let records = detector.scan_existing_transport_disks().await.unwrap();
+
+        assert_eq!(records.len(), 2);
+        let protocol = records
+            .iter()
+            .find(|record| record.device_path == "/dev/sdb1")
+            .unwrap();
+        let fresh = records
+            .iter()
+            .find(|record| record.device_path == "/dev/sdc1")
+            .unwrap();
+
+        assert_eq!(protocol.sn, "SN-PROTOCOL");
+        assert_eq!(
+            protocol.disk_id.as_deref(),
+            Some("11111111-1111-1111-1111-111111111111")
+        );
+        assert_eq!(protocol.status_code.as_deref(), Some("IMPORTED"));
+        assert_eq!(protocol.capacity_bytes, 100 * GIB);
+        assert_eq!(protocol.runtime_status, "REJECTED");
+
+        assert_eq!(fresh.sn, "SN-FRESH");
+        assert!(fresh.disk_id.is_none());
+        assert_eq!(fresh.status_code.as_deref(), Some("UNREGISTERED"));
+        assert_eq!(fresh.capacity_bytes, 200 * GIB);
+        assert_eq!(
+            fresh.mount_path.as_deref(),
+            Some(fresh_mount.to_str().unwrap())
+        );
+        assert_eq!(fresh.runtime_status, "REJECTED");
+        assert_eq!(fresh.last_error_code.as_deref(), Some("MANIFEST_INVALID"));
+
+        fs::remove_dir_all(protocol_mount).ok();
+        fs::remove_dir_all(fresh_mount).ok();
+    }
+
+    #[tokio::test]
+    async fn ready_after_initialized_disk_passes_local_checks_without_center_verify() {
         let mount = temp_mount("ready");
         write_disk_info(&mount, "INITIALIZED");
-        let requests = Arc::new(Mutex::new(Vec::new()));
         let ledger = MockLedger::default();
-        let detector = detector(
-            vec![disk(&mount, "ext4")],
-            verifier_response(true),
-            requests.clone(),
-            ledger.clone(),
-        );
+        let detector = detector(vec![disk(&mount, "ext4")], ledger.clone());
 
         let records = detector.scan_existing_transport_disks().await.unwrap();
 
@@ -1151,12 +1370,6 @@ mod tests {
         assert_eq!(records[0].status_code.as_deref(), Some("INITIALIZED"));
         assert_eq!(records[0].disk_enabled, Some(true));
         assert!(records[0].task_pool_eligible);
-        let request = requests.lock().unwrap().first().cloned().unwrap();
-        assert_eq!(request.edge_code, "edge-a");
-        assert_eq!(request.disk_id, "11111111-1111-1111-1111-111111111111");
-        assert_eq!(request.sn.as_deref(), Some("SN-001"));
-        assert_eq!(request.status_code, "INITIALIZED");
-        assert_eq!(request.protocol_version, "1.0");
         let persisted = ledger.records.lock().unwrap().first().cloned().unwrap();
         assert_eq!(
             persisted.disk_id.as_deref(),
@@ -1170,16 +1383,11 @@ mod tests {
     async fn publishes_detected_checking_and_ready_runtime_events() {
         let mount = temp_mount("runtime-events-ready");
         write_disk_info(&mount, "INITIALIZED");
-        let requests = Arc::new(Mutex::new(Vec::new()));
         let publisher = MockEventPublisher::default();
         let detector = EdgeDiskDetector::new_with_event_publisher(
             EdgeDiskDetectorConfig::new("edge-a"),
             MockProbe {
                 disks: vec![disk(&mount, "ext4")],
-            },
-            MockVerifier {
-                response: verifier_response(true),
-                requests,
             },
             MockLedger::default(),
             publisher.clone(),
@@ -1196,6 +1404,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_rescan_marks_previous_runtime_removed_and_publishes_event() {
+        let mount = temp_mount("removed-rescan");
+        write_disk_info(&mount, "INITIALIZED");
+        let mut previous = base_record(&disk(&mount, "ext4"));
+        previous.disk_id = Some("11111111-1111-1111-1111-111111111111".to_string());
+        previous.runtime_status = RuntimeStatus::Ready.as_db_value().to_string();
+        previous.status_code = Some("INITIALIZED".to_string());
+        previous.task_pool_eligible = true;
+        let ledger = MockLedger::with_existing(vec![previous]);
+        let publisher = MockEventPublisher::default();
+        let detector = EdgeDiskDetector::new_with_event_publisher(
+            EdgeDiskDetectorConfig::new("edge-a"),
+            MockProbe { disks: Vec::new() },
+            ledger.clone(),
+            publisher.clone(),
+        );
+
+        let records = detector.scan_existing_transport_disks().await.unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].runtime_status, "REMOVED");
+        assert_eq!(records[0].last_error_code.as_deref(), Some("DISK_REMOVED"));
+        assert!(!records[0].task_pool_eligible);
+        assert_eq!(ledger.records.lock().unwrap().len(), 1);
+        assert_eq!(
+            publisher.runtime_statuses.lock().unwrap().as_slice(),
+            &["REMOVED"]
+        );
+        fs::remove_dir_all(mount).ok();
+    }
+
+    #[tokio::test]
+    async fn empty_rescan_marks_previous_uninitialized_candidate_removed_by_location() {
+        let mount = temp_mount("removed-uninitialized-candidate");
+        let mut previous = base_record(&disk(&mount, "ext4"));
+        previous.runtime_status = RuntimeStatus::Rejected.as_db_value().to_string();
+        previous.status_code = Some("UNREGISTERED".to_string());
+        previous.last_error_code = Some(DiskErrorCode::ManifestInvalid.as_db_value().to_string());
+        let ledger = MockLedger::with_existing(vec![previous]);
+        let detector = EdgeDiskDetector::new(
+            EdgeDiskDetectorConfig::new("edge-a"),
+            MockProbe { disks: Vec::new() },
+            ledger.clone(),
+        );
+
+        let records = detector.scan_existing_transport_disks().await.unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].runtime_status, "REMOVED");
+        assert_eq!(records[0].last_error_code.as_deref(), Some("DISK_REMOVED"));
+        assert!(records[0].disk_id.is_none());
+        assert_eq!(ledger.records.lock().unwrap().len(), 1);
+        fs::remove_dir_all(mount).ok();
+    }
+
+    #[tokio::test]
     async fn refreshed_disk_info_id_becomes_runtime_identity_without_cache_requirement() {
         let mount = temp_mount("refreshed-disk-id");
         write_disk_info_with_disk_id(
@@ -1203,21 +1467,8 @@ mod tests {
             "INITIALIZED",
             "33333333-3333-3333-3333-333333333333",
         );
-        let requests = Arc::new(Mutex::new(Vec::new()));
         let ledger = MockLedger::default();
-        let detector = detector(
-            vec![disk(&mount, "ext4")],
-            DiskVerifyResponse {
-                allowed: true,
-                disk_id: "33333333-3333-3333-3333-333333333333".to_string(),
-                disk_enabled: true,
-                expected_status: "INITIALIZED".to_string(),
-                action: VerifyAction::AllowExport,
-                message: None,
-            },
-            requests.clone(),
-            ledger.clone(),
-        );
+        let detector = detector(vec![disk(&mount, "ext4")], ledger.clone());
 
         let records = detector.scan_existing_transport_disks().await.unwrap();
 
@@ -1227,10 +1478,6 @@ mod tests {
             Some("33333333-3333-3333-3333-333333333333")
         );
         assert!(records[0].task_pool_eligible);
-        assert_eq!(
-            requests.lock().unwrap()[0].disk_id,
-            "33333333-3333-3333-3333-333333333333"
-        );
         assert_eq!(
             ledger.records.lock().unwrap()[0].disk_id.as_deref(),
             Some("33333333-3333-3333-3333-333333333333")
@@ -1242,17 +1489,11 @@ mod tests {
     async fn rejects_missing_hardware_sn_before_center_verify() {
         let mount = temp_mount("missing-sn");
         write_disk_info(&mount, "INITIALIZED");
-        let requests = Arc::new(Mutex::new(Vec::new()));
         let mut detected = disk(&mount, "ext4");
         detected.sn.clear();
         detected.id_serial = None;
         detected.id_serial_short = None;
-        let detector = detector(
-            vec![detected],
-            verifier_response(true),
-            requests.clone(),
-            MockLedger::default(),
-        );
+        let detector = detector(vec![detected], MockLedger::default());
 
         let records = detector.scan_existing_transport_disks().await.unwrap();
 
@@ -1262,64 +1503,40 @@ mod tests {
             Some("HARDWARE_SN_UNAVAILABLE")
         );
         assert!(!records[0].task_pool_eligible);
-        assert!(requests.lock().unwrap().is_empty());
         fs::remove_dir_all(mount).ok();
     }
 
     #[tokio::test]
-    async fn center_rejection_blocks_unregistered_disabled_or_sealed_disk() {
-        let mount = temp_mount("center-rejected");
+    async fn rejects_non_initialized_disk_without_center_verify() {
+        let mount = temp_mount("not-initialized");
         write_disk_info(&mount, "SEALED");
-        let detector = detector(
-            vec![disk(&mount, "ext4")],
-            DiskVerifyResponse {
-                allowed: false,
-                disk_id: "11111111-1111-1111-1111-111111111111".to_string(),
-                disk_enabled: false,
-                expected_status: "INITIALIZED".to_string(),
-                action: VerifyAction::NeedImportFirst,
-                message: Some("need import first".to_string()),
-            },
-            Arc::new(Mutex::new(Vec::new())),
-            MockLedger::default(),
-        );
+        let detector = detector(vec![disk(&mount, "ext4")], MockLedger::default());
 
         let records = detector.scan_existing_transport_disks().await.unwrap();
 
         assert_eq!(records[0].runtime_status, "REJECTED");
         assert_eq!(
             records[0].last_error_code.as_deref(),
-            Some("CENTER_REJECTED")
+            Some("MANIFEST_INVALID")
         );
-        assert_eq!(records[0].disk_enabled, Some(false));
+        assert_eq!(records[0].status_code.as_deref(), Some("SEALED"));
+        assert_eq!(records[0].disk_enabled, Some(true));
         assert!(!records[0].task_pool_eligible);
         fs::remove_dir_all(mount).ok();
     }
 
     #[tokio::test]
-    async fn center_signature_rejection_blocks_initialized_disk() {
-        let mount = temp_mount("signature-rejected");
-        write_disk_info(&mount, "INITIALIZED");
-        let detector = detector(
-            vec![disk(&mount, "ext4")],
-            DiskVerifyResponse {
-                allowed: false,
-                disk_id: "11111111-1111-1111-1111-111111111111".to_string(),
-                disk_enabled: true,
-                expected_status: "INITIALIZED".to_string(),
-                action: VerifyAction::Reject,
-                message: Some("center_signature invalid".to_string()),
-            },
-            Arc::new(Mutex::new(Vec::new())),
-            MockLedger::default(),
-        );
+    async fn missing_center_signature_rejects_initialized_disk_locally() {
+        let mount = temp_mount("signature-missing");
+        write_disk_info_without_center_signature(&mount, "INITIALIZED");
+        let detector = detector(vec![disk(&mount, "ext4")], MockLedger::default());
 
         let records = detector.scan_existing_transport_disks().await.unwrap();
 
         assert_eq!(records[0].runtime_status, "REJECTED");
         assert_eq!(
             records[0].last_error_code.as_deref(),
-            Some("CENTER_REJECTED")
+            Some("SIGNATURE_INVALID")
         );
         assert!(!records[0].task_pool_eligible);
         fs::remove_dir_all(mount).ok();
@@ -1338,31 +1555,13 @@ mod tests {
 
     fn detector(
         disks: Vec<DetectedDisk>,
-        response: DiskVerifyResponse,
-        requests: Arc<Mutex<Vec<DiskVerifyRequest>>>,
         ledger: MockLedger,
-    ) -> EdgeDiskDetector<MockProbe, MockVerifier, MockLedger> {
+    ) -> EdgeDiskDetector<MockProbe, MockLedger> {
         EdgeDiskDetector::new(
             EdgeDiskDetectorConfig::new("edge-a"),
             MockProbe { disks },
-            MockVerifier { response, requests },
             ledger,
         )
-    }
-
-    fn verifier_response(allowed: bool) -> DiskVerifyResponse {
-        DiskVerifyResponse {
-            allowed,
-            disk_id: "11111111-1111-1111-1111-111111111111".to_string(),
-            disk_enabled: allowed,
-            expected_status: "INITIALIZED".to_string(),
-            action: if allowed {
-                VerifyAction::AllowExport
-            } else {
-                VerifyAction::Reject
-            },
-            message: None,
-        }
     }
 
     fn disk(mount_path: &Path, filesystem: &str) -> DetectedDisk {
@@ -1399,6 +1598,21 @@ mod tests {
   "protocol": {{ "version": "1.0" }},
   "disk": {{ "disk_id": "{disk_id}" }},
   "status": {{ "code": "{status_code}" }},
+  "security": {{
+    "data_key_id": "22222222-2222-2222-2222-222222222222",
+    "center_signature": "test-center-signature"
+  }}
+}}"#
+        );
+        fs::write(mount.join(PROTOCOL_ROOT).join(DISK_INFO_FILE), payload).unwrap();
+    }
+
+    fn write_disk_info_without_center_signature(mount: &Path, status_code: &str) {
+        let payload = format!(
+            r#"{{
+  "protocol": {{ "version": "1.0" }},
+  "disk": {{ "disk_id": "11111111-1111-1111-1111-111111111111" }},
+  "status": {{ "code": "{status_code}" }},
   "security": {{ "data_key_id": "22222222-2222-2222-2222-222222222222" }}
 }}"#
         );
@@ -1417,7 +1631,23 @@ mod tests {
         write_disk_info(&child, "INITIALIZED");
         let mounts = discover_transport_mounts(&[root.clone()]);
 
-        assert_eq!(mounts, vec![child]);
+        assert_eq!(mounts, vec![root.clone(), child]);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn configured_probe_discovers_child_candidates_without_protocol_marker() {
+        let root = std::env::temp_dir().join(format!(
+            "rustfs-transfer-edge-test-root-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let child = root.join("fresh-center-init-needed");
+        fs::create_dir_all(&child).unwrap();
+
+        let mounts = discover_transport_mounts(&[root.clone()]);
+
+        assert_eq!(mounts, vec![root.clone(), child]);
         fs::remove_dir_all(root).ok();
     }
 

@@ -9,6 +9,7 @@ import {
 
 export type EdgeProgressEventType =
   | "COPY_PROGRESS"
+  | "COPY_STARTED"
   | "COPY_DONE"
   | "SEAL_DONE"
   | "DISK_DETECTED"
@@ -16,6 +17,9 @@ export type EdgeProgressEventType =
   | "DISK_CHECKING"
   | "DISK_READY"
   | "DISK_REJECTED"
+  | "SCAN_STARTED"
+  | "SCAN_PROGRESS"
+  | "SCAN_DONE"
   | "ERROR";
 
 export interface CopyProgressEvent {
@@ -42,6 +46,7 @@ export interface EdgeProgressSocket {
 
 const eventTypes: readonly EdgeProgressEventType[] = [
   "COPY_PROGRESS",
+  "COPY_STARTED",
   "COPY_DONE",
   "SEAL_DONE",
   "DISK_DETECTED",
@@ -49,6 +54,9 @@ const eventTypes: readonly EdgeProgressEventType[] = [
   "DISK_CHECKING",
   "DISK_READY",
   "DISK_REJECTED",
+  "SCAN_STARTED",
+  "SCAN_PROGRESS",
+  "SCAN_DONE",
   "ERROR",
 ];
 
@@ -118,7 +126,7 @@ export function applyCopyProgressEvent(
   const eventIsTerminal = isTerminalExportJobStatus(event.export_job_status);
   const sameJob = summary.export_job_id === event.export_job_id;
 
-  if (summaryIsTerminal && summary.disks.length === 0 && !eventIsTerminal) {
+  if (summaryIsTerminal && summary.disks.length === 0 && !eventIsTerminal && !event.event_type.startsWith("DISK_")) {
     return {
       ...summary,
       ws_connected: true,
@@ -126,7 +134,7 @@ export function applyCopyProgressEvent(
     };
   }
 
-  if (sameJob && summaryIsTerminal && !eventIsTerminal) {
+  if (sameJob && summaryIsTerminal && !eventIsTerminal && !event.event_type.startsWith("DISK_")) {
     return {
       ...summary,
       ws_connected: true,
@@ -141,23 +149,14 @@ export function applyCopyProgressEvent(
     export_job_status: event.export_job_status,
     disk_status_code: visibleDiskStatusCode(event.disk_status_code),
     global_progress: event.global_progress,
-    disks: mergeDiskProgress(summary.disks, event.disks),
+    disks: mergeDiskProgress(event.disks),
     ws_connected: true,
     message: event.message,
   };
 }
 
-function mergeDiskProgress(
-  currentDisks: EdgeDiskProgress[],
-  eventDisks: EdgeDiskProgress[],
-): EdgeDiskProgress[] {
-  const eventByDiskId = new Map(eventDisks.map((disk) => [disk.disk_id, normalizeDiskProgress(disk)]));
-  const merged = currentDisks.map((disk) => eventByDiskId.get(disk.disk_id) ?? disk);
-  const knownDiskIds = new Set(currentDisks.map((disk) => disk.disk_id));
-  for (const disk of eventByDiskId.values()) {
-    if (!knownDiskIds.has(disk.disk_id)) merged.push(disk);
-  }
-  return merged;
+function mergeDiskProgress(eventDisks: EdgeDiskProgress[]): EdgeDiskProgress[] {
+  return eventDisks.map(normalizeDiskProgress);
 }
 
 function isTerminalExportJobStatus(

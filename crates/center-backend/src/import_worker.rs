@@ -15,7 +15,8 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::center_security::{
-    verify_disk_info_with_key, ENCRYPTION_ALG_AES_256_GCM, SIGNATURE_ALG_HMAC_SHA256,
+    derive_offline_disk_data_key, verify_disk_info_with_key, ENCRYPTION_ALG_AES_256_GCM,
+    SIGNATURE_ALG_HMAC_SHA256,
 };
 use rustfs_transfer_common::crypto::{object_aad, ObjectAad};
 
@@ -157,7 +158,8 @@ pub trait ImportRepository {
     fn fail_import(&mut self, import_job_id: Uuid, code: ImportErrorCode, message: &str);
     fn disk_registered(&self, disk_id: Uuid) -> bool;
     fn disk_enabled(&self, disk_id: Uuid) -> bool;
-    fn data_key(&self, disk_id: Uuid, data_key_id: Uuid) -> Option<Vec<u8>>;
+    fn active_edge_auth_secret(&self, edge_code: &str) -> Option<String>;
+    fn validate_data_key_for_import(&self, data_key: &ImportedDataKeyBinding) -> ImportResult<()>;
     fn identity_imported(&self, identity: &LedgerIdentity) -> bool;
     fn nonce_used(&self, data_key_id: Uuid, nonce: &str) -> bool;
     fn insert_ledger(&mut self, record: LedgerRecord);
@@ -311,6 +313,28 @@ where
             )
         })?;
         let checked = validate_manifest(&disk_info, &manifest, &actual_manifest_sha)?;
+        let Some(edge_auth_secret) = self.repo.active_edge_auth_secret(&checked.edge_code) else {
+            return Err(ImportError::new(
+                ImportErrorCode::ManifestInvalid,
+                "edge site is not active",
+            ));
+        };
+        self.repo
+            .validate_data_key_for_import(&checked.data_key_binding())?;
+        let disk_data_key = derive_offline_disk_data_key(
+            &edge_auth_secret,
+            &checked.edge_code,
+            checked.disk_id,
+            checked.data_key_id,
+            checked.export_job_id,
+            checked.seal_id,
+        )
+        .map_err(|err| {
+            ImportError::new(
+                ImportErrorCode::DecryptFailed,
+                format!("failed to derive offline disk data key: {err}"),
+            )
+        })?;
         let claim = self.repo.begin_import(ImportJobStart {
             disk_id,
             seal_id: checked.seal_id,
@@ -356,6 +380,7 @@ where
             &manifest,
             import_job_id,
             &checked,
+            &disk_data_key,
         ) {
             Ok((count, bytes)) => {
                 self.repo.complete_import(ImportCompletion {
@@ -383,6 +408,7 @@ where
         manifest: &ExportManifest,
         import_job_id: Uuid,
         checked: &CheckedManifest,
+        disk_data_key: &[u8; 32],
     ) -> ImportResult<(u64, u64)> {
         let import_bucket = format!("archive-{}", checked.edge_code);
         self.storage.ensure_bucket(&import_bucket)?;
@@ -404,8 +430,7 @@ where
                 ));
             }
 
-            let plaintext =
-                self.decrypt_object(protocol_root, checked.disk_id, disk_info, object)?;
+            let plaintext = self.decrypt_object(protocol_root, disk_info, object, disk_data_key)?;
             if object.chunked {
                 self.register_chunk(object, checked, import_job_id, plaintext)?;
                 if self.try_merge_chunk_group(object, checked, import_job_id, &import_bucket)? {
@@ -444,9 +469,9 @@ where
     fn decrypt_object(
         &self,
         protocol_root: &Path,
-        disk_id: Uuid,
         disk_info: &DiskInfo,
         object: &ManifestObject,
+        disk_data_key: &[u8; 32],
     ) -> ImportResult<Vec<u8>> {
         if object.data_key_id.to_string() != disk_info.security.data_key_id {
             return Err(ImportError::new(
@@ -454,12 +479,6 @@ where
                 "object data_key_id does not match disk_info security.data_key_id",
             ));
         }
-        let key = self
-            .repo
-            .data_key(disk_id, object.data_key_id)
-            .ok_or_else(|| {
-                ImportError::new(ImportErrorCode::DecryptFailed, "data key not found")
-            })?;
         let ciphertext_path =
             safe_protocol_path(protocol_root, &object.relative_data_path, Some("data/"))?;
         let ciphertext = fs::read(&ciphertext_path).map_err(|err| {
@@ -484,13 +503,13 @@ where
 
         let nonce = decode_b64_or_hex("nonce", &object.nonce)?;
         let tag = decode_b64_or_hex("tag", &object.tag)?;
-        if nonce.len() != 12 || tag.len() != 16 || key.len() != 32 {
+        if nonce.len() != 12 || tag.len() != 16 {
             return Err(ImportError::new(
                 ImportErrorCode::DecryptFailed,
                 "invalid AES-GCM key, nonce or tag length",
             ));
         }
-        let cipher = Aes256Gcm::new_from_slice(&key)
+        let cipher = Aes256Gcm::new_from_slice(disk_data_key)
             .map_err(|_| ImportError::new(ImportErrorCode::DecryptFailed, "invalid AES key"))?;
         let mut payload = ciphertext;
         payload.extend_from_slice(&tag);
@@ -1201,10 +1220,15 @@ pub const DATA_KEY_STATUS_REVOKED: &str = "REVOKED";
 
 #[derive(Debug, Clone)]
 struct MemoryDataKey {
-    key: Vec<u8>,
     status: String,
     export_job_id: Option<Uuid>,
     seal_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone)]
+struct MemoryEdgeSite {
+    edge_auth_secret: String,
+    edge_status: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1218,6 +1242,7 @@ pub struct MemoryDataKeyState {
 pub struct MemoryRepository {
     registered_disks: HashSet<Uuid>,
     disabled_disks: HashSet<Uuid>,
+    edges: HashMap<String, MemoryEdgeSite>,
     data_keys: HashMap<(Uuid, Uuid), MemoryDataKey>,
     jobs: HashMap<(Uuid, Uuid), MemoryImportJob>,
     ledger: Vec<LedgerRecord>,
@@ -1227,6 +1252,33 @@ pub struct MemoryRepository {
 impl MemoryRepository {
     pub fn register_disk(&mut self, disk_id: Uuid) {
         self.registered_disks.insert(disk_id);
+    }
+
+    pub fn disable_disk(&mut self, disk_id: Uuid) {
+        self.disabled_disks.insert(disk_id);
+    }
+
+    pub fn register_edge(
+        &mut self,
+        edge_code: impl Into<String>,
+        edge_auth_secret: impl Into<String>,
+    ) {
+        self.put_edge(edge_code, edge_auth_secret, "ACTIVE");
+    }
+
+    pub fn put_edge(
+        &mut self,
+        edge_code: impl Into<String>,
+        edge_auth_secret: impl Into<String>,
+        edge_status: impl Into<String>,
+    ) {
+        self.edges.insert(
+            edge_code.into(),
+            MemoryEdgeSite {
+                edge_auth_secret: edge_auth_secret.into(),
+                edge_status: edge_status.into(),
+            },
+        );
     }
 
     pub fn put_data_key(&mut self, disk_id: Uuid, data_key_id: Uuid, key: Vec<u8>) {
@@ -1241,12 +1293,11 @@ impl MemoryRepository {
         disk_id: Uuid,
         data_key_id: Uuid,
         export_job_id: Uuid,
-        key: Vec<u8>,
+        _key: Vec<u8>,
     ) {
         self.data_keys.insert(
             (disk_id, data_key_id),
             MemoryDataKey {
-                key,
                 status: DATA_KEY_STATUS_ISSUED.to_string(),
                 export_job_id: Some(export_job_id),
                 seal_id: None,
@@ -1455,11 +1506,15 @@ impl ImportRepository for MemoryRepository {
         !self.disabled_disks.contains(&disk_id)
     }
 
-    fn data_key(&self, disk_id: Uuid, data_key_id: Uuid) -> Option<Vec<u8>> {
-        self.data_keys
-            .get(&(disk_id, data_key_id))
-            .filter(|key| key.status != DATA_KEY_STATUS_REVOKED)
-            .map(|key| key.key.clone())
+    fn active_edge_auth_secret(&self, edge_code: &str) -> Option<String> {
+        self.edges
+            .get(edge_code)
+            .filter(|edge| edge.edge_status == "ACTIVE")
+            .map(|edge| edge.edge_auth_secret.clone())
+    }
+
+    fn validate_data_key_for_import(&self, data_key: &ImportedDataKeyBinding) -> ImportResult<()> {
+        self.validate_data_key_binding(data_key)
     }
 
     fn identity_imported(&self, identity: &LedgerIdentity) -> bool {

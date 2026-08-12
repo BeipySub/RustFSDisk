@@ -62,6 +62,15 @@ if ($centerEnv -notmatch "RUSTFS_TRANSFER__SECURITY__CENTER_SIGNATURE_KEY=CHANGE
 }
 
 $edgeToml = Get-Content -Raw (Join-Path $repo "deploy/config/edge.example.toml")
+if ($edgeToml -notmatch "Edge offline export must not depend on Center reachability") {
+    Add-Failure "edge config example must document that center.base_url is not required by offline export"
+}
+if ($edgeToml -notmatch "only an HMAC derivation input") {
+    Add-Failure "edge config example must document edge_auth_secret as derivation input, not AES key material"
+}
+if ($edgeToml -match "edge_auth_secret\s*=\s*`"(?!CHANGE_ME|example|dev|test)[^`"]+`"") {
+    Add-Failure "edge config example must not include an inline real edge_auth_secret"
+}
 if ($edgeToml -notmatch "\[auto_export\]") {
     Add-Failure "edge config example must include auto_export section"
 }
@@ -79,6 +88,12 @@ if ($edgeToml -notmatch "cooldown_seconds\s*=\s*60") {
 }
 
 $edgeEnv = Get-Content -Raw (Join-Path $repo "deploy/config/edge.env.example")
+if ($edgeEnv -notmatch "offline HMAC derivation input") {
+    Add-Failure "edge.env.example must document EDGE_AUTH_SECRET as offline derivation input"
+}
+if ($edgeEnv -notmatch "Center reachability") {
+    Add-Failure "edge.env.example must document CENTER_BASE_URL as non-required for offline export"
+}
 if ($edgeEnv -notmatch "RUSTFS_TRANSFER__AUTO_EXPORT__ENABLED=false") {
     Add-Failure "edge.env.example must keep auto export disabled by default"
 }

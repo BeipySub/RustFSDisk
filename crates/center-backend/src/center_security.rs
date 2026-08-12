@@ -6,7 +6,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use rand::{rngs::OsRng, RngCore};
 use rustfs_transfer_common::crypto::{
     center_signature_canonical_json, decode_base64, decode_hex, encode_base64, generate_nonce,
-    sha256_lower_hex, sign_center_signature, verify_center_signature, AES_GCM_TAG_LEN,
+    sha256_lower_hex, sign_center_signature, sign_string_hmac_base64, verify_center_signature,
+    AES_GCM_TAG_LEN,
 };
 use serde::Serialize;
 use uuid::Uuid;
@@ -19,6 +20,7 @@ pub const ENCRYPTION_ALG_AES_256_GCM: &str = "AES-256-GCM";
 
 const WRAPPED_KEY_PREFIX: &str = "local-master-key:v1";
 const DATA_KEY_CONTEXT: &str = "rustfs-transfer:data-key";
+const OFFLINE_DISK_DATA_KEY_CONTEXT: &str = "rustfs-transfer:offline-disk-data-key:v1";
 const DISK_INFO_CONTEXT: &str = "rustfs-transfer:disk-info";
 
 #[derive(Clone)]
@@ -171,6 +173,26 @@ pub fn disk_info_canonical_json<T: Serialize>(disk_info: &T) -> Result<String> {
 
 pub fn disk_data_key_base64(key: &[u8; 32]) -> String {
     encode_base64(key)
+}
+
+pub fn derive_offline_disk_data_key(
+    edge_auth_secret: &str,
+    edge_code: &str,
+    disk_id: Uuid,
+    data_key_id: Uuid,
+    export_job_id: Uuid,
+    seal_id: Uuid,
+) -> Result<[u8; 32]> {
+    let message = format!(
+        "{OFFLINE_DISK_DATA_KEY_CONTEXT}\nedge_code={edge_code}\ndisk_id={disk_id}\ndata_key_id={data_key_id}\nexport_job_id={export_job_id}\nseal_id={seal_id}"
+    );
+    let key = decode_base64(&sign_string_hmac_base64(
+        edge_auth_secret.as_bytes(),
+        &message,
+    ))
+    .map_err(|error| anyhow!(error.to_string()))?;
+    key.try_into()
+        .map_err(|_| anyhow!("offline disk data key derivation did not produce 32 bytes"))
 }
 
 fn read_key_from_env(env_name: &str) -> Result<[u8; 32]> {

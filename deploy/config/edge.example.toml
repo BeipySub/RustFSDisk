@@ -6,9 +6,17 @@ control_api_token_env = "RUSTFS_TRANSFER__SERVER__CONTROL_API_TOKEN"
 url = "postgres://rustfs_transfer_edge:change-me@127.0.0.1:5432/rustfs_transfer_edge"
 
 [center]
+# Kept for legacy audit tooling and non-export compatibility only.
+# Edge offline export must not depend on Center reachability or this URL.
 base_url = "http://center.example.com:8080"
 edge_code = "edge-demo"
+# Kept as an audit identifier for legacy Center HMAC requests.
+# It is not required by the Edge offline export main flow.
 auth_key_id = "CHANGE_ME_AUTH_KEY_ID"
+# Deploy-time source for center.edge_auth_secret. Use a secret manager or
+# environment file; never place a real authorization secret in this example.
+# In offline export this secret is only an HMAC derivation input for the
+# per-seal disk_data_key, never the AES-256-GCM key itself.
 edge_auth_secret_env = "RUSTFS_TRANSFER__CENTER__EDGE_AUTH_SECRET"
 
 [rustfs]

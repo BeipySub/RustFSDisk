@@ -35,8 +35,10 @@ pub struct DatabaseConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CenterConfig {
+    #[serde(default)]
     pub base_url: String,
     pub edge_code: String,
+    #[serde(default)]
     pub auth_key_id: String,
     #[serde(default)]
     pub edge_auth_secret: String,
@@ -210,9 +212,7 @@ impl EdgeConfig {
 
     fn validate(&self) -> anyhow::Result<()> {
         ensure_non_empty("database.url", &self.database.url)?;
-        ensure_non_empty("center.base_url", &self.center.base_url)?;
         ensure_non_empty("center.edge_code", &self.center.edge_code)?;
-        ensure_non_empty("center.auth_key_id", &self.center.auth_key_id)?;
         ensure_non_empty("center.edge_auth_secret", &self.center.edge_auth_secret)?;
         ensure_non_empty("rustfs.endpoint", &self.rustfs.endpoint)?;
         ensure_optional_non_empty("rustfs.access_key_id", &self.rustfs.access_key_id)?;
@@ -470,6 +470,31 @@ mod tests {
         std::env::remove_var("RUSTFS_TRANSFER__TEST_EDGE_SECRET");
         std::env::remove_var("RUSTFS_TRANSFER__TEST_RESCAN_TOKEN");
         std::env::remove_var("RUSTFS_TRANSFER__TEST_CONTROL_TOKEN");
+    }
+
+    #[test]
+    fn center_base_url_and_auth_key_id_are_not_required_for_offline_export() {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        clear_rustfs_credential_env();
+        let raw = r#"
+            [database]
+            url = "postgres://edge:edge@localhost/edge"
+
+            [center]
+            edge_code = "edge-a"
+            edge_auth_secret = "example-dev-secret"
+
+            [rustfs]
+            endpoint = "http://127.0.0.1:9000"
+            access_key_id = "edge-access-key"
+            secret_access_key = "edge-secret-key"
+        "#;
+
+        let config = EdgeConfig::from_toml(raw).expect("offline edge config loads");
+
+        assert_eq!(config.center.edge_code, "edge-a");
+        assert!(config.center.base_url.is_empty());
+        assert!(config.center.auth_key_id.is_empty());
     }
 
     #[test]

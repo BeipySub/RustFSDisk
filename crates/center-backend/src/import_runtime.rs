@@ -69,7 +69,7 @@ impl CenterImportControlService for ProductionCenterImportControlService {
             let handle = Handle::current();
 
             task::spawn_blocking(move || {
-                let mut repo = PgImportRepository::new(pool, handle.clone(), security);
+                let mut repo = PgImportRepository::new(pool, handle.clone());
                 let mut storage = S3ArchiveStorage::new(s3_client, handle);
                 let mut progress = ProgressAggregator::default();
                 let outcome =
@@ -171,16 +171,11 @@ fn is_import_job_status(status: &str) -> bool {
 struct PgImportRepository {
     pool: PgPool,
     handle: Handle,
-    security: CenterSecurity,
 }
 
 impl PgImportRepository {
-    fn new(pool: PgPool, handle: Handle, security: CenterSecurity) -> Self {
-        Self {
-            pool,
-            handle,
-            security,
-        }
+    fn new(pool: PgPool, handle: Handle) -> Self {
+        Self { pool, handle }
     }
 }
 
@@ -365,27 +360,62 @@ impl ImportRepository for PgImportRepository {
             .unwrap_or(false)
     }
 
-    fn data_key(&self, disk_id: Uuid, data_key_id: Uuid) -> Option<Vec<u8>> {
+    fn active_edge_auth_secret(&self, edge_code: &str) -> Option<String> {
+        self.handle
+            .block_on(async {
+                sqlx::query_scalar::<_, String>(
+                    r#"
+                    SELECT auth_secret_ciphertext
+                    FROM edge_site
+                    WHERE edge_code = $1
+                      AND status = 'ACTIVE'
+                    "#,
+                )
+                .bind(edge_code)
+                .fetch_optional(&self.pool)
+                .await
+            })
+            .ok()
+            .flatten()
+    }
+
+    fn validate_data_key_for_import(
+        &self,
+        data_key: &ImportedDataKeyBinding,
+    ) -> Result<(), ImportError> {
         self.handle.block_on(async {
             let row = sqlx::query(
                 r#"
-                SELECT encrypted_key
+                SELECT export_job_id, seal_id, status
                 FROM data_key
                 WHERE disk_id = $1
                   AND data_key_id = $2
                   AND status IN ('ACTIVE', 'ISSUED', 'SEALED_READONLY', 'RETIRED')
                 "#,
             )
-            .bind(disk_id)
-            .bind(data_key_id)
+            .bind(data_key.disk_id)
+            .bind(data_key.data_key_id)
             .fetch_optional(&self.pool)
             .await
-            .ok()??;
-            let encrypted_key: String = row.get("encrypted_key");
-            self.security
-                .unwrap_disk_data_key(disk_id, data_key_id, &encrypted_key)
-                .ok()
-                .map(Vec::from)
+            .map_err(repo_err)?
+            .ok_or_else(|| repo_invalid("data key not found or not usable for import"))?;
+            let export_job_id: Option<Uuid> = row.get("export_job_id");
+            let seal_id: Option<Uuid> = row.get("seal_id");
+            if let Some(export_job_id) = export_job_id {
+                if export_job_id != data_key.export_job_id {
+                    return Err(repo_invalid(
+                        "data key export_job_id does not match imported manifest",
+                    ));
+                }
+            }
+            if let Some(seal_id) = seal_id {
+                if seal_id != data_key.seal_id {
+                    return Err(repo_invalid(
+                        "data key seal_id does not match imported manifest",
+                    ));
+                }
+            }
+            Ok(())
         })
     }
 

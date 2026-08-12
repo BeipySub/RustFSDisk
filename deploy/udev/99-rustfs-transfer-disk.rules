@@ -1,3 +1,4 @@
 # Only notify the local daemon to rescan block devices.
 # Do not start export, import, cleanup, or reinitialization work from udev.
 ACTION=="add|remove|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", TAG+="systemd", ENV{SYSTEMD_WANTS}+="rustfs-transfer-disk-rescan@%k.service"
+ACTION=="add|remove|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="partition", TAG+="systemd", ENV{SYSTEMD_WANTS}+="rustfs-transfer-disk-rescan@%k.service"

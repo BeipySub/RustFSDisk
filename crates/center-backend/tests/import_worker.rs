@@ -6,8 +6,8 @@ use aes_gcm::{
 };
 use base64::{engine::general_purpose, Engine as _};
 use rustfs_transfer_center::center_security::{
-    sign_disk_info_with_key, verify_disk_info_with_key, ENCRYPTION_ALG_AES_256_GCM,
-    SIGNATURE_ALG_HMAC_SHA256,
+    derive_offline_disk_data_key, sign_disk_info_with_key, verify_disk_info_with_key,
+    ENCRYPTION_ALG_AES_256_GCM, SIGNATURE_ALG_HMAC_SHA256,
 };
 use rustfs_transfer_center::import_worker::{
     ImportErrorCode, ImportOutcome, ImportWorker, MemoryArchiveStorage, MemoryRepository,
@@ -294,11 +294,96 @@ fn decrypt_failure_marks_job_failed_and_keeps_disk_unimported() {
 }
 
 #[test]
+fn offline_disk_data_key_matches_edge_derivation_vector() {
+    let key = derive_offline_disk_data_key(
+        "edge-secret-fixture",
+        "edge-a",
+        "11111111-1111-1111-1111-111111111111".parse().unwrap(),
+        "22222222-2222-2222-2222-222222222222".parse().unwrap(),
+        "33333333-3333-3333-3333-333333333333".parse().unwrap(),
+        "44444444-4444-4444-4444-444444444444".parse().unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        hex::encode(key),
+        "6beef782ba8dca85c86c597ffc3b328dae0473857c4fc6f6cc841070e245c0c1"
+    );
+}
+
+#[test]
+fn wrong_edge_authorization_secret_fails_decrypt() {
+    let fixture = SealedDiskFixture::new_plain("alpha.txt", b"hello archive".to_vec());
+    let mut repo = fixture.repository();
+    repo.put_edge("edge-a", "wrong-edge-secret", "ACTIVE");
+    let mut storage = MemoryArchiveStorage::default();
+    let mut progress = ProgressAggregator::default();
+
+    let err = ImportWorker::new(
+        &mut repo,
+        &mut storage,
+        &mut progress,
+        fixture.signature_key.clone(),
+    )
+    .import_sealed_disk(&fixture.root)
+    .expect_err("wrong edge auth secret cannot decrypt offline disk");
+
+    assert_eq!(err.code, ImportErrorCode::DecryptFailed);
+    assert!(repo.ledger().is_empty());
+    assert!(storage.objects().is_empty());
+}
+
+#[test]
+fn disabled_edge_is_rejected_before_import_claim() {
+    let fixture = SealedDiskFixture::new_plain("alpha.txt", b"hello archive".to_vec());
+    let mut repo = fixture.repository();
+    repo.put_edge("edge-a", fixture.edge_auth_secret.clone(), "DISABLED");
+    let mut storage = MemoryArchiveStorage::default();
+    let mut progress = ProgressAggregator::default();
+
+    let err = ImportWorker::new(
+        &mut repo,
+        &mut storage,
+        &mut progress,
+        fixture.signature_key.clone(),
+    )
+    .import_sealed_disk(&fixture.root)
+    .expect_err("disabled edge cannot import");
+
+    assert_eq!(err.code, ImportErrorCode::ManifestInvalid);
+    assert!(repo.jobs().is_empty());
+    assert!(repo.ledger().is_empty());
+}
+
+#[test]
+fn disabled_disk_is_rejected_before_import_claim() {
+    let fixture = SealedDiskFixture::new_plain("alpha.txt", b"hello archive".to_vec());
+    let mut repo = fixture.repository();
+    repo.disable_disk(fixture.disk_id);
+    let mut storage = MemoryArchiveStorage::default();
+    let mut progress = ProgressAggregator::default();
+
+    let err = ImportWorker::new(
+        &mut repo,
+        &mut storage,
+        &mut progress,
+        fixture.signature_key.clone(),
+    )
+    .import_sealed_disk(&fixture.root)
+    .expect_err("disabled disk cannot import");
+
+    assert_eq!(err.code, ImportErrorCode::ManifestInvalid);
+    assert!(repo.jobs().is_empty());
+    assert!(repo.ledger().is_empty());
+}
+
+#[test]
 fn missing_target_key_does_not_update_other_disk_key() {
     let fixture = SealedDiskFixture::new_plain("alpha.txt", b"hello archive".to_vec());
     let wrong_disk_id = Uuid::new_v4();
     let mut repo = MemoryRepository::default();
     repo.register_disk(fixture.disk_id);
+    repo.register_edge("edge-a", fixture.edge_auth_secret.clone());
     repo.put_issued_data_key(
         wrong_disk_id,
         fixture.data_key_id,
@@ -360,6 +445,7 @@ struct SealedDiskFixture {
     export_job_id: Uuid,
     data_key_id: Uuid,
     key: Vec<u8>,
+    edge_auth_secret: String,
     signature_key: Vec<u8>,
 }
 
@@ -391,7 +477,17 @@ impl SealedDiskFixture {
         let center_key_id = Uuid::new_v4();
         let signature_key = vec![0x31; 32];
         let chunk_group_id = Uuid::new_v4();
-        let key_bytes = vec![7_u8; 32];
+        let edge_auth_secret = "edge-a-offline-secret".to_string();
+        let key_bytes = derive_offline_disk_data_key(
+            &edge_auth_secret,
+            "edge-a",
+            disk_id,
+            data_key_id,
+            export_job_id,
+            seal_id,
+        )
+        .unwrap()
+        .to_vec();
         let nonce_bytes = nonce_for(chunk_index);
         let disk_id_text = disk_id.to_string();
         let seal_id_text = seal_id.to_string();
@@ -531,6 +627,7 @@ impl SealedDiskFixture {
             export_job_id,
             data_key_id,
             key: key_bytes,
+            edge_auth_secret,
             signature_key,
         }
     }
@@ -538,6 +635,7 @@ impl SealedDiskFixture {
     fn repository(&self) -> MemoryRepository {
         let mut repo = MemoryRepository::default();
         repo.register_disk(self.disk_id);
+        repo.register_edge("edge-a", self.edge_auth_secret.clone());
         repo.put_data_key(self.disk_id, self.data_key_id, self.key.clone());
         repo
     }

@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, provide, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import ProductHeader from "./components/ProductHeader.vue";
 import DashboardView from "./views/DashboardView.vue";
 import SyncRecordsView from "./views/SyncRecordsView.vue";
 
@@ -12,11 +13,6 @@ interface EdgeIdentityDetail {
 const routes: EdgeRoute[] = ["/dashboard", "/sync-records"];
 const currentPath = ref<EdgeRoute>(normalizePath(window.location.pathname));
 const edgeIdentity = ref("Edge 本地节点");
-
-const navItems: Array<{ label: string; path: EdgeRoute }> = [
-  { label: "运行首页", path: "/dashboard" },
-  { label: "同步记录", path: "/sync-records" },
-];
 
 const currentView = computed(() => {
   if (currentPath.value === "/sync-records") return SyncRecordsView;
@@ -32,8 +28,6 @@ function navigate(path: EdgeRoute) {
   window.history.pushState({}, "", path);
   currentPath.value = path;
 }
-
-provide("edgeNavigate", navigate);
 
 function handlePopState() {
   currentPath.value = normalizePath(window.location.pathname);
@@ -61,23 +55,7 @@ onBeforeUnmount(() => {
 <template>
   <div class="edge-app">
     <div class="edge-canvas">
-      <header class="product-header">
-        <button class="brand" type="button" @click="navigate('/dashboard')">RustFS离线同步中心</button>
-        <span class="header-rule" aria-hidden="true"></span>
-        <span class="site-identity">{{ edgeIdentity }}</span>
-        <nav aria-label="Edge 页面导航">
-          <button
-            v-for="item in navItems"
-            :key="item.path"
-            :aria-current="currentPath === item.path ? 'page' : undefined"
-            :class="{ active: currentPath === item.path }"
-            type="button"
-            @click="navigate(item.path)"
-          >
-            {{ item.label }}
-          </button>
-        </nav>
-      </header>
+      <ProductHeader :edge-identity="edgeIdentity" @dashboard="navigate('/dashboard')" />
       <component :is="currentView" class="page-host" />
     </div>
   </div>

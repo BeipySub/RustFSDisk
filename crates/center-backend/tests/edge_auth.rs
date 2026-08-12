@@ -4,9 +4,9 @@ use axum::{
 };
 use chrono::{Duration, Utc};
 use rustfs_transfer_center::{
-    center_auth::signed_headers, center_security::CenterSecurity, router, AppState,
-    CenterConfigRecord, CenterService, DataKeyRecord, DataKeyStatus, DiskRecord, DiskStatusCode,
-    EdgeRecord, MemoryCenterStore, PROTOCOL_VERSION,
+    center_auth::signed_headers, center_security::CenterSecurity, router, AppState, CenterService,
+    DataKeyRecord, DataKeyStatus, DiskRecord, DiskStatusCode, EdgeRecord, MemoryCenterStore,
+    PROTOCOL_VERSION,
 };
 use serde_json::Value;
 use tower::ServiceExt;
@@ -21,13 +21,7 @@ fn state(edge_status: &str) -> AppState {
 }
 
 fn store_with_edge(edge_status: &str) -> MemoryCenterStore {
-    let mut store = MemoryCenterStore {
-        center_config: Some(CenterConfigRecord {
-            center_id: Uuid::new_v4(),
-            protocol_version: PROTOCOL_VERSION.to_string(),
-        }),
-        ..Default::default()
-    };
+    let mut store = MemoryCenterStore::default();
     store.edges.insert(
         EDGE_CODE.to_string(),
         EdgeRecord {

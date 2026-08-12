@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::{
     center_security::{CenterSecurity, ENCRYPTION_ALG_AES_256_GCM, SIGNATURE_ALG_HMAC_SHA256},
-    CenterConfigRecord, DiskRecord, DiskStatusCode,
+    CenterIdentity, DiskRecord, DiskStatusCode,
 };
 
 pub const PROTOCOL_ROOT: &str = "rustfs-transfer";
@@ -115,7 +115,7 @@ impl DiskInfoStatus {
 
 impl InitializedDiskInfoDocument {
     pub fn initialized(
-        center_config: &CenterConfigRecord,
+        center_identity: &CenterIdentity,
         disk: &DiskRecord,
         capacity_bytes: i64,
         data_key_id: Uuid,
@@ -125,7 +125,7 @@ impl InitializedDiskInfoDocument {
         let mut document = Self {
             protocol: DiskInfoProtocol {
                 name: PROTOCOL_NAME.to_string(),
-                version: center_config.protocol_version.clone(),
+                version: center_identity.protocol_version.clone(),
             },
             disk: DiskInfoDisk {
                 disk_id: disk.disk_id,
@@ -143,7 +143,7 @@ impl InitializedDiskInfoDocument {
                 export_finished_at: String::new(),
             },
             center: DiskInfoCenter {
-                center_id: center_config.center_id,
+                center_id: center_identity.center_id,
                 import_job_id: String::new(),
                 import_started_at: String::new(),
                 import_finished_at: String::new(),

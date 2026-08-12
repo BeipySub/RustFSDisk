@@ -115,7 +115,7 @@ pub trait ExportObjectRepository {
         runtime_status: &str,
         error_code: Option<&str>,
     ) -> Result<()>;
-    fn clear_disk_runtime(&self, disk_id: Uuid) -> Result<()>;
+    fn mark_disk_runtime_done_after_seal(&self, disk_id: Uuid) -> Result<()>;
     fn mark_job_sealed_checkpoint(
         &self,
         export_job_id: Uuid,
@@ -457,7 +457,8 @@ where
             manifest.objects.len() as u64,
             total_manifest_bytes(&manifest),
         )?;
-        self.repository.clear_disk_runtime(self.config.disk_id)?;
+        self.repository
+            .mark_disk_runtime_done_after_seal(self.config.disk_id)?;
         self.progress
             .mark_disk_done(&self.config.disk_id.to_string());
         Ok(manifest)

@@ -8,9 +8,9 @@ use rustfs_transfer_center::{
     import_runtime::ProductionCenterImportControlService,
     reinitialize_runtime::ProductionCenterReinitializeControlService,
     reinitializer::DiskInfoTemplate,
-    router, AppState, CenterConfig, CenterService, CenterStore, PgCenterStore,
+    router, AppState, CenterConfig, CenterIdentity, CenterService, CenterStore, PgCenterStore,
 };
-use sqlx::{postgres::PgPoolOptions, Row};
+use sqlx::postgres::PgPoolOptions;
 use tokio::net::TcpListener;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -41,20 +41,24 @@ async fn main() -> anyhow::Result<()> {
     let s3_client = aws_sdk_s3::Client::new(&sdk_config);
     let import_control =
         ProductionCenterImportControlService::new(pool.clone(), s3_client, security.clone());
-    let center_config = service_center_config(&pool).await?;
     let reinitialize_control = ProductionCenterReinitializeControlService::new(
         pool.clone(),
         DiskInfoTemplate {
-            protocol_version: center_config.protocol_version,
-            center_id: center_config.center_id,
-            center_name: None,
+            protocol_version: config.center.protocol_version.clone(),
+            center_id: config.center.center_id,
+            center_name: Some(config.center.center_name.clone()),
             center_key_id: security.center_key_id(),
             signature_alg: SIGNATURE_ALG_HMAC_SHA256.to_string(),
         },
         security.clone(),
     );
 
-    let service = CenterService::new(CenterStore::Pg(PgCenterStore::new(pool)), security);
+    let center_identity = CenterIdentity::from(&config.center);
+    let service = CenterService::new(
+        CenterStore::Pg(PgCenterStore::new(pool)),
+        security,
+        center_identity,
+    );
     let app = router(
         AppState::new(service)
             .with_control_api_token(config.server.control_api_token.clone())
@@ -109,22 +113,4 @@ fn required_rustfs_secret<'a>(field: &str, value: &'a Option<String>) -> anyhow:
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow::anyhow!("{field} must not be empty"))
-}
-
-async fn service_center_config(pool: &sqlx::PgPool) -> anyhow::Result<CenterConfigForReinit> {
-    let row = sqlx::query(
-        "SELECT center_id, protocol_version FROM center_config ORDER BY id ASC LIMIT 1",
-    )
-    .fetch_one(pool)
-    .await
-    .context("load center_config for reinitialize control")?;
-    Ok(CenterConfigForReinit {
-        center_id: row.get("center_id"),
-        protocol_version: row.get("protocol_version"),
-    })
-}
-
-struct CenterConfigForReinit {
-    center_id: uuid::Uuid,
-    protocol_version: String,
 }

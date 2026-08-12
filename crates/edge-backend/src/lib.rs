@@ -1,6 +1,5 @@
 pub mod adapters;
 pub mod auto_export;
-pub mod center_client;
 pub mod config;
 pub mod control;
 pub mod disk_detection;
@@ -16,6 +15,5 @@ pub mod server;
 pub use adapters::{
     AdapterBundle, Clock, DatabaseAdapter, DiskAdapter, IdGenerator, ObjectStoreAdapter,
 };
-pub use center_client::CenterHmacClient;
 pub use config::EdgeConfig;
 pub use server::{app, AppState};

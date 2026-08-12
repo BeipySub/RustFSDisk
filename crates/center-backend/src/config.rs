@@ -1,8 +1,10 @@
 use serde::Deserialize;
 use std::{env, fs, net::SocketAddr, path::Path};
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CenterConfig {
+    pub center: CenterIdentityConfig,
     #[serde(default)]
     pub server: ServerConfig,
     pub database: DatabaseConfig,
@@ -11,6 +13,15 @@ pub struct CenterConfig {
     pub paths: PathConfig,
     #[serde(default)]
     pub security: SecurityConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CenterIdentityConfig {
+    pub center_id: Uuid,
+    #[serde(default = "default_center_name")]
+    pub center_name: String,
+    #[serde(default = "default_protocol_version")]
+    pub protocol_version: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -69,6 +80,18 @@ impl CenterConfig {
     }
 
     fn apply_env_overrides(&mut self) {
+        override_uuid(
+            "RUSTFS_TRANSFER__CENTER__CENTER_ID",
+            &mut self.center.center_id,
+        );
+        override_string(
+            "RUSTFS_TRANSFER__CENTER__CENTER_NAME",
+            &mut self.center.center_name,
+        );
+        override_string(
+            "RUSTFS_TRANSFER__CENTER__PROTOCOL_VERSION",
+            &mut self.center.protocol_version,
+        );
         override_socket_addr("RUSTFS_TRANSFER__SERVER__BIND", &mut self.server.bind);
         if self
             .server
@@ -109,6 +132,8 @@ impl CenterConfig {
     }
 
     fn validate(&self) -> anyhow::Result<()> {
+        ensure_non_empty("center.center_name", &self.center.center_name)?;
+        ensure_non_empty("center.protocol_version", &self.center.protocol_version)?;
         ensure_non_empty("database.url", &self.database.url)?;
         ensure_non_empty("rustfs.endpoint", &self.rustfs.endpoint)?;
         Ok(())
@@ -153,6 +178,16 @@ fn override_socket_addr(name: &str, value: &mut SocketAddr) {
     }
 }
 
+fn override_uuid(name: &str, value: &mut Uuid) {
+    if let Ok(env_value) = env::var(name) {
+        if !env_value.trim().is_empty() {
+            if let Ok(parsed) = env_value.parse() {
+                *value = parsed;
+            }
+        }
+    }
+}
+
 fn override_optional_string(name: &str, value: &mut Option<String>) {
     if let Ok(env_value) = env::var(name) {
         if !env_value.trim().is_empty() {
@@ -188,6 +223,14 @@ fn default_region() -> String {
     "us-east-1".to_owned()
 }
 
+fn default_center_name() -> String {
+    "RustFS Transfer Center".to_owned()
+}
+
+fn default_protocol_version() -> String {
+    crate::PROTOCOL_VERSION.to_owned()
+}
+
 fn default_data_dir() -> String {
     "/var/lib/rustfs-transfer/center".to_owned()
 }
@@ -203,6 +246,9 @@ mod tests {
     #[test]
     fn loads_minimal_config_with_defaults() {
         let raw = r#"
+            [center]
+            center_id = "00000000-0000-0000-0000-000000000001"
+
             [database]
             url = "postgres://center:center@localhost/center"
 
@@ -213,6 +259,13 @@ mod tests {
         let config = CenterConfig::from_toml(raw).expect("config loads");
 
         assert_eq!(config.server.bind.port(), 8080);
+        assert_eq!(
+            config.center.center_id,
+            "00000000-0000-0000-0000-000000000001"
+                .parse::<Uuid>()
+                .unwrap()
+        );
+        assert_eq!(config.center.protocol_version, crate::PROTOCOL_VERSION);
         assert_eq!(config.rustfs.region, "us-east-1");
         assert_eq!(config.paths.data_dir, "/var/lib/rustfs-transfer/center");
     }
