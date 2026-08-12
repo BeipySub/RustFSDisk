@@ -287,20 +287,32 @@ pub struct ExportJobRecord {
 pub struct DiskRuntimeSummary {
     pub hardware_serial: String,
     pub disk_sn: String,
+    pub stable_hardware_id: String,
     pub disk_id: Option<Uuid>,
     pub device_path: String,
     pub mount_path: Option<String>,
     pub filesystem_type: Option<String>,
+    pub filesystem: Option<String>,
     pub fs_uuid: Option<String>,
+    pub filesystem_uuid: Option<String>,
     pub disk_status_code: String,
     pub runtime_status: String,
+    pub task_pool_eligible: bool,
     pub capacity_bytes: u64,
+    pub total_bytes: u64,
+    pub done_bytes: u64,
+    pub remaining_bytes: u64,
     pub free_bytes: u64,
     pub object_budget_bytes: u64,
+    pub speed_bytes_per_sec: u64,
+    pub object_total: u64,
+    pub object_done: u64,
+    pub object_remaining: u64,
     pub progress: EdgeDiskProgressSummary,
     pub current_object: Option<DashboardCurrentObject>,
     pub last_error_code: Option<String>,
     pub error_message: Option<String>,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -319,6 +331,7 @@ pub struct DashboardCurrentObject {
     pub bucket: String,
     pub key: String,
     pub display_name: String,
+    pub relative_data_path: String,
     pub size_bytes: u64,
     pub done_bytes: u64,
     pub remaining_bytes: u64,
@@ -1209,24 +1222,51 @@ async fn load_disk_runtime(pool: &PgPool) -> Result<Vec<DiskRuntimeSummary>, Con
             let mount_path: Option<String> = row.get("mount_path");
             let runtime_status: String = row.get("status");
             let metadata = disk_runtime_filesystem_metadata(&device_path, mount_path.as_deref());
+            let filesystem_type = metadata.filesystem_type;
+            let fs_uuid = metadata.fs_uuid;
+            let disk_status_code = disk_status_code_from_mount(mount_path.as_deref())
+                .unwrap_or_else(|| disk_status_code_from_runtime(&runtime_status).to_string());
+            let capacity_bytes = row.get::<i64, _>("capacity_bytes").max(0) as u64;
+            let free_bytes = row.get::<i64, _>("free_bytes").max(0) as u64;
+            let object_budget_bytes = row.get::<i64, _>("object_budget_bytes").max(0) as u64;
+            let progress = EdgeDiskProgressSummary::idle();
+            let last_error_code: Option<String> = row.get("last_error_code");
+            let error_message: Option<String> = row.get("error_message");
+            let message = disk_runtime_message(
+                &runtime_status,
+                last_error_code.as_deref(),
+                error_message.as_deref(),
+            );
+            let task_pool_eligible = runtime_status == "READY" && disk_status_code == "INITIALIZED";
             DiskRuntimeSummary {
                 hardware_serial: disk_sn.clone(),
-                disk_sn,
+                disk_sn: disk_sn.clone(),
+                stable_hardware_id: fs_uuid.clone().unwrap_or_else(|| disk_sn.clone()),
                 disk_id: row.get("disk_id"),
                 device_path,
                 mount_path: mount_path.clone(),
-                filesystem_type: metadata.filesystem_type,
-                fs_uuid: metadata.fs_uuid,
-                disk_status_code: disk_status_code_from_mount(mount_path.as_deref())
-                    .unwrap_or_else(|| disk_status_code_from_runtime(&runtime_status).to_string()),
+                filesystem_type: filesystem_type.clone(),
+                filesystem: filesystem_type,
+                fs_uuid: fs_uuid.clone(),
+                filesystem_uuid: fs_uuid,
+                disk_status_code,
                 runtime_status,
-                capacity_bytes: row.get::<i64, _>("capacity_bytes").max(0) as u64,
-                free_bytes: row.get::<i64, _>("free_bytes").max(0) as u64,
-                object_budget_bytes: row.get::<i64, _>("object_budget_bytes").max(0) as u64,
-                progress: EdgeDiskProgressSummary::idle(),
+                task_pool_eligible,
+                capacity_bytes,
+                total_bytes: progress.total_bytes,
+                done_bytes: progress.done_bytes,
+                remaining_bytes: progress.remaining_bytes,
+                free_bytes,
+                object_budget_bytes,
+                speed_bytes_per_sec: progress.speed_bytes_per_sec,
+                object_total: progress.object_total,
+                object_done: progress.object_done,
+                object_remaining: progress.object_remaining,
+                progress,
                 current_object: None,
-                last_error_code: row.get("last_error_code"),
-                error_message: row.get("error_message"),
+                last_error_code,
+                error_message,
+                message,
             }
         })
         .collect())
@@ -1328,6 +1368,24 @@ fn enrich_disks_from_copy_progress(
             object_done: progress.object_done,
             object_remaining: progress.object_remaining,
         };
+        disk.total_bytes = disk.progress.total_bytes;
+        disk.done_bytes = disk.progress.done_bytes;
+        disk.remaining_bytes = disk.progress.remaining_bytes;
+        disk.speed_bytes_per_sec = disk.progress.speed_bytes_per_sec;
+        disk.object_total = disk.progress.object_total;
+        disk.object_done = disk.progress.object_done;
+        disk.object_remaining = disk.progress.object_remaining;
+        disk.disk_status_code = progress.disk_status_code.clone();
+        disk.task_pool_eligible = false;
+        disk.message = progress.message.clone();
+        disk.last_error_code = progress
+            .last_error_code
+            .clone()
+            .or(disk.last_error_code.clone());
+        disk.error_message = progress
+            .error_message
+            .clone()
+            .or(disk.error_message.clone());
         disk.current_object =
             progress
                 .current_object
@@ -1336,6 +1394,7 @@ fn enrich_disks_from_copy_progress(
                     bucket: current.bucket.clone(),
                     key: current.key.clone(),
                     display_name: current.display_name.clone(),
+                    relative_data_path: current.relative_data_path.clone(),
                     size_bytes: current.size_bytes,
                     done_bytes: current.done_bytes,
                     remaining_bytes: current.remaining_bytes,
@@ -1422,6 +1481,19 @@ fn disk_status_code_from_runtime(runtime_status: &str) -> &'static str {
         "REJECTED" => "UNREGISTERED",
         "ERROR" | "REMOVED" => "ERROR",
         _ => "INITIALIZED",
+    }
+}
+
+fn disk_runtime_message(
+    runtime_status: &str,
+    last_error_code: Option<&str>,
+    error_message: Option<&str>,
+) -> String {
+    match (last_error_code, error_message) {
+        (Some(code), Some(message)) => format!("{code}: {message}"),
+        (Some(code), None) => code.to_string(),
+        (None, Some(message)) => message.to_string(),
+        (None, None) => format!("disk runtime_status={runtime_status}"),
     }
 }
 

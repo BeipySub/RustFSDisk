@@ -8,7 +8,7 @@ export type DiskStatusCode =
   | "IMPORTED"
   | "ERROR";
 
-export type EdgeVisibleDiskStatusCode = Exclude<DiskStatusCode, "IMPORTED">;
+export type EdgeVisibleDiskStatusCode = DiskStatusCode;
 
 export type RuntimeStatus =
   | "DETECTED"
@@ -313,6 +313,7 @@ const visibleDiskStatusCodes: readonly EdgeVisibleDiskStatusCode[] = [
   "EDGE_COPYING",
   "SEALED",
   "CENTER_IMPORTING",
+  "IMPORTED",
   "ERROR",
 ];
 
@@ -520,8 +521,42 @@ export function diskStatusDisplay(value: EdgeVisibleDiskStatusCode | undefined):
   if (value === "EDGE_COPYING") return "写入中";
   if (value === "SEALED") return "已封盘";
   if (value === "CENTER_IMPORTING") return "中控导入中";
+  if (value === "IMPORTED") return "已导入";
   if (value === "ERROR") return "异常";
   return "未返回";
+}
+
+export function edgeRejectedDiskStatusLabel(
+  disk: Pick<EdgeDiskProgress, "disk_status_code" | "last_error_code" | "error_message" | "message">,
+): string {
+  if (disk.disk_status_code === "SEALED") return "已封盘";
+  if (disk.disk_status_code === "IMPORTED") return "已导入";
+  if (disk.disk_status_code === "CENTER_IMPORTING") return "中控导入中";
+  if (disk.disk_status_code === "UNREGISTERED") return "未注册";
+  const reason = disk.error_message || disk.last_error_code || disk.message || "";
+  if (isEdgeUninitializedDiskIssue(reason)) return "未初始化";
+  if (isEdgeUnregisteredDiskIssue(reason)) return "未注册";
+  if (isEdgeUnsupportedDiskIssue(reason)) return "不可导出";
+  return "拒绝";
+}
+
+export function edgeDiskPrimaryStatusLabel(
+  disk: Pick<EdgeDiskProgress, "disk_status_code" | "runtime_status" | "last_error_code" | "error_message" | "message">,
+): string {
+  if (disk.disk_status_code) return diskStatusDisplay(disk.disk_status_code);
+  return "未返回";
+}
+
+export function isEdgeUninitializedDiskIssue(value: string): boolean {
+  return /MISSING_DISK_INFO|NO_DISK_INFO|missing .*disk_info|disk_info\.json.*missing|UNINITIALIZED|missing .*protocol|缺少.*运输协议|缺少.*disk_info/i.test(value);
+}
+
+export function isEdgeUnregisteredDiskIssue(value: string): boolean {
+  return /UNREGISTERED|not registered|unregistered disk/i.test(value);
+}
+
+export function isEdgeUnsupportedDiskIssue(value: string): boolean {
+  return /FILESYSTEM_INVALID|UNSUPPORTED|non[-_ ]?protocol|not ext4|non[-_ ]?ext4|filesystem/i.test(value);
 }
 
 export function isActiveExportJobStatus(value: ExportJobStatus | undefined): boolean {

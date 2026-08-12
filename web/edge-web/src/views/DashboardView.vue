@@ -2,9 +2,14 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import {
   DashboardHttpError,
+  edgeDiskPrimaryStatusLabel,
   diskStatusDisplay,
+  edgeRejectedDiskStatusLabel,
   fetchEdgeDashboardSummary,
   fetchEdgeReadiness,
+  isEdgeUninitializedDiskIssue,
+  isEdgeUnregisteredDiskIssue,
+  isEdgeUnsupportedDiskIssue,
   isActiveExportJobStatus,
   triggerEdgeRustFsScan,
   type EdgeDashboardSummary,
@@ -131,6 +136,10 @@ const otherWarningDisks = computed(() => disks.value.filter((disk) => disk.last_
 const selectedProgressPercent = computed(() =>
   progressPercent(selectedDisk.value?.done_bytes ?? 0, selectedDisk.value?.total_bytes ?? 0),
 );
+const hasSelectedCopyTask = computed(() => {
+  const disk = selectedDisk.value;
+  return Boolean(disk?.current_object || disk?.runtime_status === "COPYING" || (disk?.object_total ?? 0) > 0);
+});
 const selectedDiskIndex = computed(() => (selectedDisk.value ? disks.value.findIndex((disk) => disk.disk_id === selectedDisk.value?.disk_id) : -1));
 const selectedSlotLabel = computed(() => (selectedDiskIndex.value >= 0 ? String(selectedDiskIndex.value + 1).padStart(2, "0") : "--"));
 const selectedDiskTitle = computed(() =>
@@ -172,7 +181,7 @@ const sealedJobReadyForPickup = computed(
   () =>
     !httpError.value &&
     viewSummary.value.export_job_status === "SEALED" &&
-    viewSummary.value.disks.length === 0 &&
+    viewSummary.value.disks.length > 0 &&
     Boolean(viewSummary.value.export_job_id || viewSummary.value.global_progress.done_bytes > 0),
 );
 const estimatedDone = computed(() => {
@@ -333,20 +342,11 @@ function diskTone(disk: EdgeDiskProgress): string {
 }
 
 function diskStatusLabel(disk: EdgeDiskProgress): string {
-  if (disk.runtime_status === "COPYING") return "拷贝中";
-  if (disk.runtime_status === "READY") return "就绪";
-  if (disk.runtime_status === "DONE") return disk.disk_status_code === "SEALED" ? "已封盘" : "完成";
-  if (disk.runtime_status === "REJECTED") return rejectedDiskStatusLabel(disk);
-  if (disk.runtime_status === "REMOVED") return "已移除";
-  if (disk.runtime_status === "ERROR") return "错误";
-  if (disk.runtime_status === "CHECKING") return "校验中";
-  if (disk.runtime_status === "DETECTED") return "已检测";
-  return diskStatusDisplay(disk.disk_status_code);
+  return edgeDiskPrimaryStatusLabel(disk);
 }
 
 function diskCardStatusLabel(disk: EdgeDiskProgress): string {
-  if (disk.runtime_status === "REJECTED") return rejectedDiskStatusLabel(disk);
-  return disk.disk_status_code ? diskStatusDisplay(disk.disk_status_code) : diskStatusLabel(disk);
+  return disk.disk_status_code ? diskStatusDisplay(disk.disk_status_code) : "未返回";
 }
 
 function diskStatusDetail(disk: EdgeDiskProgress): string {
@@ -359,6 +359,9 @@ function diskStatusDetail(disk: EdgeDiskProgress): string {
 }
 
 function diskStatusTooltip(disk: EdgeDiskProgress): string {
+  if (disk.disk_status_code === "SEALED") return "已封盘：可拔盘送往中控端导入，不可继续用于 Edge 导出。";
+  if (disk.disk_status_code === "IMPORTED") return "已导入：请在中控端重新初始化后再用于 Edge 导出。";
+  if (disk.disk_status_code === "CENTER_IMPORTING") return "中控导入中：当前不可用于 Edge 导出。";
   if (disk.runtime_status !== "REJECTED" && disk.runtime_status !== "ERROR") return "";
   return translateDiskIssue(diskIssueRawText(disk));
 }
@@ -368,11 +371,7 @@ function diskIssueRawText(disk: EdgeDiskProgress): string {
 }
 
 function rejectedDiskStatusLabel(disk: EdgeDiskProgress): string {
-  const reason = diskIssueRawText(disk);
-  if (isUninitializedDiskIssue(reason)) return "未初始化";
-  if (isUnregisteredDiskIssue(reason) || disk.disk_status_code === "UNREGISTERED") return "未注册";
-  if (isUnsupportedDiskIssue(reason)) return "不可导出";
-  return "拒绝";
+  return edgeRejectedDiskStatusLabel(disk);
 }
 
 function translateDiskIssue(value: string): string {
@@ -390,34 +389,21 @@ function translateDiskIssue(value: string): string {
   if (value.includes("MANIFEST_INVALID")) {
     return `盘内清单无效：${value}`;
   }
-  if (isUninitializedDiskIssue(value)) {
+  if (isEdgeUninitializedDiskIssue(value)) {
     return "未初始化：未检测到有效的盘内初始化信息，请先到中控端初始化后再用于 Edge 离线导出。";
   }
-  if (isUnregisteredDiskIssue(value)) {
+  if (isEdgeUnregisteredDiskIssue(value)) {
     return "未注册：需要先在中控端注册并初始化后再用于 Edge 离线导出。";
   }
-  if (isUnsupportedDiskIssue(value)) {
+  if (isEdgeUnsupportedDiskIssue(value)) {
     return "不可导出：当前磁盘不满足 Edge 离线导出要求，请按中控端初始化流程处理。";
   }
   return value;
 }
 
-function isUninitializedDiskIssue(value: string): boolean {
-  return /MISSING_DISK_INFO|NO_DISK_INFO|disk_info|UNINITIALIZED|not initialized|expected INITIALIZED/i.test(value);
-}
-
-function isUnregisteredDiskIssue(value: string): boolean {
-  return /UNREGISTERED|not registered|unregistered disk/i.test(value);
-}
-
-function isUnsupportedDiskIssue(value: string): boolean {
-  return /FILESYSTEM_INVALID|UNSUPPORTED|non[-_ ]?protocol|not ext4|non[-_ ]?ext4|filesystem/i.test(value);
-}
-
 function diskLifecycleStatusLabel(disk: EdgeDiskProgress | null): string {
   if (!disk) return "未返回";
   if (disk.disk_status_code) return diskStatusDisplay(disk.disk_status_code);
-  if (disk.runtime_status === "REJECTED") return rejectedDiskStatusLabel(disk);
   return "未返回";
 }
 
@@ -730,8 +716,8 @@ onBeforeUnmount(() => {
           <div><dt>系统格式</dt><dd>{{ selectedDisk?.filesystem ?? selectedDisk?.filesystem_uuid ?? "未返回" }}</dd></div>
           <div><dt>运行状态</dt><dd class="tone-running">{{ selectedDisk ? diskStatusLabel(selectedDisk) : "未返回" }}</dd></div>
           <div><dt>盘内状态</dt><dd class="tone-running">{{ diskLifecycleStatusLabel(selectedDisk) }}</dd></div>
-          <div><dt>拷贝进度</dt><dd>{{ selectedProgressPercent.toFixed(2) }}%</dd></div>
-          <div><dt>当前文件</dt><dd :title="selectedCurrentObjectName">{{ selectedCurrentObjectName }}</dd></div>
+          <div v-if="hasSelectedCopyTask"><dt>拷贝进度</dt><dd>{{ selectedProgressPercent.toFixed(2) }}%</dd></div>
+          <div v-if="hasSelectedCopyTask"><dt>当前文件</dt><dd :title="selectedCurrentObjectName">{{ selectedCurrentObjectName }}</dd></div>
           <div><dt>容量</dt><dd>{{ selectedDisk ? formatTbPair(selectedDisk) : "0.00/0.00 TB" }}</dd></div>
         </dl>
       </div>
@@ -773,12 +759,10 @@ onBeforeUnmount(() => {
       <article class="overview-panel glass-panel">
         <h2>扫描与导出概览</h2>
         <dl class="overview-metrics">
+          <div><dt>RustFS对象总数</dt><dd>{{ viewSummary.global_progress.object_total.toLocaleString() }}</dd></div>
           <div><dt>已发现对象</dt><dd>{{ viewSummary.scan.scanned_object_count.toLocaleString() }}</dd></div>
           <div><dt>已导出对象</dt><dd>{{ viewSummary.global_progress.object_done.toLocaleString() }}</dd></div>
           <div><dt>导出进度</dt><dd>{{ exportedObjectPercent.toFixed(2) }}%</dd></div>
-          <div><dt>扫描字节</dt><dd>{{ formatBytes(viewSummary.scan.scanned_bytes) }}</dd></div>
-          <div><dt>导出字节</dt><dd>{{ formatBytes(viewSummary.global_progress.done_bytes) }}</dd></div>
-          <div><dt>跳过对象</dt><dd>{{ viewSummary.scan.skipped_object_count.toLocaleString() }}（{{ skippedObjectPercent.toFixed(2) }}%）</dd></div>
         </dl>
       </article>
 

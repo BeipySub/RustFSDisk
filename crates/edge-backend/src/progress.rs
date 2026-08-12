@@ -22,18 +22,57 @@ pub struct CurrentObjectProgress {
 pub struct DiskProgressSnapshot {
     pub disk_id: String,
     pub disk_sn: String,
+    #[serde(default)]
+    pub hardware_serial: String,
+    #[serde(default)]
+    pub stable_hardware_id: String,
+    #[serde(default)]
+    pub device_path: String,
     pub mount_path: String,
+    #[serde(default)]
+    pub filesystem_type: Option<String>,
+    #[serde(default)]
+    pub filesystem: Option<String>,
+    #[serde(default)]
+    pub fs_uuid: Option<String>,
+    #[serde(default)]
+    pub filesystem_uuid: Option<String>,
+    #[serde(default)]
+    pub capacity_bytes: u64,
     pub runtime_status: String,
+    #[serde(default)]
+    pub disk_status_code: String,
+    #[serde(default)]
+    pub task_pool_eligible: bool,
     pub total_bytes: u64,
     pub done_bytes: u64,
     pub remaining_bytes: u64,
     pub free_bytes: u64,
+    #[serde(default)]
+    pub object_budget_bytes: u64,
     pub speed_bytes_per_sec: u64,
     pub object_total: u64,
     pub object_done: u64,
     pub object_remaining: u64,
+    #[serde(default)]
+    pub progress: DiskProgressFields,
     pub current_object: Option<CurrentObjectProgress>,
+    #[serde(default)]
+    pub last_error_code: Option<String>,
+    #[serde(default)]
+    pub error_message: Option<String>,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiskProgressFields {
+    pub total_bytes: u64,
+    pub done_bytes: u64,
+    pub remaining_bytes: u64,
+    pub speed_bytes_per_sec: u64,
+    pub object_total: u64,
+    pub object_done: u64,
+    pub object_remaining: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -245,21 +284,46 @@ impl ProgressAggregator {
         let disks = state
             .disks
             .values()
-            .map(|disk| DiskProgressSnapshot {
-                disk_id: disk.disk_id.clone(),
-                disk_sn: disk.disk_sn.clone(),
-                mount_path: disk.mount_path.clone(),
-                runtime_status: disk.runtime_status.clone(),
-                total_bytes: disk.total_bytes,
-                done_bytes: disk.done_bytes,
-                remaining_bytes: disk.total_bytes.saturating_sub(disk.done_bytes),
-                free_bytes: disk.free_bytes,
-                speed_bytes_per_sec: disk.done_bytes / elapsed,
-                object_total: disk.object_total,
-                object_done: disk.object_done,
-                object_remaining: disk.object_total.saturating_sub(disk.object_done),
-                current_object: disk.current_object.clone(),
-                message: disk.message.clone(),
+            .map(|disk| {
+                let progress = DiskProgressFields {
+                    total_bytes: disk.total_bytes,
+                    done_bytes: disk.done_bytes,
+                    remaining_bytes: disk.total_bytes.saturating_sub(disk.done_bytes),
+                    speed_bytes_per_sec: disk.done_bytes / elapsed,
+                    object_total: disk.object_total,
+                    object_done: disk.object_done,
+                    object_remaining: disk.object_total.saturating_sub(disk.object_done),
+                };
+                DiskProgressSnapshot {
+                    disk_id: disk.disk_id.clone(),
+                    disk_sn: disk.disk_sn.clone(),
+                    hardware_serial: disk.disk_sn.clone(),
+                    stable_hardware_id: disk.disk_sn.clone(),
+                    device_path: String::new(),
+                    mount_path: disk.mount_path.clone(),
+                    filesystem_type: None,
+                    filesystem: None,
+                    fs_uuid: None,
+                    filesystem_uuid: None,
+                    capacity_bytes: 0,
+                    runtime_status: disk.runtime_status.clone(),
+                    disk_status_code: state.disk_status_code.clone(),
+                    task_pool_eligible: false,
+                    total_bytes: progress.total_bytes,
+                    done_bytes: progress.done_bytes,
+                    remaining_bytes: progress.remaining_bytes,
+                    free_bytes: disk.free_bytes,
+                    object_budget_bytes: 0,
+                    speed_bytes_per_sec: progress.speed_bytes_per_sec,
+                    object_total: progress.object_total,
+                    object_done: progress.object_done,
+                    object_remaining: progress.object_remaining,
+                    progress,
+                    current_object: disk.current_object.clone(),
+                    last_error_code: None,
+                    error_message: None,
+                    message: disk.message.clone(),
+                }
             })
             .collect();
 

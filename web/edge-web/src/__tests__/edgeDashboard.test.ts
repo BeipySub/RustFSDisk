@@ -3,7 +3,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   buildExportJobsUrl,
+  edgeDiskPrimaryStatusLabel,
   diskStatusDisplay,
+  edgeRejectedDiskStatusLabel,
   edgeScanPath,
   isActiveExportJobStatus,
   localEdgePath,
@@ -48,10 +50,12 @@ test("displays Edge visible disk lifecycle codes in Chinese", () => {
   assert.equal(diskStatusDisplay("UNREGISTERED"), "未注册");
   assert.equal(diskStatusDisplay("INITIALIZED"), "已初始化");
   assert.equal(diskStatusDisplay("SEALED"), "已封盘");
+  assert.equal(diskStatusDisplay("CENTER_IMPORTING"), "中控导入中");
+  assert.equal(diskStatusDisplay("IMPORTED"), "已导入");
   assert.equal(diskStatusDisplay(undefined), "未返回");
 });
 
-test("normalizes summary and hides imported disk lifecycle from Edge UI", () => {
+test("normalizes summary and keeps imported disk lifecycle visible in Edge UI", () => {
   const summary = normalizeEdgeDashboardSummary({
     source: "edge",
     edge_code: "edge-hz-01",
@@ -77,9 +81,84 @@ test("normalizes summary and hides imported disk lifecycle from Edge UI", () => 
     ],
   });
 
-  assert.equal(summary.disk_status_code, undefined);
-  assert.equal(summary.disks[0]?.disk_status_code, undefined);
-  assert.equal(diskStatusDisplay(summary.disks[0]?.disk_status_code).includes("IMPORTED"), false);
+  assert.equal(summary.disk_status_code, "IMPORTED");
+  assert.equal(summary.disks[0]?.disk_status_code, "IMPORTED");
+  assert.equal(diskStatusDisplay(summary.disks[0]?.disk_status_code), "已导入");
+});
+
+test("labels sealed rejected disk as sealed instead of uninitialized", () => {
+  assert.equal(
+    edgeRejectedDiskStatusLabel({
+      disk_status_code: "SEALED",
+      last_error_code: "MANIFEST_INVALID",
+      error_message: "MANIFEST_INVALID: disk status_code SEALED is not eligible for offline edge export; expected INITIALIZED",
+      message: "",
+    }),
+    "已封盘",
+  );
+});
+
+test("uses imported lifecycle as primary label even when runtime is rejected", () => {
+  assert.equal(
+    edgeDiskPrimaryStatusLabel({
+      disk_status_code: "IMPORTED",
+      runtime_status: "REJECTED",
+      last_error_code: "MANIFEST_INVALID",
+      error_message: "MANIFEST_INVALID: disk status_code IMPORTED is not eligible for offline edge export; expected INITIALIZED",
+      message: "",
+    }),
+    "已导入",
+  );
+});
+
+test("uses sealed lifecycle as primary label even when runtime is rejected", () => {
+  assert.equal(
+    edgeDiskPrimaryStatusLabel({
+      disk_status_code: "SEALED",
+      runtime_status: "REJECTED",
+      last_error_code: "MANIFEST_INVALID",
+      error_message: "MANIFEST_INVALID: disk status_code SEALED is not eligible for offline edge export; expected INITIALIZED",
+      message: "",
+    }),
+    "已封盘",
+  );
+});
+
+test("does not use runtime status as disk lifecycle primary label", () => {
+  assert.equal(
+    edgeDiskPrimaryStatusLabel({
+      disk_status_code: undefined,
+      runtime_status: "REJECTED",
+      last_error_code: "MANIFEST_INVALID",
+      error_message: "MANIFEST_INVALID: expected INITIALIZED",
+      message: "",
+    }),
+    "未返回",
+  );
+});
+
+test("labels imported rejected disk as imported instead of uninitialized", () => {
+  assert.equal(
+    edgeRejectedDiskStatusLabel({
+      disk_status_code: "IMPORTED",
+      last_error_code: "MANIFEST_INVALID",
+      error_message: "MANIFEST_INVALID: disk status_code IMPORTED is not eligible for offline edge export; expected INITIALIZED",
+      message: "",
+    }),
+    "已导入",
+  );
+});
+
+test("labels missing disk info as uninitialized", () => {
+  assert.equal(
+    edgeRejectedDiskStatusLabel({
+      disk_status_code: undefined,
+      last_error_code: "MISSING_DISK_INFO",
+      error_message: "missing disk_info.json transport protocol file",
+      message: "",
+    }),
+    "未初始化",
+  );
 });
 
 test("normalizes export job list and drops non Edge object statuses", () => {
@@ -111,7 +190,7 @@ test("normalizes export job list and drops non Edge object statuses", () => {
   assert.equal(response.items[0]?.object_status_counts.EXPORTED, 2);
   assert.equal("IMPORTED" in (response.items[0]?.object_status_counts ?? {}), false);
   assert.equal(visibleDiskStatusCode("INITIALIZED"), "INITIALIZED");
-  assert.equal(visibleDiskStatusCode("IMPORTED"), undefined);
+  assert.equal(visibleDiskStatusCode("IMPORTED"), "IMPORTED");
 });
 
 test("normalizes deployed export job list wire shape", () => {
@@ -531,4 +610,328 @@ test("does not resurrect disks from stale websocket when HTTP summary is termina
   assert.equal(merged.export_job_status, "SEALED");
   assert.equal(merged.export_job_id, "job-sealed");
   assert.equal(merged.global_progress.done_bytes, 1428414961);
+});
+
+test("does not resurrect a removed disk when HTTP summary has no current disks", () => {
+  const summary = normalizeEdgeDashboardSummary({
+    source: "edge",
+    edge_code: "edge-demo",
+    edge_name: "edge-demo",
+    export_job_id: "job-sealed",
+    export_job_status: "SEALED",
+    scan: {
+      scan_event_type: "SCAN_DONE",
+      scanned_bucket_count: 1,
+      scanned_object_count: 59,
+      scanned_bytes: 1428414961,
+      stable_object_count: 59,
+      skipped_object_count: 0,
+      current_bucket: "",
+      current_key: "",
+      last_scan_at: "2026-08-12T10:31:58Z",
+      message: "done",
+    },
+    global_progress: {
+      total_bytes: 1428414961,
+      done_bytes: 1428414961,
+      remaining_bytes: 0,
+      speed_bytes_per_sec: 0,
+      object_total: 59,
+      object_done: 59,
+      object_remaining: 0,
+    },
+    disks: [],
+    ws_connected: false,
+    last_http_refresh_at: "2026-08-12T10:31:58Z",
+    message: "summary says no current disks",
+  });
+
+  const merged = applyCopyProgressEvent(summary, {
+    event_type: "DISK_REMOVED",
+    event_time: "2026-08-12T10:23:01Z",
+    source: "edge",
+    edge_code: "edge-demo",
+    export_job_id: "",
+    disk_status_code: "UNREGISTERED",
+    export_job_status: "PENDING",
+    global_progress: {
+      total_bytes: 0,
+      done_bytes: 0,
+      remaining_bytes: 0,
+      speed_bytes_per_sec: 0,
+      object_total: 0,
+      object_done: 0,
+      object_remaining: 0,
+    },
+    disks: [
+      {
+        disk_id: "",
+        disk_sn: "SN-OLD",
+        mount_path: "/mnt/old",
+        runtime_status: "CHECKING",
+        total_bytes: 0,
+        done_bytes: 0,
+        remaining_bytes: 0,
+        free_bytes: 0,
+        speed_bytes_per_sec: 0,
+        object_total: 0,
+        object_done: 0,
+        object_remaining: 0,
+        current_object: null,
+        message: "disk runtime_status=CHECKING",
+      },
+    ],
+    message: "DISK_REMOVED",
+  });
+
+  assert.equal(merged.disks.length, 0);
+  assert.equal(merged.ws_connected, true);
+  assert.equal(merged.message, "DISK_REMOVED");
+});
+
+test("keeps imported lifecycle when websocket updates rejected runtime without disk status", () => {
+  const summary = normalizeEdgeDashboardSummary({
+    source: "edge",
+    edge_code: "edge-demo",
+    edge_name: "edge-demo",
+    export_job_id: "job-copying",
+    export_job_status: "COPYING",
+    scan: {
+      scan_event_type: "SCAN_DONE",
+      scanned_bucket_count: 1,
+      scanned_object_count: 0,
+      scanned_bytes: 0,
+      stable_object_count: 0,
+      skipped_object_count: 0,
+      current_bucket: "",
+      current_key: "",
+      last_scan_at: "2026-08-12T10:31:58Z",
+      message: "done",
+    },
+    global_progress: {
+      total_bytes: 0,
+      done_bytes: 0,
+      remaining_bytes: 0,
+      speed_bytes_per_sec: 0,
+      object_total: 0,
+      object_done: 0,
+      object_remaining: 0,
+    },
+    disks: [
+      {
+        disk_id: "disk-imported",
+        disk_sn: "SN-1",
+        mount_path: "/media/edge/imported",
+        disk_status_code: "IMPORTED",
+        runtime_status: "CHECKING",
+        total_bytes: 100,
+        done_bytes: 0,
+        remaining_bytes: 0,
+        free_bytes: 40,
+        speed_bytes_per_sec: 0,
+        object_total: 0,
+        object_done: 0,
+        object_remaining: 0,
+        current_object: null,
+        filesystem: "ext4",
+        message: "summary",
+      },
+    ],
+    ws_connected: false,
+    last_http_refresh_at: "2026-08-12T10:31:58Z",
+    message: "summary",
+  });
+
+  const merged = applyCopyProgressEvent(summary, {
+    event_type: "DISK_REJECTED",
+    event_time: "2026-08-12T10:32:00Z",
+    source: "edge",
+    edge_code: "edge-demo",
+    export_job_id: "job-copying",
+    export_job_status: "COPYING",
+    global_progress: summary.global_progress,
+    disks: [
+      {
+        disk_id: "disk-imported",
+        disk_sn: "SN-1",
+        mount_path: "/media/edge/imported",
+        runtime_status: "REJECTED",
+        total_bytes: 0,
+        done_bytes: 0,
+        remaining_bytes: 0,
+        free_bytes: 0,
+        speed_bytes_per_sec: 0,
+        object_total: 0,
+        object_done: 0,
+        object_remaining: 0,
+        current_object: null,
+        last_error_code: "MANIFEST_INVALID",
+        error_message: "MANIFEST_INVALID: disk status_code IMPORTED is not eligible for offline edge export; expected INITIALIZED",
+        message: "rejected",
+      },
+    ],
+    message: "rejected",
+  });
+
+  assert.equal(merged.disks.length, 1);
+  assert.equal(merged.disks[0]?.disk_status_code, "IMPORTED");
+  assert.equal(merged.disks[0]?.runtime_status, "REJECTED");
+  assert.equal(merged.disks[0]?.filesystem, "ext4");
+  assert.equal(merged.disks[0]?.total_bytes, 100);
+  assert.equal(edgeDiskPrimaryStatusLabel(merged.disks[0]!), "已导入");
+});
+
+test("keeps sealed lifecycle when websocket updates rejected runtime without disk status", () => {
+  const summary = normalizeEdgeDashboardSummary({
+    source: "edge",
+    edge_code: "edge-demo",
+    edge_name: "edge-demo",
+    export_job_id: "job-copying",
+    export_job_status: "COPYING",
+    scan: {
+      scan_event_type: "SCAN_DONE",
+      scanned_bucket_count: 1,
+      scanned_object_count: 0,
+      scanned_bytes: 0,
+      stable_object_count: 0,
+      skipped_object_count: 0,
+      current_bucket: "",
+      current_key: "",
+      last_scan_at: "2026-08-12T10:31:58Z",
+      message: "done",
+    },
+    global_progress: {
+      total_bytes: 0,
+      done_bytes: 0,
+      remaining_bytes: 0,
+      speed_bytes_per_sec: 0,
+      object_total: 0,
+      object_done: 0,
+      object_remaining: 0,
+    },
+    disks: [
+      {
+        disk_id: "disk-sealed",
+        disk_sn: "SN-2",
+        mount_path: "/media/edge/sealed",
+        disk_status_code: "SEALED",
+        runtime_status: "DONE",
+        total_bytes: 200,
+        done_bytes: 200,
+        remaining_bytes: 0,
+        free_bytes: 20,
+        speed_bytes_per_sec: 0,
+        object_total: 1,
+        object_done: 1,
+        object_remaining: 0,
+        current_object: null,
+        message: "summary",
+      },
+    ],
+    ws_connected: false,
+    last_http_refresh_at: "2026-08-12T10:31:58Z",
+    message: "summary",
+  });
+
+  const merged = applyCopyProgressEvent(summary, {
+    event_type: "DISK_REJECTED",
+    event_time: "2026-08-12T10:32:00Z",
+    source: "edge",
+    edge_code: "edge-demo",
+    export_job_id: "job-copying",
+    export_job_status: "COPYING",
+    global_progress: summary.global_progress,
+    disks: [
+      {
+        disk_id: "disk-sealed",
+        disk_sn: "SN-2",
+        mount_path: "/media/edge/sealed",
+        runtime_status: "REJECTED",
+        total_bytes: 0,
+        done_bytes: 0,
+        remaining_bytes: 0,
+        free_bytes: 0,
+        speed_bytes_per_sec: 0,
+        object_total: 0,
+        object_done: 0,
+        object_remaining: 0,
+        current_object: null,
+        last_error_code: "MANIFEST_INVALID",
+        error_message: "MANIFEST_INVALID: disk status_code SEALED is not eligible for offline edge export; expected INITIALIZED",
+        message: "rejected",
+      },
+    ],
+    message: "rejected",
+  });
+
+  assert.equal(merged.disks[0]?.disk_status_code, "SEALED");
+  assert.equal(merged.disks[0]?.runtime_status, "REJECTED");
+  assert.equal(edgeDiskPrimaryStatusLabel(merged.disks[0]!), "已封盘");
+});
+
+test("clears dashboard disks when websocket sends an empty disk list", () => {
+  const summary = normalizeEdgeDashboardSummary({
+    source: "edge",
+    edge_code: "edge-demo",
+    edge_name: "edge-demo",
+    export_job_id: "job-copying",
+    export_job_status: "COPYING",
+    scan: {
+      scan_event_type: "SCAN_DONE",
+      scanned_bucket_count: 1,
+      scanned_object_count: 0,
+      scanned_bytes: 0,
+      stable_object_count: 0,
+      skipped_object_count: 0,
+      current_bucket: "",
+      current_key: "",
+      last_scan_at: "2026-08-12T10:31:58Z",
+      message: "done",
+    },
+    global_progress: {
+      total_bytes: 0,
+      done_bytes: 0,
+      remaining_bytes: 0,
+      speed_bytes_per_sec: 0,
+      object_total: 0,
+      object_done: 0,
+      object_remaining: 0,
+    },
+    disks: [
+      {
+        disk_id: "disk-a",
+        disk_sn: "SN-A",
+        mount_path: "/media/edge/a",
+        disk_status_code: "INITIALIZED",
+        runtime_status: "READY",
+        total_bytes: 100,
+        done_bytes: 0,
+        remaining_bytes: 0,
+        free_bytes: 100,
+        speed_bytes_per_sec: 0,
+        object_total: 0,
+        object_done: 0,
+        object_remaining: 0,
+        current_object: null,
+        message: "ready",
+      },
+    ],
+    ws_connected: false,
+    last_http_refresh_at: "2026-08-12T10:31:58Z",
+    message: "summary",
+  });
+
+  const merged = applyCopyProgressEvent(summary, {
+    event_type: "DISK_REMOVED",
+    event_time: "2026-08-12T10:32:00Z",
+    source: "edge",
+    edge_code: "edge-demo",
+    export_job_id: "job-copying",
+    export_job_status: "COPYING",
+    global_progress: summary.global_progress,
+    disks: [],
+    message: "removed",
+  });
+
+  assert.equal(merged.disks.length, 0);
 });

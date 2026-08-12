@@ -5,16 +5,16 @@ use axum::{
     body::Body,
     extract::{
         ws::{Message, WebSocket},
-        Path as AxumPath, State, WebSocketUpgrade,
+        Path as AxumPath, Query, State, WebSocketUpgrade,
     },
     http::{HeaderMap, Request, StatusCode},
     response::Response,
     routing::{get, post},
     Json, Router,
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, QueryBuilder, Row};
 use tokio::{
     sync::RwLock,
     time::{self, Duration},
@@ -88,6 +88,12 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(health_handler))
         .route("/readyz", get(readiness_handler))
         .route("/api/center/summary", get(center_summary_handler))
+        .route("/api/center/sync-records", get(sync_records_handler))
+        .route(
+            "/api/center/sync-records/{ledger_id}",
+            get(sync_record_detail_handler),
+        )
+        .route("/api/center/edge-sites", get(edge_sites_handler))
         .route("/ws/center/import-progress", get(center_import_progress_ws))
         .route("/ws/center/progress", get(center_import_progress_ws))
         .route("/api/edge/auth", post(center_auth::edge_auth_handler))
@@ -326,6 +332,63 @@ pub struct CenterDashboardSummary {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct SyncRecordsQuery {
+    pub page: Option<u32>,
+    pub page_size: Option<u32>,
+    pub edge_code: Option<String>,
+    pub imported_from: Option<String>,
+    pub imported_to: Option<String>,
+    pub q: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SyncRecordItem {
+    pub ledger_id: i64,
+    pub edge_code: String,
+    pub edge_name: Option<String>,
+    pub source_bucket: String,
+    pub source_key: String,
+    pub source_etag: String,
+    pub source_size_bytes: u64,
+    pub source_last_modified: DateTime<Utc>,
+    pub plaintext_sha256: String,
+    pub ciphertext_sha256: Option<String>,
+    pub chunk_group_id: Option<Uuid>,
+    pub import_bucket: String,
+    pub import_key: String,
+    pub export_job_id: Uuid,
+    pub import_job_id: Uuid,
+    pub imported_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct EdgeSiteOption {
+    pub edge_code: String,
+    pub edge_name: String,
+    pub edge_status: String,
+    pub object_count: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SyncRecordsResponse {
+    pub page: u32,
+    pub page_size: u32,
+    pub total: u64,
+    pub items: Vec<SyncRecordItem>,
+    pub edges: Vec<EdgeSiteOption>,
+}
+
+#[derive(Debug, Clone)]
+struct NormalizedSyncRecordsQuery {
+    page: u32,
+    page_size: u32,
+    edge_code: Option<String>,
+    imported_from: Option<DateTime<Utc>>,
+    imported_to: Option<DateTime<Utc>>,
+    q: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct CenterImportProgressEvent {
     pub event_type: String,
@@ -359,6 +422,7 @@ pub struct MemoryCenterStore {
     pub disks_by_sn: HashMap<String, Uuid>,
     pub edges: HashMap<String, EdgeRecord>,
     pub data_keys: HashMap<Uuid, DataKeyRecord>,
+    pub sync_records: Vec<SyncRecordItem>,
 }
 
 #[derive(Clone)]
@@ -662,6 +726,19 @@ impl CenterService {
             message: "center HTTP dashboard summary".to_string(),
         })
     }
+
+    pub async fn sync_records(&self, query: SyncRecordsQuery) -> Result<SyncRecordsResponse> {
+        let query = NormalizedSyncRecordsQuery::try_from(query)?;
+        self.store.sync_records(&query).await
+    }
+
+    pub async fn sync_record_detail(&self, ledger_id: i64) -> Result<Option<SyncRecordItem>> {
+        self.store.sync_record_detail(ledger_id).await
+    }
+
+    pub async fn edge_sites(&self) -> Result<Vec<EdgeSiteOption>> {
+        self.store.edge_sites_with_object_counts().await
+    }
 }
 
 impl CenterIdentity {
@@ -672,6 +749,39 @@ impl CenterIdentity {
             protocol_version: PROTOCOL_VERSION.to_string(),
         }
     }
+}
+
+impl TryFrom<SyncRecordsQuery> for NormalizedSyncRecordsQuery {
+    type Error = anyhow::Error;
+
+    fn try_from(query: SyncRecordsQuery) -> Result<Self> {
+        let page = query.page.unwrap_or(1).max(1);
+        let page_size = query.page_size.unwrap_or(20).clamp(1, 100);
+        Ok(Self {
+            page,
+            page_size,
+            edge_code: non_empty(query.edge_code),
+            imported_from: parse_optional_rfc3339("imported_from", query.imported_from)?,
+            imported_to: parse_optional_rfc3339("imported_to", query.imported_to)?,
+            q: non_empty(query.q),
+        })
+    }
+}
+
+fn non_empty(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn parse_optional_rfc3339(field: &str, value: Option<String>) -> Result<Option<DateTime<Utc>>> {
+    let Some(value) = non_empty(value) else {
+        return Ok(None);
+    };
+    let parsed = DateTime::parse_from_rfc3339(&value)
+        .with_context(|| format!("{field} must be RFC3339 timestamp"))?
+        .with_timezone(&Utc);
+    Ok(Some(parsed))
 }
 
 impl VerifyDiskResponse {
@@ -774,6 +884,42 @@ impl CenterStore {
                     .cloned()
                     .map(memory_disk_summary)
                     .collect())
+            }
+        }
+    }
+
+    async fn sync_records(
+        &self,
+        query: &NormalizedSyncRecordsQuery,
+    ) -> Result<SyncRecordsResponse> {
+        match self {
+            Self::Pg(pg) => pg.sync_records(query).await,
+            Self::Memory(mem) => {
+                let guard = mem.read().await;
+                Ok(memory_sync_records(&guard, query))
+            }
+        }
+    }
+
+    async fn sync_record_detail(&self, ledger_id: i64) -> Result<Option<SyncRecordItem>> {
+        match self {
+            Self::Pg(pg) => pg.sync_record_detail(ledger_id).await,
+            Self::Memory(mem) => Ok(mem
+                .read()
+                .await
+                .sync_records
+                .iter()
+                .find(|record| record.ledger_id == ledger_id)
+                .cloned()),
+        }
+    }
+
+    async fn edge_sites_with_object_counts(&self) -> Result<Vec<EdgeSiteOption>> {
+        match self {
+            Self::Pg(pg) => pg.edge_sites_with_object_counts().await,
+            Self::Memory(mem) => {
+                let guard = mem.read().await;
+                Ok(memory_edge_sites(&guard))
             }
         }
     }
@@ -943,6 +1089,117 @@ impl PgCenterStore {
         Ok(rows.into_iter().map(center_disk_summary_from_row).collect())
     }
 
+    async fn sync_records(
+        &self,
+        query: &NormalizedSyncRecordsQuery,
+    ) -> Result<SyncRecordsResponse> {
+        let total = self.sync_records_count(query).await?;
+        let offset = i64::from(query.page.saturating_sub(1)) * i64::from(query.page_size);
+        let mut builder: QueryBuilder<Postgres> = QueryBuilder::new(
+            r#"
+            SELECT ol.id AS ledger_id,
+                   ol.edge_code,
+                   es.edge_name,
+                   ol.source_bucket,
+                   ol.source_key,
+                   ol.source_etag,
+                   ol.source_size_bytes,
+                   ol.source_last_modified,
+                   ol.plaintext_sha256,
+                   ol.ciphertext_sha256,
+                   ol.chunk_group_id,
+                   ol.import_bucket,
+                   ol.import_key,
+                   ol.export_job_id,
+                   ol.import_job_id,
+                   ol.imported_at
+            FROM object_ledger AS ol
+            LEFT JOIN edge_site AS es ON es.edge_code = ol.edge_code
+            WHERE TRUE
+            "#,
+        );
+        append_sync_record_filters(&mut builder, query);
+        builder.push(" ORDER BY ol.imported_at DESC, ol.id DESC LIMIT ");
+        builder.push_bind(i64::from(query.page_size));
+        builder.push(" OFFSET ");
+        builder.push_bind(offset);
+
+        let rows = builder.build().fetch_all(&self.pool).await?;
+        let edges = self.edge_sites_with_object_counts().await?;
+        Ok(SyncRecordsResponse {
+            page: query.page,
+            page_size: query.page_size,
+            total,
+            items: rows.into_iter().map(sync_record_from_row).collect(),
+            edges,
+        })
+    }
+
+    async fn sync_records_count(&self, query: &NormalizedSyncRecordsQuery) -> Result<u64> {
+        let mut builder: QueryBuilder<Postgres> = QueryBuilder::new(
+            r#"
+            SELECT COUNT(*)
+            FROM object_ledger AS ol
+            LEFT JOIN edge_site AS es ON es.edge_code = ol.edge_code
+            WHERE TRUE
+            "#,
+        );
+        append_sync_record_filters(&mut builder, query);
+        let total = builder
+            .build_query_scalar::<i64>()
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(total.max(0) as u64)
+    }
+
+    async fn sync_record_detail(&self, ledger_id: i64) -> Result<Option<SyncRecordItem>> {
+        let row = sqlx::query(
+            r#"
+            SELECT ol.id AS ledger_id,
+                   ol.edge_code,
+                   es.edge_name,
+                   ol.source_bucket,
+                   ol.source_key,
+                   ol.source_etag,
+                   ol.source_size_bytes,
+                   ol.source_last_modified,
+                   ol.plaintext_sha256,
+                   ol.ciphertext_sha256,
+                   ol.chunk_group_id,
+                   ol.import_bucket,
+                   ol.import_key,
+                   ol.export_job_id,
+                   ol.import_job_id,
+                   ol.imported_at
+            FROM object_ledger AS ol
+            LEFT JOIN edge_site AS es ON es.edge_code = ol.edge_code
+            WHERE ol.id = $1
+            "#,
+        )
+        .bind(ledger_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(sync_record_from_row))
+    }
+
+    async fn edge_sites_with_object_counts(&self) -> Result<Vec<EdgeSiteOption>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT es.edge_code,
+                   es.edge_name,
+                   es.status AS edge_status,
+                   COUNT(ol.id) AS object_count
+            FROM edge_site AS es
+            LEFT JOIN object_ledger AS ol ON ol.edge_code = es.edge_code
+            GROUP BY es.edge_code, es.edge_name, es.status
+            ORDER BY es.edge_code ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(edge_site_option_from_row).collect())
+    }
+
     async fn stage_initializing_data_key(&self, key: DataKeyRecord) -> Result<()> {
         sqlx::query(
             "INSERT INTO data_key (data_key_id, disk_id, encryption_alg, encrypted_key, key_wrap_alg, status, remark) VALUES ($1, $2, $3, $4, $5, 'REVOKED', 'initialization staging: not issuable until disk_info write succeeds')",
@@ -1081,6 +1338,171 @@ fn edge_record_from_row(row: sqlx::postgres::PgRow) -> EdgeRecord {
         auth_secret: row.get("auth_secret_ciphertext"),
         edge_status: row.get("status"),
     }
+}
+
+fn append_sync_record_filters<'a>(
+    builder: &mut QueryBuilder<'a, Postgres>,
+    query: &'a NormalizedSyncRecordsQuery,
+) {
+    if let Some(edge_code) = &query.edge_code {
+        builder.push(" AND (ol.edge_code = ");
+        builder.push_bind(edge_code);
+        builder.push(" OR es.edge_code = ");
+        builder.push_bind(edge_code);
+        builder.push(")");
+    }
+    if let Some(imported_from) = query.imported_from {
+        builder.push(" AND ol.imported_at >= ");
+        builder.push_bind(imported_from.naive_utc());
+    }
+    if let Some(imported_to) = query.imported_to {
+        builder.push(" AND ol.imported_at <= ");
+        builder.push_bind(imported_to.naive_utc());
+    }
+    if let Some(q) = &query.q {
+        let like = format!("%{q}%");
+        builder.push(
+            r#" AND (
+                ol.source_bucket ILIKE "#,
+        );
+        builder.push_bind(like.clone());
+        builder.push(" OR ol.source_key ILIKE ");
+        builder.push_bind(like.clone());
+        builder.push(" OR ol.source_etag ILIKE ");
+        builder.push_bind(like.clone());
+        builder.push(" OR ol.import_job_id::text ILIKE ");
+        builder.push_bind(like.clone());
+        builder.push(" OR ol.export_job_id::text ILIKE ");
+        builder.push_bind(like.clone());
+        builder.push(" OR ol.import_bucket ILIKE ");
+        builder.push_bind(like.clone());
+        builder.push(" OR ol.import_key ILIKE ");
+        builder.push_bind(like);
+        builder.push(")");
+    }
+}
+
+fn sync_record_from_row(row: sqlx::postgres::PgRow) -> SyncRecordItem {
+    SyncRecordItem {
+        ledger_id: row.get("ledger_id"),
+        edge_code: row.get("edge_code"),
+        edge_name: row.get("edge_name"),
+        source_bucket: row.get("source_bucket"),
+        source_key: row.get("source_key"),
+        source_etag: row.get("source_etag"),
+        source_size_bytes: row.get::<i64, _>("source_size_bytes").max(0) as u64,
+        source_last_modified: utc_from_naive(row.get("source_last_modified")),
+        plaintext_sha256: row.get("plaintext_sha256"),
+        ciphertext_sha256: row.get("ciphertext_sha256"),
+        chunk_group_id: row.get("chunk_group_id"),
+        import_bucket: row.get("import_bucket"),
+        import_key: row.get("import_key"),
+        export_job_id: row.get("export_job_id"),
+        import_job_id: row.get("import_job_id"),
+        imported_at: utc_from_naive(row.get("imported_at")),
+    }
+}
+
+fn edge_site_option_from_row(row: sqlx::postgres::PgRow) -> EdgeSiteOption {
+    EdgeSiteOption {
+        edge_code: row.get("edge_code"),
+        edge_name: row.get("edge_name"),
+        edge_status: row.get("edge_status"),
+        object_count: Some(row.get::<i64, _>("object_count").max(0) as u64),
+    }
+}
+
+fn utc_from_naive(value: NaiveDateTime) -> DateTime<Utc> {
+    Utc.from_utc_datetime(&value)
+}
+
+fn memory_sync_records(
+    store: &MemoryCenterStore,
+    query: &NormalizedSyncRecordsQuery,
+) -> SyncRecordsResponse {
+    let mut records = store
+        .sync_records
+        .iter()
+        .filter(|record| memory_record_matches(record, query))
+        .cloned()
+        .collect::<Vec<_>>();
+    records.sort_by(|left, right| {
+        right
+            .imported_at
+            .cmp(&left.imported_at)
+            .then_with(|| right.ledger_id.cmp(&left.ledger_id))
+    });
+
+    let total = records.len() as u64;
+    let offset = (query.page.saturating_sub(1) as usize) * (query.page_size as usize);
+    let limit = query.page_size as usize;
+    let items = records.into_iter().skip(offset).take(limit).collect();
+
+    SyncRecordsResponse {
+        page: query.page,
+        page_size: query.page_size,
+        total,
+        items,
+        edges: memory_edge_sites(store),
+    }
+}
+
+fn memory_record_matches(record: &SyncRecordItem, query: &NormalizedSyncRecordsQuery) -> bool {
+    if let Some(edge_code) = &query.edge_code {
+        if record.edge_code != *edge_code {
+            return false;
+        }
+    }
+    if let Some(imported_from) = query.imported_from {
+        if record.imported_at < imported_from {
+            return false;
+        }
+    }
+    if let Some(imported_to) = query.imported_to {
+        if record.imported_at > imported_to {
+            return false;
+        }
+    }
+    if let Some(q) = &query.q {
+        let q = q.to_ascii_lowercase();
+        let searchable = [
+            record.source_bucket.as_str(),
+            record.source_key.as_str(),
+            record.source_etag.as_str(),
+            record.import_bucket.as_str(),
+            record.import_key.as_str(),
+        ];
+        if !searchable
+            .iter()
+            .any(|value| value.to_ascii_lowercase().contains(&q))
+            && !record.import_job_id.to_string().contains(&q)
+            && !record.export_job_id.to_string().contains(&q)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn memory_edge_sites(store: &MemoryCenterStore) -> Vec<EdgeSiteOption> {
+    let mut edges = store
+        .edges
+        .values()
+        .map(|edge| EdgeSiteOption {
+            edge_code: edge.edge_code.clone(),
+            edge_name: edge.edge_name.clone(),
+            edge_status: edge.edge_status.clone(),
+            object_count: Some(
+                store
+                    .sync_records
+                    .iter()
+                    .filter(|record| record.edge_code == edge.edge_code)
+                    .count() as u64,
+            ),
+        })
+        .collect::<Vec<_>>();
+    edges.sort_by(|left, right| left.edge_code.cmp(&right.edge_code));
+    edges
 }
 
 fn center_global_progress(disks: &[CenterDiskSummary]) -> CenterGlobalProgress {
@@ -1252,6 +1674,39 @@ async fn center_summary_handler(
         .map_err(Into::into)
 }
 
+async fn sync_records_handler(
+    State(state): State<AppState>,
+    Query(query): Query<SyncRecordsQuery>,
+) -> Result<Json<SyncRecordsResponse>, ApiError> {
+    state
+        .service
+        .sync_records(query)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn sync_record_detail_handler(
+    State(state): State<AppState>,
+    AxumPath(ledger_id): AxumPath<i64>,
+) -> Result<Json<SyncRecordItem>, ApiError> {
+    state
+        .service
+        .sync_record_detail(ledger_id)
+        .await?
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found("sync record not found"))
+}
+
+async fn edge_sites_handler(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let edges = state.service.edge_sites().await?;
+    Ok(Json(
+        serde_json::json!({ "items": edges.clone(), "edges": edges }),
+    ))
+}
+
 async fn center_import_progress_ws(
     State(state): State<AppState>,
     ws: WebSocketUpgrade,
@@ -1347,7 +1802,7 @@ async fn verify_disk_handler(
 ) -> Result<Json<VerifyDiskResponse>, EdgeApiError> {
     let authenticated = center_auth::authenticate_edge_request(&state, request).await?;
     let req = serde_json::from_slice::<VerifyDiskRequest>(&authenticated.body)
-        .map_err(|err| ApiError(anyhow!("invalid verify request json: {err}")))?;
+        .map_err(|err| ApiError::from(anyhow!("invalid verify request json: {err}")))?;
     state
         .service
         .verify_disk(req)
@@ -1363,7 +1818,7 @@ async fn export_key_handler(
 ) -> Result<Json<ExportKeyResponse>, EdgeApiError> {
     let authenticated = center_auth::authenticate_edge_request(&state, request).await?;
     let req = serde_json::from_slice::<ExportKeyRequest>(&authenticated.body)
-        .map_err(|err| ApiError(anyhow!("invalid export-key request json: {err}")))?;
+        .map_err(|err| ApiError::from(anyhow!("invalid export-key request json: {err}")))?;
     state
         .service
         .export_key(req)
@@ -1441,21 +1896,39 @@ struct ErrorBody {
     message: String,
 }
 
-struct ApiError(anyhow::Error);
+struct ApiError {
+    status: StatusCode,
+    error_code: &'static str,
+    message: String,
+}
 
 impl From<anyhow::Error> for ApiError {
     fn from(value: anyhow::Error) -> Self {
-        Self(value)
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            error_code: "INVALID_REQUEST",
+            message: value.to_string(),
+        }
+    }
+}
+
+impl ApiError {
+    fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            error_code: "NOT_FOUND",
+            message: message.into(),
+        }
     }
 }
 
 impl axum::response::IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         (
-            StatusCode::BAD_REQUEST,
+            self.status,
             Json(ErrorBody {
-                error_code: "INVALID_REQUEST",
-                message: self.0.to_string(),
+                error_code: self.error_code,
+                message: self.message,
             }),
         )
             .into_response()
@@ -1526,6 +1999,16 @@ mod tests {
                 edge_status: "ACTIVE".to_string(),
             },
         );
+        store.edges.insert(
+            "edge-b".to_string(),
+            EdgeRecord {
+                edge_code: "edge-b".to_string(),
+                edge_name: "Edge B".to_string(),
+                auth_key_id: "auth-key-b".to_string(),
+                auth_secret: "edge-auth-secret-b".to_string(),
+                edge_status: "DISABLED".to_string(),
+            },
+        );
         store.data_keys.insert(
             data_key_id,
             DataKeyRecord {
@@ -1539,11 +2022,64 @@ mod tests {
                 status: DataKeyStatus::Active,
             },
         );
+        store.sync_records = vec![
+            test_sync_record(
+                1,
+                "edge-a",
+                Some("Edge A"),
+                "photos",
+                "2026/08/a.jpg",
+                "archive-edge-a",
+                "2026-08-12T01:00:00Z",
+            ),
+            test_sync_record(
+                2,
+                "edge-b",
+                Some("Edge B"),
+                "videos",
+                "2026/08/b.mp4",
+                "archive-edge-b",
+                "2026-08-12T02:00:00Z",
+            ),
+        ];
         CenterService::new(
             CenterStore::Memory(Arc::new(RwLock::new(store))),
             security,
             CenterIdentity::test(),
         )
+    }
+
+    fn test_sync_record(
+        ledger_id: i64,
+        edge_code: &str,
+        edge_name: Option<&str>,
+        source_bucket: &str,
+        source_key: &str,
+        import_bucket: &str,
+        imported_at: &str,
+    ) -> SyncRecordItem {
+        SyncRecordItem {
+            ledger_id,
+            edge_code: edge_code.to_string(),
+            edge_name: edge_name.map(str::to_string),
+            source_bucket: source_bucket.to_string(),
+            source_key: source_key.to_string(),
+            source_etag: format!("etag-{ledger_id}"),
+            source_size_bytes: 1024 * ledger_id as u64,
+            source_last_modified: DateTime::parse_from_rfc3339("2026-08-11T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            plaintext_sha256: format!("plain-sha-{ledger_id}"),
+            ciphertext_sha256: Some(format!("cipher-sha-{ledger_id}")),
+            chunk_group_id: None,
+            import_bucket: import_bucket.to_string(),
+            import_key: source_key.to_string(),
+            export_job_id: Uuid::new_v4(),
+            import_job_id: Uuid::new_v4(),
+            imported_at: DateTime::parse_from_rfc3339(imported_at)
+                .unwrap()
+                .with_timezone(&Utc),
+        }
     }
 
     async fn ids(service: &CenterService) -> (Uuid, Uuid) {
@@ -2061,6 +2597,91 @@ mod tests {
         assert!(body["disks"][0].get("runtime_status").is_some());
         assert!(body["disks"][0].get("disk_enabled").is_some());
         assert!(body["disks"][0].get("status").is_none());
+    }
+
+    #[tokio::test]
+    async fn sync_records_route_lists_filters_and_uses_ledger_shape() {
+        let app = router(AppState::new(memory_service()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/center/sync-records?page=1&page_size=1&edge_code=edge-b&q=b.mp4")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["page"], 1);
+        assert_eq!(body["page_size"], 1);
+        assert_eq!(body["total"], 1);
+        assert_eq!(body["items"][0]["ledger_id"], 2);
+        assert_eq!(body["items"][0]["edge_code"], "edge-b");
+        assert_eq!(body["items"][0]["edge_name"], "Edge B");
+        assert_eq!(body["items"][0]["source_bucket"], "videos");
+        assert!(body["items"][0].get("status").is_none());
+        assert!(body["edges"].is_array());
+    }
+
+    #[tokio::test]
+    async fn sync_record_detail_route_returns_one_record_or_not_found() {
+        let app = router(AppState::new(memory_service()));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/center/sync-records/1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["ledger_id"], 1);
+        assert_eq!(body["import_bucket"], "archive-edge-a");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/center/sync-records/999")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn edge_sites_route_returns_prefixed_status_and_object_counts() {
+        let app = router(AppState::new(memory_service()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/center/edge-sites")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["items"][0]["edge_code"], "edge-a");
+        assert_eq!(body["items"][0]["edge_status"], "ACTIVE");
+        assert_eq!(body["items"][0]["object_count"], 1);
+        assert!(body["items"][0].get("status").is_none());
+        assert_eq!(body["edges"][1]["edge_code"], "edge-b");
     }
 
     #[tokio::test]

@@ -703,16 +703,27 @@ mod tests {
         crate::control::DiskRuntimeSummary {
             hardware_serial: "SN-A".to_owned(),
             disk_sn: "SN-A".to_owned(),
+            stable_hardware_id: "fs-uuid-a".to_owned(),
             disk_id: Some(Uuid::new_v4()),
             device_path: "/dev/sdb1".to_owned(),
             mount_path: Some("/mnt/rustfs-transfer/disk-a".to_owned()),
             filesystem_type: Some("ext4".to_owned()),
+            filesystem: Some("ext4".to_owned()),
             fs_uuid: Some("fs-uuid-a".to_owned()),
+            filesystem_uuid: Some("fs-uuid-a".to_owned()),
             disk_status_code: disk_status_code.to_owned(),
             runtime_status: runtime_status.to_owned(),
+            task_pool_eligible: runtime_status == "READY" && disk_status_code == "INITIALIZED",
             capacity_bytes: 100,
+            total_bytes: 0,
+            done_bytes: 0,
+            remaining_bytes: 0,
             free_bytes: 80,
             object_budget_bytes: 64,
+            speed_bytes_per_sec: 0,
+            object_total: 0,
+            object_done: 0,
+            object_remaining: 0,
             progress: EdgeDiskProgressSummary {
                 total_bytes: 0,
                 done_bytes: 0,
@@ -726,6 +737,7 @@ mod tests {
                 bucket: "bucket".to_owned(),
                 key: "key".to_owned(),
                 display_name: "key".to_owned(),
+                relative_data_path: "key".to_owned(),
                 size_bytes: 10,
                 done_bytes: 0,
                 remaining_bytes: 10,
@@ -734,6 +746,7 @@ mod tests {
             }),
             last_error_code: None,
             error_message: None,
+            message: format!("disk runtime_status={runtime_status}"),
         }
     }
 

@@ -842,7 +842,7 @@ button:focus-visible {
 
 .selected-disk-strip {
   position: absolute;
-  inset: 56% 22px auto;
+  inset: 57% 22px auto;
   z-index: 23;
   display: grid;
   grid-template-columns: minmax(0, 1fr);
@@ -1093,7 +1093,7 @@ dd {
 
 .overview-metrics {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 0;
   height: calc(100% - 34px);
 }
@@ -1107,12 +1107,11 @@ dd {
   border-top: 1px solid rgb(118 148 177 / 20%);
 }
 
-.overview-metrics div:nth-child(1),
-.overview-metrics div:nth-child(4) {
+.overview-metrics div:nth-child(1) {
   border-left: 0;
 }
 
-.overview-metrics div:nth-child(-n + 3) {
+.overview-metrics div:nth-child(-n + 4) {
   border-top: 0;
 }
 

@@ -248,7 +248,17 @@ async fn edge_summary(
 async fn edge_dashboard_summary(
     State(state): State<AppState>,
 ) -> Result<Json<crate::control::EdgeControlSummary>, ApiError> {
-    refresh_transport_runtime_before_control(&state).await?;
+    if let Err(err) = state
+        .disk_rescan
+        .run_rescan_once(DiskRescanTrigger::control_refresh())
+        .await
+    {
+        tracing::warn!(
+            error = %err,
+            "edge dashboard summary disk refresh failed; returning latest recorded summary"
+        );
+    }
+
     state
         .control
         .summary()
@@ -852,16 +862,27 @@ mod tests {
                     disks: vec![DiskRuntimeSummary {
                         hardware_serial: "SN-A".to_string(),
                         disk_sn: "SN-A".to_string(),
+                        stable_hardware_id: "fs-uuid-a".to_string(),
                         disk_id: Some(Uuid::new_v4()),
                         device_path: "/dev/sdb1".to_string(),
                         mount_path: Some("/mnt/rustfs-transfer/disk-a".to_string()),
                         filesystem_type: Some("ext4".to_string()),
+                        filesystem: Some("ext4".to_string()),
                         fs_uuid: Some("fs-uuid-a".to_string()),
+                        filesystem_uuid: Some("fs-uuid-a".to_string()),
                         disk_status_code: "IMPORTED".to_string(),
                         runtime_status: "READY".to_string(),
+                        task_pool_eligible: false,
                         capacity_bytes: 100,
+                        total_bytes: 99,
+                        done_bytes: 10,
+                        remaining_bytes: 89,
                         free_bytes: 80,
                         object_budget_bytes: 64,
+                        speed_bytes_per_sec: 5,
+                        object_total: 2,
+                        object_done: 1,
+                        object_remaining: 1,
                         progress: EdgeDiskProgressSummary {
                             total_bytes: 99,
                             done_bytes: 10,
@@ -875,6 +896,7 @@ mod tests {
                             bucket: "test".to_string(),
                             key: "alpha.bin".to_string(),
                             display_name: "alpha.bin".to_string(),
+                            relative_data_path: "alpha.bin".to_string(),
                             size_bytes: 99,
                             done_bytes: 10,
                             remaining_bytes: 89,
@@ -883,6 +905,7 @@ mod tests {
                         }),
                         last_error_code: None,
                         error_message: None,
+                        message: "disk runtime_status=READY".to_string(),
                     }],
                     ws_connected: false,
                     last_http_refresh_at: Utc::now(),

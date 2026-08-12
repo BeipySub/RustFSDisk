@@ -126,6 +126,14 @@ export function applyCopyProgressEvent(
   const eventIsTerminal = isTerminalExportJobStatus(event.export_job_status);
   const sameJob = summary.export_job_id === event.export_job_id;
 
+  if (event.event_type === "DISK_REMOVED" && summary.disks.length === 0) {
+    return {
+      ...summary,
+      ws_connected: true,
+      message: event.message || summary.message,
+    };
+  }
+
   if (summaryIsTerminal && summary.disks.length === 0 && !eventIsTerminal && !event.event_type.startsWith("DISK_")) {
     return {
       ...summary,
@@ -149,14 +157,46 @@ export function applyCopyProgressEvent(
     export_job_status: event.export_job_status,
     disk_status_code: visibleDiskStatusCode(event.disk_status_code),
     global_progress: event.global_progress,
-    disks: mergeDiskProgress(event.disks),
+    disks: mergeDiskProgress(summary.disks, event.disks),
     ws_connected: true,
     message: event.message,
   };
 }
 
-function mergeDiskProgress(eventDisks: EdgeDiskProgress[]): EdgeDiskProgress[] {
-  return eventDisks.map(normalizeDiskProgress);
+function mergeDiskProgress(
+  currentDisks: EdgeDiskProgress[],
+  eventDisks: EdgeDiskProgress[],
+): EdgeDiskProgress[] {
+  if (eventDisks.length === 0) return [];
+
+  const currentByKey = new Map(currentDisks.map((disk) => [diskIdentityKey(disk), disk]));
+  return eventDisks.map((disk) => {
+    const normalized = normalizeDiskProgress(disk);
+    const current = currentByKey.get(diskIdentityKey(normalized));
+    if (!current) return normalized;
+
+    return normalizeDiskProgress({
+      ...current,
+      ...normalized,
+      disk_status_code: normalized.disk_status_code ?? current.disk_status_code,
+      filesystem: normalized.filesystem ?? current.filesystem,
+      filesystem_uuid: normalized.filesystem_uuid ?? current.filesystem_uuid,
+      partition_uuid: normalized.partition_uuid ?? current.partition_uuid,
+      device_path: normalized.device_path ?? current.device_path,
+      model: normalized.model ?? current.model,
+      vendor: normalized.vendor ?? current.vendor,
+      transport: normalized.transport ?? current.transport,
+      hardware_serial: normalized.hardware_serial ?? current.hardware_serial,
+      id_serial: normalized.id_serial ?? current.id_serial,
+      stable_hardware_id: normalized.stable_hardware_id ?? current.stable_hardware_id,
+      total_bytes: normalized.total_bytes || current.total_bytes,
+      free_bytes: normalized.free_bytes || current.free_bytes,
+    });
+  });
+}
+
+function diskIdentityKey(disk: EdgeDiskProgress): string {
+  return disk.disk_id || disk.mount_path || disk.device_path || disk.disk_sn || disk.stable_hardware_id || "";
 }
 
 function isTerminalExportJobStatus(
