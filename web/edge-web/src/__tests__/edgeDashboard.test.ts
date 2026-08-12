@@ -475,7 +475,7 @@ test("replaces dashboard disks with the latest websocket disk list", () => {
   assert.equal(merged.disks.find((disk) => disk.disk_id === "disk-b"), undefined);
 });
 
-test("does not regress a terminal HTTP export job from stale websocket progress", () => {
+test("replaces terminal HTTP summary with websocket snapshot", () => {
   const summary = normalizeEdgeDashboardSummary({
     source: "edge",
     edge_code: "edge-demo",
@@ -529,13 +529,13 @@ test("does not regress a terminal HTTP export job from stale websocket progress"
     message: "stale copying",
   });
 
-  assert.equal(merged.export_job_status, "SEALED");
-  assert.equal(merged.global_progress.done_bytes, 100);
-  assert.equal(merged.message, "sealed");
+  assert.equal(merged.export_job_status, "COPYING");
+  assert.equal(merged.global_progress.done_bytes, 0);
+  assert.equal(merged.message, "stale copying");
   assert.equal(merged.ws_connected, true);
 });
 
-test("does not resurrect disks from stale websocket when HTTP summary is terminal and empty", () => {
+test("uses websocket disks as the current snapshot", () => {
   const summary = normalizeEdgeDashboardSummary({
     source: "edge",
     edge_code: "edge-demo",
@@ -606,10 +606,11 @@ test("does not resurrect disks from stale websocket when HTTP summary is termina
     message: "old ws snapshot",
   });
 
-  assert.equal(merged.disks.length, 0);
-  assert.equal(merged.export_job_status, "SEALED");
-  assert.equal(merged.export_job_id, "job-sealed");
-  assert.equal(merged.global_progress.done_bytes, 1428414961);
+  assert.equal(merged.disks.length, 1);
+  assert.equal(merged.disks[0]?.disk_id, "disk-a");
+  assert.equal(merged.export_job_status, "COPYING");
+  assert.equal(merged.export_job_id, "stale-copying-job");
+  assert.equal(merged.global_progress.done_bytes, 0);
 });
 
 test("does not resurrect a removed disk when HTTP summary has no current disks", () => {
@@ -663,24 +664,8 @@ test("does not resurrect a removed disk when HTTP summary has no current disks",
       object_done: 0,
       object_remaining: 0,
     },
-    disks: [
-      {
-        disk_id: "",
-        disk_sn: "SN-OLD",
-        mount_path: "/mnt/old",
-        runtime_status: "CHECKING",
-        total_bytes: 0,
-        done_bytes: 0,
-        remaining_bytes: 0,
-        free_bytes: 0,
-        speed_bytes_per_sec: 0,
-        object_total: 0,
-        object_done: 0,
-        object_remaining: 0,
-        current_object: null,
-        message: "disk runtime_status=CHECKING",
-      },
-    ],
+    disks: [],
+
     message: "DISK_REMOVED",
   });
 
@@ -689,7 +674,7 @@ test("does not resurrect a removed disk when HTTP summary has no current disks",
   assert.equal(merged.message, "DISK_REMOVED");
 });
 
-test("keeps imported lifecycle when websocket updates rejected runtime without disk status", () => {
+test("keeps imported lifecycle when websocket updates rejected runtime", () => {
   const summary = normalizeEdgeDashboardSummary({
     source: "edge",
     edge_code: "edge-demo",
@@ -755,8 +740,10 @@ test("keeps imported lifecycle when websocket updates rejected runtime without d
         disk_id: "disk-imported",
         disk_sn: "SN-1",
         mount_path: "/media/edge/imported",
+        disk_status_code: "IMPORTED",
         runtime_status: "REJECTED",
-        total_bytes: 0,
+        filesystem: "ext4",
+        total_bytes: 100,
         done_bytes: 0,
         remaining_bytes: 0,
         free_bytes: 0,
@@ -781,7 +768,7 @@ test("keeps imported lifecycle when websocket updates rejected runtime without d
   assert.equal(edgeDiskPrimaryStatusLabel(merged.disks[0]!), "已导入");
 });
 
-test("keeps sealed lifecycle when websocket updates rejected runtime without disk status", () => {
+test("keeps sealed lifecycle when websocket updates rejected runtime", () => {
   const summary = normalizeEdgeDashboardSummary({
     source: "edge",
     edge_code: "edge-demo",
@@ -846,8 +833,9 @@ test("keeps sealed lifecycle when websocket updates rejected runtime without dis
         disk_id: "disk-sealed",
         disk_sn: "SN-2",
         mount_path: "/media/edge/sealed",
+        disk_status_code: "SEALED",
         runtime_status: "REJECTED",
-        total_bytes: 0,
+        total_bytes: 200,
         done_bytes: 0,
         remaining_bytes: 0,
         free_bytes: 0,

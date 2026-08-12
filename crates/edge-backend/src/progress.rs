@@ -18,7 +18,7 @@ pub struct CurrentObjectProgress {
     pub object_status: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DiskProgressSnapshot {
     pub disk_id: String,
     pub disk_sn: String,
@@ -50,6 +50,10 @@ pub struct DiskProgressSnapshot {
     pub free_bytes: u64,
     #[serde(default)]
     pub object_budget_bytes: u64,
+    #[serde(default)]
+    pub export_job_id: Option<String>,
+    #[serde(default)]
+    pub seal_id: Option<String>,
     pub speed_bytes_per_sec: u64,
     pub object_total: u64,
     pub object_done: u64,
@@ -58,13 +62,19 @@ pub struct DiskProgressSnapshot {
     pub progress: DiskProgressFields,
     pub current_object: Option<CurrentObjectProgress>,
     #[serde(default)]
+    pub current_file: Option<String>,
+    #[serde(default)]
+    pub current_file_size: u64,
+    #[serde(default)]
+    pub current_file_done: u64,
+    #[serde(default)]
     pub last_error_code: Option<String>,
     #[serde(default)]
     pub error_message: Option<String>,
     pub message: String,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct DiskProgressFields {
     pub total_bytes: u64,
     pub done_bytes: u64,
@@ -73,9 +83,10 @@ pub struct DiskProgressFields {
     pub object_total: u64,
     pub object_done: u64,
     pub object_remaining: u64,
+    pub percent: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct GlobalProgressSnapshot {
     pub total_bytes: u64,
     pub done_bytes: u64,
@@ -84,19 +95,59 @@ pub struct GlobalProgressSnapshot {
     pub object_total: u64,
     pub object_done: u64,
     pub object_remaining: u64,
+    #[serde(default)]
+    pub percent: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObjectInventorySnapshot {
+    pub total_bytes: u64,
+    pub exported_bytes: u64,
+    pub total_count: u64,
+    pub exported_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DashboardExportJobSnapshot {
+    pub export_job_id: String,
+    pub export_job_status: String,
+    pub start_time: Option<DateTime<Utc>>,
+    pub finish_time: Option<DateTime<Utc>>,
+    pub total_bytes: u64,
+    pub done_bytes: u64,
+    pub remaining_bytes: u64,
+    pub speed_bytes_per_sec: u64,
+    pub object_total: u64,
+    pub object_done: u64,
+    pub object_remaining: u64,
+    #[serde(default)]
+    pub percent: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CopyProgressEvent {
     pub event_type: String,
     pub event_time: DateTime<Utc>,
     pub source: String,
     pub edge_code: String,
+    #[serde(default)]
+    pub edge_name: String,
+    #[serde(default)]
+    pub object_inventory: ObjectInventorySnapshot,
     pub export_job_id: String,
+    #[serde(default)]
+    pub export_job: Option<DashboardExportJobSnapshot>,
     pub disk_status_code: String,
     pub export_job_status: String,
+    #[serde(default)]
+    pub global: GlobalProgressSnapshot,
     pub global_progress: GlobalProgressSnapshot,
+    #[serde(default)]
+    pub disk_runtime: Vec<DiskProgressSnapshot>,
     pub disks: Vec<DiskProgressSnapshot>,
+    #[serde(default)]
+    pub ws_connected: bool,
+    pub last_http_refresh_at: DateTime<Utc>,
     pub message: String,
 }
 
@@ -281,7 +332,7 @@ impl ProgressAggregator {
         let done_bytes = state.disks.values().map(|disk| disk.done_bytes).sum();
         let object_total = state.disks.values().map(|disk| disk.object_total).sum();
         let object_done = state.disks.values().map(|disk| disk.object_done).sum();
-        let disks = state
+        let disks: Vec<DiskProgressSnapshot> = state
             .disks
             .values()
             .map(|disk| {
@@ -293,7 +344,22 @@ impl ProgressAggregator {
                     object_total: disk.object_total,
                     object_done: disk.object_done,
                     object_remaining: disk.object_total.saturating_sub(disk.object_done),
+                    percent: percent(disk.done_bytes, disk.total_bytes),
                 };
+                let current_file = disk
+                    .current_object
+                    .as_ref()
+                    .map(|object| object.display_name.clone());
+                let current_file_size = disk
+                    .current_object
+                    .as_ref()
+                    .map(|object| object.size_bytes)
+                    .unwrap_or(0);
+                let current_file_done = disk
+                    .current_object
+                    .as_ref()
+                    .map(|object| object.done_bytes)
+                    .unwrap_or(0);
                 DiskProgressSnapshot {
                     disk_id: disk.disk_id.clone(),
                     disk_sn: disk.disk_sn.clone(),
@@ -314,18 +380,47 @@ impl ProgressAggregator {
                     remaining_bytes: progress.remaining_bytes,
                     free_bytes: disk.free_bytes,
                     object_budget_bytes: 0,
+                    export_job_id: Some(state.export_job_id.clone()),
+                    seal_id: None,
                     speed_bytes_per_sec: progress.speed_bytes_per_sec,
                     object_total: progress.object_total,
                     object_done: progress.object_done,
                     object_remaining: progress.object_remaining,
                     progress,
                     current_object: disk.current_object.clone(),
+                    current_file,
+                    current_file_size,
+                    current_file_done,
                     last_error_code: None,
                     error_message: None,
                     message: disk.message.clone(),
                 }
             })
             .collect();
+        let global_progress = GlobalProgressSnapshot {
+            total_bytes,
+            done_bytes,
+            remaining_bytes: total_bytes.saturating_sub(done_bytes),
+            speed_bytes_per_sec: done_bytes / elapsed,
+            object_total,
+            object_done,
+            object_remaining: object_total.saturating_sub(object_done),
+            percent: percent(done_bytes, total_bytes),
+        };
+        let export_job = DashboardExportJobSnapshot {
+            export_job_id: state.export_job_id.clone(),
+            export_job_status: state.export_job_status.clone(),
+            start_time: None,
+            finish_time: None,
+            total_bytes: global_progress.total_bytes,
+            done_bytes: global_progress.done_bytes,
+            remaining_bytes: global_progress.remaining_bytes,
+            speed_bytes_per_sec: global_progress.speed_bytes_per_sec,
+            object_total: global_progress.object_total,
+            object_done: global_progress.object_done,
+            object_remaining: global_progress.object_remaining,
+            percent: global_progress.percent,
+        };
 
         CopyProgressEvent {
             event_type: if requested_event_type == "COPY_PROGRESS" {
@@ -336,20 +431,27 @@ impl ProgressAggregator {
             event_time: Utc::now(),
             source: "edge".to_string(),
             edge_code: state.edge_code.clone(),
+            edge_name: state.edge_code.clone(),
+            object_inventory: ObjectInventorySnapshot::default(),
             export_job_id: state.export_job_id.clone(),
+            export_job: Some(export_job),
             disk_status_code: state.disk_status_code.clone(),
             export_job_status: state.export_job_status.clone(),
-            global_progress: GlobalProgressSnapshot {
-                total_bytes,
-                done_bytes,
-                remaining_bytes: total_bytes.saturating_sub(done_bytes),
-                speed_bytes_per_sec: done_bytes / elapsed,
-                object_total,
-                object_done,
-                object_remaining: object_total.saturating_sub(object_done),
-            },
+            global: global_progress.clone(),
+            global_progress,
+            disk_runtime: disks.clone(),
             disks,
+            ws_connected: true,
+            last_http_refresh_at: Utc::now(),
             message: message.into(),
         }
+    }
+}
+
+fn percent(done_bytes: u64, total_bytes: u64) -> f64 {
+    if total_bytes == 0 {
+        0.0
+    } else {
+        (done_bytes as f64 / total_bytes as f64) * 100.0
     }
 }

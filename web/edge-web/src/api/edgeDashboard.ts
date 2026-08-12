@@ -55,6 +55,17 @@ export interface EdgeCurrentObject {
   object_status: ObjectStatus;
 }
 
+export interface EdgeObjectInventory {
+  total_bytes: number;
+  exported_bytes: number;
+  total_count: number;
+  exported_count: number;
+}
+
+export interface EdgeDiskProgressSnapshot extends EdgeGlobalProgress {
+  percent: number;
+}
+
 export interface EdgeDiskProgress {
   disk_id: string;
   disk_sn: string;
@@ -64,13 +75,19 @@ export interface EdgeDiskProgress {
   mount_path: string;
   device_path?: string;
   filesystem?: string;
+  filesystem_type?: string;
   filesystem_uuid?: string;
+  fs_uuid?: string;
   partition_uuid?: string;
   model?: string;
   vendor?: string;
   transport?: string;
   disk_status_code?: EdgeVisibleDiskStatusCode;
   runtime_status: RuntimeStatus;
+  capacity_bytes?: number;
+  object_budget_bytes?: number;
+  task_pool_eligible?: boolean;
+  progress?: EdgeDiskProgressSnapshot;
   total_bytes: number;
   done_bytes: number;
   remaining_bytes: number;
@@ -95,6 +112,13 @@ export interface EdgeGlobalProgress {
   object_remaining: number;
 }
 
+export interface EdgeExportJobSnapshot extends EdgeGlobalProgress {
+  export_job_id: string;
+  export_job_status: ExportJobStatus;
+  start_time?: string | null;
+  finish_time?: string | null;
+}
+
 export interface EdgeScanSummary {
   scan_event_type: ScanEventType;
   scanned_bucket_count: number;
@@ -113,6 +137,8 @@ export interface EdgeDashboardSummary {
   edge_code: string;
   edge_name: string;
   edge_status?: EdgeStatus;
+  object_inventory?: EdgeObjectInventory;
+  export_job?: EdgeExportJobSnapshot | null;
   export_job_id: string;
   export_job_status: ExportJobStatus;
   disk_status_code?: EdgeVisibleDiskStatusCode;
@@ -218,6 +244,24 @@ interface EdgeControlExportJob {
   object_status_counts?: Record<string, number>;
 }
 
+interface EdgeWireObjectInventory {
+  total_bytes?: number;
+  exported_bytes?: number;
+  total_count?: number;
+  exported_count?: number;
+}
+
+interface EdgeWireExportJob extends Partial<EdgeGlobalProgress> {
+  export_job_id?: string | null;
+  edge_code?: string;
+  export_job_status?: string | null;
+  start_time?: string | null;
+  finish_time?: string | null;
+  object_count?: number;
+  copied_count?: number;
+  copied_bytes?: number;
+}
+
 interface EdgeControlDiskRuntime {
   disk_id?: string | null;
   disk_sn?: string | null;
@@ -227,13 +271,17 @@ interface EdgeControlDiskRuntime {
   mount_path?: string | null;
   device_path?: string | null;
   filesystem?: string | null;
+  filesystem_type?: string | null;
   filesystem_uuid?: string | null;
+  fs_uuid?: string | null;
   partition_uuid?: string | null;
   model?: string | null;
   vendor?: string | null;
   transport?: string | null;
   disk_status_code?: string | null;
   runtime_status?: string | null;
+  task_pool_eligible?: boolean;
+  progress?: Partial<EdgeDiskProgressSnapshot> | null;
   capacity_bytes?: number;
   free_bytes?: number;
   object_budget_bytes?: number;
@@ -255,9 +303,10 @@ interface EdgeControlSummary {
   edge_code: string;
   edge_name?: string;
   edge_status?: string;
+  object_inventory?: EdgeWireObjectInventory;
   scan?: EdgeControlScanSnapshot;
   latest_export_job?: EdgeControlExportJob | null;
-  export_job?: EdgeControlExportJob | null;
+  export_job?: EdgeWireExportJob | null;
   export_job_id?: string;
   export_job_status?: string;
   disk_status_code?: string;
@@ -399,113 +448,105 @@ export function buildExportJobsUrl(basePath: string, query: EdgeExportJobsQuery)
 export function normalizeEdgeDashboardSummary(
   payload: EdgeDashboardSummary | EdgeControlSummary,
 ): EdgeDashboardSummary {
-  if (isNormalizedDashboardSummary(payload)) {
-    const summary = payload as EdgeDashboardSummary;
-    return {
-      ...summary,
-      disk_status_code: visibleDiskStatusCode(summary.disk_status_code),
-      disks: summary.disks.map(normalizeDiskProgress),
-      ws_connected: false,
-      last_http_refresh_at: new Date().toISOString(),
-    };
-  }
-
-  const controlPayload = payload as EdgeControlSummary;
-  const latestExportJob = controlPayload.latest_export_job ?? controlPayload.export_job ?? null;
-  const copiedBytes = latestExportJob?.copied_bytes ?? 0;
-  const totalBytes = latestExportJob?.total_bytes ?? 0;
-  const copiedCount = latestExportJob?.copied_count ?? 0;
-  const objectCount = latestExportJob?.object_count ?? 0;
-  const scan = controlPayload.scan ?? {};
+  const controlPayload = payload as EdgeControlSummary & Partial<EdgeDashboardSummary>;
+  const exportJobSource =
+    controlPayload.export_job ??
+    controlPayload.latest_export_job ??
+    (controlPayload.export_job_id || controlPayload.export_job_status || controlPayload.global_progress
+      ? {
+          export_job_id: controlPayload.export_job_id,
+          export_job_status: controlPayload.export_job_status,
+          ...controlPayload.global_progress,
+        }
+      : null);
+  const exportJob = normalizeExportJobSnapshot(exportJobSource);
+  const globalProgress = normalizeGlobalProgress(
+    controlPayload.global_progress,
+    exportJob ?? emptyGlobalProgress(),
+  );
+  const objectInventory = normalizeObjectInventory(
+    controlPayload.object_inventory,
+    controlPayload.scan,
+    globalProgress,
+    exportJobSource,
+  );
 
   return {
     source: "edge",
-    edge_code: controlPayload.edge_code,
-    edge_name: controlPayload.edge_name ?? controlPayload.edge_code,
+    edge_code: controlPayload.edge_code ?? "",
+    edge_name: controlPayload.edge_name ?? controlPayload.edge_code ?? "Edge",
     edge_status: edgeStatus(controlPayload.edge_status),
-    export_job_id: latestExportJob?.export_job_id ?? controlPayload.export_job_id ?? "",
-    export_job_status: exportJobStatus(
-      latestExportJob?.export_job_status ?? controlPayload.export_job_status,
-      "PENDING",
-    ),
+    object_inventory: objectInventory,
+    export_job: exportJob,
+    export_job_id: exportJob?.export_job_id ?? controlPayload.export_job_id ?? "",
+    export_job_status: exportJob?.export_job_status ?? exportJobStatus(controlPayload.export_job_status, "PENDING"),
     disk_status_code: visibleDiskStatusCode(controlPayload.disk_status_code),
-    scan: {
-      scan_event_type: scanEventType(scan.event_type, "SCAN_PROGRESS"),
-      scanned_bucket_count: numberValue(scan.bucket_done),
-      scanned_object_count: numberValue(scan.object_seen),
-      scanned_bytes: numberValue(scan.total_bytes),
-      stable_object_count: numberValue(scan.stable_object_count),
-      skipped_object_count: numberValue(scan.source_changed_count),
-      current_bucket: scan.current_bucket ?? "",
-      current_key: scan.current_object_key ?? "",
-      last_scan_at: scan.event_time ?? new Date().toISOString(),
-      message: scan.message ?? scan.scan_phase ?? "等待 RustFS 扫描状态",
-    },
-    global_progress: normalizeGlobalProgress(controlPayload.global_progress, {
-      total_bytes: totalBytes,
-      done_bytes: copiedBytes,
-      remaining_bytes: Math.max(0, totalBytes - copiedBytes),
-      speed_bytes_per_sec: 0,
-      object_total: objectCount,
-      object_done: copiedCount,
-      object_remaining: Math.max(0, objectCount - copiedCount),
-    }),
-    disks: (controlPayload.disks ?? []).map((disk, index) =>
-      normalizeDiskProgress({
-        disk_id: disk.disk_id ?? `unidentified-disk-${index + 1}`,
-        disk_sn: disk.disk_sn ?? disk.hardware_serial ?? "待后端补充",
-        hardware_serial: nullableString(disk.hardware_serial),
-        id_serial: nullableString(disk.id_serial),
-        stable_hardware_id: nullableString(disk.stable_hardware_id),
-        mount_path: disk.mount_path ?? "待后端补充",
-        device_path: nullableString(disk.device_path),
-        filesystem: nullableString(disk.filesystem),
-        filesystem_uuid: nullableString(disk.filesystem_uuid),
-        partition_uuid: nullableString(disk.partition_uuid),
-        model: nullableString(disk.model),
-        vendor: nullableString(disk.vendor),
-        transport: nullableString(disk.transport),
-        disk_status_code: visibleDiskStatusCode(disk.disk_status_code),
-        runtime_status: runtimeStatus(disk.runtime_status, "DETECTED"),
-        total_bytes: numberValue(disk.total_bytes ?? disk.object_budget_bytes ?? disk.capacity_bytes),
-        done_bytes: numberValue(disk.done_bytes),
-        remaining_bytes: numberValue(disk.remaining_bytes ?? disk.object_budget_bytes),
-        free_bytes: numberValue(disk.free_bytes),
-        speed_bytes_per_sec: numberValue(disk.speed_bytes_per_sec),
-        object_total: numberValue(disk.object_total),
-        object_done: numberValue(disk.object_done),
-        object_remaining: numberValue(disk.object_remaining),
-        current_object: normalizeCurrentObject(disk.current_object),
-        last_error_code: nullableString(disk.last_error_code),
-        error_message: nullableString(disk.error_message),
-        message:
-          disk.message ??
-          disk.error_message ??
-          "等待 COPY_PROGRESS WebSocket 补充分盘实时进度",
-      }),
-    ),
-    ws_connected: false,
-    last_http_refresh_at: new Date().toISOString(),
+    scan: normalizeScanSummary(controlPayload.scan, objectInventory),
+    global_progress: globalProgress,
+    disks: (controlPayload.disks ?? []).map((disk, index) => normalizeDiskProgress(disk, index)),
+    ws_connected: Boolean(controlPayload.ws_connected),
+    last_http_refresh_at: controlPayload.last_http_refresh_at ?? new Date().toISOString(),
     message: controlPayload.message ?? "HTTP summary loaded; waiting for COPY_PROGRESS WebSocket",
   };
 }
 
-function isNormalizedDashboardSummary(
-  payload: EdgeDashboardSummary | EdgeControlSummary,
-): payload is EdgeDashboardSummary {
-  const scan = (payload as { scan?: Partial<EdgeScanSummary> }).scan;
-  return Array.isArray(payload.disks) && scan?.scan_event_type !== undefined;
-}
+export function normalizeDiskProgress(
+  disk: EdgeDiskProgress | EdgeControlDiskRuntime,
+  index = 0,
+): EdgeDiskProgress {
+  const filesystem = nullableString(disk.filesystem_type ?? disk.filesystem);
+  const filesystemUuid = nullableString(disk.fs_uuid ?? disk.filesystem_uuid);
+  const capacityBytes = numberValue(disk.capacity_bytes ?? disk.total_bytes ?? disk.object_budget_bytes);
+  const budgetBytes = numberValue(disk.object_budget_bytes ?? disk.total_bytes ?? disk.capacity_bytes);
+  const progressDefault = {
+    total_bytes: numberValue((disk.progress?.total_bytes ?? disk.total_bytes ?? budgetBytes) || capacityBytes),
+    done_bytes: numberValue(disk.progress?.done_bytes ?? disk.done_bytes),
+    remaining_bytes: numberValue(disk.progress?.remaining_bytes ?? disk.remaining_bytes),
+    speed_bytes_per_sec: numberValue(disk.progress?.speed_bytes_per_sec ?? disk.speed_bytes_per_sec),
+    object_total: numberValue(disk.progress?.object_total ?? disk.object_total),
+    object_done: numberValue(disk.progress?.object_done ?? disk.object_done),
+    object_remaining: numberValue(disk.progress?.object_remaining ?? disk.object_remaining),
+  };
+  const progress = normalizeDiskProgressSnapshot(disk.progress, progressDefault);
+  const diskId = disk.disk_id || `unidentified-disk-${index + 1}`;
 
-export function normalizeDiskProgress(disk: EdgeDiskProgress): EdgeDiskProgress {
   return {
     ...disk,
+    disk_id: diskId,
+    disk_sn: disk.disk_sn ?? disk.hardware_serial ?? "",
+    hardware_serial: nullableString(disk.hardware_serial),
+    id_serial: nullableString(disk.id_serial),
+    stable_hardware_id: nullableString(disk.stable_hardware_id),
+    mount_path: disk.mount_path ?? "",
+    device_path: nullableString(disk.device_path),
+    filesystem,
+    filesystem_type: filesystem,
+    filesystem_uuid: filesystemUuid,
+    fs_uuid: filesystemUuid,
+    partition_uuid: nullableString(disk.partition_uuid),
+    model: nullableString(disk.model),
+    vendor: nullableString(disk.vendor),
+    transport: nullableString(disk.transport),
     disk_status_code: visibleDiskStatusCode(disk.disk_status_code),
     runtime_status: runtimeStatus(disk.runtime_status, "DETECTED"),
+    capacity_bytes: capacityBytes,
+    object_budget_bytes: budgetBytes,
+    task_pool_eligible: disk.task_pool_eligible,
+    progress,
+    total_bytes: progress.total_bytes || budgetBytes || capacityBytes,
+    done_bytes: progress.done_bytes,
+    remaining_bytes: progress.remaining_bytes,
+    free_bytes: numberValue(disk.free_bytes),
+    speed_bytes_per_sec: progress.speed_bytes_per_sec,
+    object_total: progress.object_total,
+    object_done: progress.object_done,
+    object_remaining: progress.object_remaining,
     current_object: normalizeCurrentObject(disk.current_object),
+    last_error_code: nullableString(disk.last_error_code),
+    error_message: nullableString(disk.error_message),
+    message: disk.message ?? disk.error_message ?? "",
   };
 }
-
 export function visibleDiskStatusCode(
   value: DiskStatusCode | string | null | undefined,
 ): EdgeVisibleDiskStatusCode | undefined {
@@ -669,6 +710,119 @@ function normalizeGlobalProgress(
     object_done: objectDone,
     object_remaining: numberValue(value?.object_remaining, Math.max(0, objectTotal - objectDone)),
   };
+}
+
+function emptyGlobalProgress(): EdgeGlobalProgress {
+  return {
+    total_bytes: 0,
+    done_bytes: 0,
+    remaining_bytes: 0,
+    speed_bytes_per_sec: 0,
+    object_total: 0,
+    object_done: 0,
+    object_remaining: 0,
+  };
+}
+
+function normalizeDiskProgressSnapshot(
+  value: Partial<EdgeDiskProgressSnapshot> | null | undefined,
+  defaultValue: EdgeGlobalProgress,
+): EdgeDiskProgressSnapshot {
+  const progress = normalizeGlobalProgress(value ?? undefined, defaultValue);
+  return {
+    ...progress,
+    percent: numberValue(value?.percent, percentValue(progress.done_bytes, progress.total_bytes)),
+  };
+}
+
+function normalizeExportJobSnapshot(
+  value: EdgeWireExportJob | EdgeControlExportJob | EdgeExportJobSnapshot | null | undefined,
+): EdgeExportJobSnapshot | null {
+  const progressValue = value as
+    | (Partial<EdgeWireExportJob> & Partial<EdgeControlExportJob> & Partial<EdgeExportJobSnapshot>)
+    | null
+    | undefined;
+  if (!progressValue?.export_job_id && !progressValue?.export_job_status) return null;
+  const totalBytes = numberValue(progressValue.total_bytes);
+  const doneBytes = numberValue(progressValue.done_bytes ?? progressValue.copied_bytes);
+  const objectTotal = numberValue(progressValue.object_total ?? progressValue.object_count);
+  const objectDone = numberValue(progressValue.object_done ?? progressValue.copied_count);
+  const progress = normalizeGlobalProgress(progressValue, {
+    total_bytes: totalBytes,
+    done_bytes: doneBytes,
+    remaining_bytes: Math.max(0, totalBytes - doneBytes),
+    speed_bytes_per_sec: numberValue(progressValue.speed_bytes_per_sec),
+    object_total: objectTotal,
+    object_done: objectDone,
+    object_remaining: Math.max(0, objectTotal - objectDone),
+  });
+  return {
+    ...progress,
+    export_job_id: progressValue.export_job_id ?? "",
+    export_job_status: exportJobStatus(progressValue.export_job_status ?? undefined, "PENDING"),
+    start_time: progressValue.start_time,
+    finish_time: progressValue.finish_time,
+  };
+}
+
+function normalizeObjectInventory(
+  value: EdgeWireObjectInventory | EdgeObjectInventory | undefined,
+  scan: EdgeControlScanSnapshot | EdgeScanSummary | undefined,
+  globalProgress: EdgeGlobalProgress,
+  exportJob: EdgeWireExportJob | EdgeControlExportJob | EdgeExportJobSnapshot | null | undefined,
+): EdgeObjectInventory {
+  return {
+    total_bytes: numberValue(value?.total_bytes ?? scanTotalBytes(scan), globalProgress.total_bytes),
+    exported_bytes: numberValue(value?.exported_bytes ?? exportJobDoneBytes(exportJob), globalProgress.done_bytes),
+    total_count: numberValue(value?.total_count ?? scanObjectCount(scan), globalProgress.object_total),
+    exported_count: numberValue(value?.exported_count ?? exportJobDoneObjects(exportJob), globalProgress.object_done),
+  };
+}
+
+function normalizeScanSummary(
+  scan: EdgeControlScanSnapshot | EdgeScanSummary | undefined,
+  inventory: EdgeObjectInventory,
+): EdgeScanSummary {
+  const normalizedScan = scan as Partial<EdgeScanSummary> & EdgeControlScanSnapshot | undefined;
+  return {
+    scan_event_type: scanEventType(normalizedScan?.scan_event_type ?? normalizedScan?.event_type, "SCAN_PROGRESS"),
+    scanned_bucket_count: numberValue(normalizedScan?.scanned_bucket_count ?? normalizedScan?.bucket_done),
+    scanned_object_count: numberValue(normalizedScan?.scanned_object_count ?? normalizedScan?.object_seen, inventory.total_count),
+    scanned_bytes: numberValue(normalizedScan?.scanned_bytes ?? normalizedScan?.total_bytes, inventory.total_bytes),
+    stable_object_count: numberValue(normalizedScan?.stable_object_count),
+    skipped_object_count: numberValue(normalizedScan?.skipped_object_count ?? normalizedScan?.source_changed_count),
+    current_bucket: normalizedScan?.current_bucket ?? "",
+    current_key: normalizedScan?.current_key ?? normalizedScan?.current_object_key ?? "",
+    last_scan_at: normalizedScan?.last_scan_at ?? normalizedScan?.event_time ?? new Date().toISOString(),
+    message: normalizedScan?.message ?? normalizedScan?.scan_phase ?? "",
+  };
+}
+
+function scanTotalBytes(scan: EdgeControlScanSnapshot | EdgeScanSummary | undefined): number | undefined {
+  return (scan as EdgeScanSummary | undefined)?.scanned_bytes ?? (scan as EdgeControlScanSnapshot | undefined)?.total_bytes;
+}
+
+function scanObjectCount(scan: EdgeControlScanSnapshot | EdgeScanSummary | undefined): number | undefined {
+  return (scan as EdgeScanSummary | undefined)?.scanned_object_count ?? (scan as EdgeControlScanSnapshot | undefined)?.object_seen;
+}
+
+function exportJobDoneBytes(
+  exportJob: EdgeWireExportJob | EdgeControlExportJob | EdgeExportJobSnapshot | null | undefined,
+): number | undefined {
+  const value = exportJob as Partial<EdgeWireExportJob & EdgeControlExportJob & EdgeExportJobSnapshot> | null | undefined;
+  return value?.done_bytes ?? value?.copied_bytes;
+}
+
+function exportJobDoneObjects(
+  exportJob: EdgeWireExportJob | EdgeControlExportJob | EdgeExportJobSnapshot | null | undefined,
+): number | undefined {
+  const value = exportJob as Partial<EdgeWireExportJob & EdgeControlExportJob & EdgeExportJobSnapshot> | null | undefined;
+  return value?.object_done ?? value?.copied_count;
+}
+
+function percentValue(doneBytes: number, totalBytes: number): number {
+  if (totalBytes <= 0) return 0;
+  return Math.min(100, Math.max(0, (doneBytes / totalBytes) * 100));
 }
 
 function normalizeCurrentObject(

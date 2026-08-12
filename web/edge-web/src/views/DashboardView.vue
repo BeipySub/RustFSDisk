@@ -49,6 +49,13 @@ function emptySummary(): EdgeDashboardSummary {
     edge_code: "",
     edge_name: "Edge",
     edge_status: undefined,
+    object_inventory: {
+      total_bytes: 0,
+      exported_bytes: 0,
+      total_count: 0,
+      exported_count: 0,
+    },
+    export_job: null,
     export_job_id: "",
     export_job_status: "PENDING",
     disk_status_code: undefined,
@@ -120,11 +127,35 @@ const transportSlots = computed(() =>
   })),
 );
 const selectedDisk = computed(() => disks.value.find((disk) => disk.disk_id === selectedDiskId.value) ?? null);
-const showParticleStream = computed(() => disks.value.some((disk) => disk.runtime_status === "COPYING"));
+const showParticleStream = computed(
+  () =>
+    isActiveExportJobStatus(viewSummary.value.export_job_status) &&
+    viewSummary.value.global_progress.total_bytes > 0 &&
+    viewSummary.value.global_progress.done_bytes < viewSummary.value.global_progress.total_bytes,
+);
 const particleStreamActive = computed(() => showParticleStream.value || (showParticleDevPanel && particleSamplePlaying.value));
 const particleCanvasActive = computed(() => showParticleStream.value || (showParticleDevPanel && particleSamplePlaying.value && particleSceneState.value === "running"));
 const globalProgressPercent = computed(() =>
   progressPercent(viewSummary.value.global_progress.done_bytes, viewSummary.value.global_progress.total_bytes),
+);
+const objectInventory = computed(() => {
+  const inventory = viewSummary.value.object_inventory;
+  return {
+    total_bytes: inventory?.total_bytes ?? viewSummary.value.scan.scanned_bytes,
+    exported_bytes: inventory?.exported_bytes ?? viewSummary.value.global_progress.done_bytes,
+    total_count:
+      inventory?.total_count ??
+      (viewSummary.value.scan.scanned_object_count || viewSummary.value.global_progress.object_total),
+    exported_count: inventory?.exported_count ?? viewSummary.value.global_progress.object_done,
+  };
+});
+const rustFsObjectTotal = computed(() => objectInventory.value.total_count);
+const discoveredObjectCount = computed(() =>
+  Math.max(0, objectInventory.value.total_count - objectInventory.value.exported_count),
+);
+const exportedInventoryObjectCount = computed(() => objectInventory.value.exported_count);
+const inventoryExportPercent = computed(() =>
+  progressPercent(objectInventory.value.exported_count, objectInventory.value.total_count),
 );
 const runningDisks = computed(() => disks.value.filter((disk) => disk.runtime_status === "COPYING").length);
 const readyDisks = computed(() => disks.value.filter((disk) => disk.runtime_status === "READY" || disk.runtime_status === "DONE").length);
@@ -134,11 +165,18 @@ const errorDisks = computed(() => disks.value.filter((disk) => disk.runtime_stat
 const attentionDisks = computed(() => rejectedDisks.value + errorDisks.value);
 const otherWarningDisks = computed(() => disks.value.filter((disk) => disk.last_error_code === "INSUFFICIENT_SPACE").length);
 const selectedProgressPercent = computed(() =>
-  progressPercent(selectedDisk.value?.done_bytes ?? 0, selectedDisk.value?.total_bytes ?? 0),
+  progressPercent(
+    selectedDisk.value?.progress?.done_bytes ?? selectedDisk.value?.done_bytes ?? 0,
+    selectedDisk.value?.progress?.total_bytes ?? selectedDisk.value?.total_bytes ?? 0,
+  ),
 );
 const hasSelectedCopyTask = computed(() => {
   const disk = selectedDisk.value;
-  return Boolean(disk?.current_object || disk?.runtime_status === "COPYING" || (disk?.object_total ?? 0) > 0);
+  return Boolean(
+    disk?.current_object ||
+      disk?.runtime_status === "COPYING" ||
+      (disk?.progress?.object_total ?? disk?.object_total ?? 0) > 0,
+  );
 });
 const selectedDiskIndex = computed(() => (selectedDisk.value ? disks.value.findIndex((disk) => disk.disk_id === selectedDisk.value?.disk_id) : -1));
 const selectedSlotLabel = computed(() => (selectedDiskIndex.value >= 0 ? String(selectedDiskIndex.value + 1).padStart(2, "0") : "--"));
@@ -430,13 +468,21 @@ function decodeHexAscii(value: string): string | undefined {
 
 function slotUsedBytes(disk: EdgeDiskProgress): number {
   const total = slotTotalBytes(disk);
-  if (disk.done_bytes > 0) return Math.min(total, disk.done_bytes);
+  const doneBytes = disk.progress?.done_bytes ?? disk.done_bytes;
+  if (doneBytes > 0) return Math.min(total, doneBytes);
   if (total > 0 && disk.free_bytes > 0) return Math.max(0, total - disk.free_bytes);
   return 0;
 }
 
 function slotTotalBytes(disk: EdgeDiskProgress): number {
-  return disk.total_bytes || disk.done_bytes + disk.remaining_bytes || disk.free_bytes || 0;
+  return (
+    disk.capacity_bytes ||
+    disk.object_budget_bytes ||
+    disk.total_bytes ||
+    (disk.progress?.done_bytes ?? disk.done_bytes) + (disk.progress?.remaining_bytes ?? disk.remaining_bytes) ||
+    disk.free_bytes ||
+    0
+  );
 }
 
 function slotProgressPercent(disk: EdgeDiskProgress): number {
@@ -503,7 +549,7 @@ onMounted(() => {
   progressSocket = connectEdgeProgressSocket({
     onEvent(event) {
       summary.value = applyCopyProgressEvent(summary.value ?? emptySummary(), event);
-      wsMessage.value = event.message || event.event_type;
+      wsMessage.value = event.message || event.event_type || "";
       wsConnected.value = true;
     },
     onConnectionChange(connected, message) {
@@ -665,8 +711,8 @@ onBeforeUnmount(() => {
         </p>
         <div class="progress-track"><b :style="{ width: `${globalProgressPercent}%` }"></b></div>
         <dl>
-          <div><dt>文件</dt><dd>{{ viewSummary.global_progress.object_total.toLocaleString() }}</dd></div>
-          <div><dt>对象</dt><dd>{{ viewSummary.global_progress.object_done.toLocaleString() }}</dd></div>
+          <div><dt>文件</dt><dd>{{ rustFsObjectTotal.toLocaleString() }}</dd></div>
+          <div><dt>对象</dt><dd>{{ exportedInventoryObjectCount.toLocaleString() }}</dd></div>
           <div><dt>批次</dt><dd>{{ viewSummary.export_job_id || "暂无" }}</dd></div>
           <div><dt>预计完成</dt><dd>{{ estimatedDone }}</dd></div>
         </dl>
@@ -759,10 +805,10 @@ onBeforeUnmount(() => {
       <article class="overview-panel glass-panel">
         <h2>扫描与导出概览</h2>
         <dl class="overview-metrics">
-          <div><dt>RustFS对象总数</dt><dd>{{ viewSummary.global_progress.object_total.toLocaleString() }}</dd></div>
-          <div><dt>已发现对象</dt><dd>{{ viewSummary.scan.scanned_object_count.toLocaleString() }}</dd></div>
-          <div><dt>已导出对象</dt><dd>{{ viewSummary.global_progress.object_done.toLocaleString() }}</dd></div>
-          <div><dt>导出进度</dt><dd>{{ exportedObjectPercent.toFixed(2) }}%</dd></div>
+          <div><dt>RustFS对象总数</dt><dd>{{ rustFsObjectTotal.toLocaleString() }}</dd></div>
+          <div><dt>已发现对象</dt><dd>{{ discoveredObjectCount.toLocaleString() }}</dd></div>
+          <div><dt>已导出对象</dt><dd>{{ exportedInventoryObjectCount.toLocaleString() }}</dd></div>
+          <div><dt>导出进度</dt><dd>{{ inventoryExportPercent.toFixed(2) }}%</dd></div>
         </dl>
       </article>
 
@@ -802,8 +848,8 @@ onBeforeUnmount(() => {
         <h2>扫描与导出概览</h2>
         <dl class="metric-strip">
           <div><dt>扫描字节</dt><dd>{{ formatBytes(viewSummary.scan.scanned_bytes) }}</dd><small>{{ viewSummary.scan.scan_event_type }}</small></div>
-          <div><dt>已发现对象</dt><dd>{{ viewSummary.scan.scanned_object_count.toLocaleString() }}</dd><small>总计对象</small></div>
-          <div><dt>已导出对象</dt><dd>{{ viewSummary.global_progress.object_done.toLocaleString() }}</dd><small>{{ globalProgressPercent.toFixed(2) }}%</small></div>
+          <div><dt>已发现对象</dt><dd>{{ discoveredObjectCount.toLocaleString() }}</dd><small>总计对象</small></div>
+          <div><dt>已导出对象</dt><dd>{{ exportedInventoryObjectCount.toLocaleString() }}</dd><small>{{ globalProgressPercent.toFixed(2) }}%</small></div>
           <div><dt>预计完成</dt><dd>{{ estimatedDone }}</dd><small>剩余时间</small></div>
         </dl>
         <h2>只读接口边界</h2>

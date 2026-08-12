@@ -10,7 +10,7 @@ use crate::{
     disk_detection::{
         ConfiguredMountProbe, EdgeDiskDetector, EdgeDiskDetectorConfig, PgDiskRuntimeLedger,
     },
-    progress::{CopyProgressEvent, GlobalProgressSnapshot},
+    progress::{CopyProgressEvent, GlobalProgressSnapshot, ObjectInventorySnapshot},
     realtime::EdgeRealtimeHub,
     rescan::{DiskRescanAccepted, DiskRescanCoordinator, DiskRescanTrigger},
     scanner::ScanProgressSnapshot,
@@ -301,8 +301,13 @@ fn browser_safe_summary(
 }
 
 fn browser_safe_export_job(
-    job: crate::control::ExportJobResponse,
+    mut job: crate::control::ExportJobResponse,
 ) -> crate::control::ExportJobResponse {
+    for disk in &mut job.disks {
+        if disk.disk_status_code.as_deref() == Some("IMPORTED") {
+            disk.disk_status_code = Some("ERROR".to_string());
+        }
+    }
     job
 }
 
@@ -371,12 +376,32 @@ async fn publish_edge_copy_progress(
 }
 
 fn scan_progress_event(edge_code: &str, snapshot: ScanProgressSnapshot) -> CopyProgressEvent {
+    let global_progress = GlobalProgressSnapshot {
+        total_bytes: snapshot.total_bytes,
+        done_bytes: 0,
+        remaining_bytes: snapshot.total_bytes,
+        speed_bytes_per_sec: 0,
+        object_total: snapshot.object_seen,
+        object_done: snapshot.stable_object_count,
+        object_remaining: snapshot
+            .object_seen
+            .saturating_sub(snapshot.stable_object_count),
+        percent: 0.0,
+    };
     CopyProgressEvent {
         event_type: snapshot.event_type.to_string(),
         event_time: snapshot.event_time,
         source: snapshot.source.to_string(),
         edge_code: edge_code.to_string(),
+        edge_name: edge_code.to_string(),
+        object_inventory: ObjectInventorySnapshot {
+            total_bytes: snapshot.total_bytes,
+            exported_bytes: 0,
+            total_count: snapshot.object_seen,
+            exported_count: snapshot.stable_object_count,
+        },
         export_job_id: String::new(),
+        export_job: None,
         disk_status_code: "INITIALIZED".to_string(),
         export_job_status: match snapshot.scan_phase {
             "SCANNING" => "SCANNING",
@@ -384,18 +409,12 @@ fn scan_progress_event(edge_code: &str, snapshot: ScanProgressSnapshot) -> CopyP
             _ => "PENDING",
         }
         .to_string(),
-        global_progress: GlobalProgressSnapshot {
-            total_bytes: snapshot.total_bytes,
-            done_bytes: 0,
-            remaining_bytes: snapshot.total_bytes,
-            speed_bytes_per_sec: 0,
-            object_total: snapshot.object_seen,
-            object_done: snapshot.stable_object_count,
-            object_remaining: snapshot
-                .object_seen
-                .saturating_sub(snapshot.stable_object_count),
-        },
+        global: global_progress.clone(),
+        global_progress,
+        disk_runtime: Vec::new(),
         disks: Vec::new(),
+        ws_connected: true,
+        last_http_refresh_at: chrono::Utc::now(),
         message: snapshot
             .message
             .unwrap_or_else(|| format!("scan_phase={}", snapshot.scan_phase)),
@@ -403,24 +422,33 @@ fn scan_progress_event(edge_code: &str, snapshot: ScanProgressSnapshot) -> CopyP
 }
 
 fn idle_copy_progress_event(edge_code: &str) -> CopyProgressEvent {
+    let global_progress = GlobalProgressSnapshot {
+        total_bytes: 0,
+        done_bytes: 0,
+        remaining_bytes: 0,
+        speed_bytes_per_sec: 0,
+        object_total: 0,
+        object_done: 0,
+        object_remaining: 0,
+        percent: 0.0,
+    };
     CopyProgressEvent {
         event_type: "COPY_PROGRESS".to_string(),
         event_time: chrono::Utc::now(),
         source: "edge".to_string(),
         edge_code: edge_code.to_string(),
+        edge_name: edge_code.to_string(),
+        object_inventory: ObjectInventorySnapshot::default(),
         export_job_id: String::new(),
+        export_job: None,
         disk_status_code: "INITIALIZED".to_string(),
         export_job_status: "PENDING".to_string(),
-        global_progress: GlobalProgressSnapshot {
-            total_bytes: 0,
-            done_bytes: 0,
-            remaining_bytes: 0,
-            speed_bytes_per_sec: 0,
-            object_total: 0,
-            object_done: 0,
-            object_remaining: 0,
-        },
+        global: global_progress.clone(),
+        global_progress,
+        disk_runtime: Vec::new(),
         disks: Vec::new(),
+        ws_connected: true,
+        last_http_refresh_at: chrono::Utc::now(),
         message: "no active edge copy progress snapshot".to_string(),
     }
 }
@@ -841,6 +869,70 @@ mod tests {
         fn summary<'a>(&'a self) -> ControlFuture<'a, EdgeControlSummary> {
             Box::pin(async move {
                 self.calls.lock().unwrap().push("summary");
+                let disk = DiskRuntimeSummary {
+                    hardware_serial: "SN-A".to_string(),
+                    disk_sn: "SN-A".to_string(),
+                    stable_hardware_id: "fs-uuid-a".to_string(),
+                    disk_id: Some(Uuid::new_v4()),
+                    device_path: "/dev/sdb1".to_string(),
+                    mount_path: Some("/mnt/rustfs-transfer/disk-a".to_string()),
+                    filesystem_type: Some("ext4".to_string()),
+                    filesystem: Some("ext4".to_string()),
+                    fs_uuid: Some("fs-uuid-a".to_string()),
+                    filesystem_uuid: Some("fs-uuid-a".to_string()),
+                    disk_status_code: "IMPORTED".to_string(),
+                    runtime_status: "READY".to_string(),
+                    task_pool_eligible: false,
+                    capacity_bytes: 100,
+                    total_bytes: 99,
+                    done_bytes: 10,
+                    remaining_bytes: 89,
+                    free_bytes: 80,
+                    object_budget_bytes: 64,
+                    export_job_id: Some(self.export_job_id.to_string()),
+                    seal_id: None,
+                    speed_bytes_per_sec: 5,
+                    object_total: 2,
+                    object_done: 1,
+                    object_remaining: 1,
+                    progress: EdgeDiskProgressSummary {
+                        total_bytes: 99,
+                        done_bytes: 10,
+                        remaining_bytes: 89,
+                        speed_bytes_per_sec: 5,
+                        object_total: 2,
+                        object_done: 1,
+                        object_remaining: 1,
+                        percent: 10.1010101010101,
+                    },
+                    current_object: Some(DashboardCurrentObject {
+                        bucket: "test".to_string(),
+                        key: "alpha.bin".to_string(),
+                        display_name: "alpha.bin".to_string(),
+                        relative_data_path: "alpha.bin".to_string(),
+                        size_bytes: 99,
+                        done_bytes: 10,
+                        remaining_bytes: 89,
+                        speed_bytes_per_sec: 5,
+                        object_status: "COPYING".to_string(),
+                    }),
+                    current_file: Some("alpha.bin".to_string()),
+                    current_file_size: 99,
+                    current_file_done: 10,
+                    last_error_code: None,
+                    error_message: None,
+                    message: "disk runtime_status=READY".to_string(),
+                };
+                let global_progress = EdgeGlobalSummary {
+                    total_bytes: 99,
+                    done_bytes: 0,
+                    remaining_bytes: 99,
+                    speed_bytes_per_sec: 0,
+                    object_total: 2,
+                    object_done: 0,
+                    object_remaining: 2,
+                    percent: 0.0,
+                };
                 Ok(EdgeControlSummary {
                     source: "edge",
                     edge_code: "edge-a".to_string(),
@@ -848,8 +940,17 @@ mod tests {
                     export_job_id: Some(self.export_job_id),
                     export_job_status: "PENDING".to_string(),
                     disk_status_code: "INITIALIZED".to_string(),
-                    scan: ScanProgressSnapshot::default(),
-                    global_progress: EdgeGlobalSummary {
+                    object_inventory: ObjectInventorySnapshot {
+                        total_bytes: 99,
+                        exported_bytes: 10,
+                        total_count: 2,
+                        exported_count: 1,
+                    },
+                    export_job: Some(crate::progress::DashboardExportJobSnapshot {
+                        export_job_id: self.export_job_id.to_string(),
+                        export_job_status: "PENDING".to_string(),
+                        start_time: None,
+                        finish_time: None,
                         total_bytes: 99,
                         done_bytes: 0,
                         remaining_bytes: 99,
@@ -857,56 +958,14 @@ mod tests {
                         object_total: 2,
                         object_done: 0,
                         object_remaining: 2,
-                    },
+                        percent: 0.0,
+                    }),
+                    scan: ScanProgressSnapshot::default(),
+                    global: global_progress.clone(),
+                    global_progress,
+                    disk_runtime: vec![disk.clone()],
                     latest_export_job: Some(export_job_response(self.export_job_id)),
-                    disks: vec![DiskRuntimeSummary {
-                        hardware_serial: "SN-A".to_string(),
-                        disk_sn: "SN-A".to_string(),
-                        stable_hardware_id: "fs-uuid-a".to_string(),
-                        disk_id: Some(Uuid::new_v4()),
-                        device_path: "/dev/sdb1".to_string(),
-                        mount_path: Some("/mnt/rustfs-transfer/disk-a".to_string()),
-                        filesystem_type: Some("ext4".to_string()),
-                        filesystem: Some("ext4".to_string()),
-                        fs_uuid: Some("fs-uuid-a".to_string()),
-                        filesystem_uuid: Some("fs-uuid-a".to_string()),
-                        disk_status_code: "IMPORTED".to_string(),
-                        runtime_status: "READY".to_string(),
-                        task_pool_eligible: false,
-                        capacity_bytes: 100,
-                        total_bytes: 99,
-                        done_bytes: 10,
-                        remaining_bytes: 89,
-                        free_bytes: 80,
-                        object_budget_bytes: 64,
-                        speed_bytes_per_sec: 5,
-                        object_total: 2,
-                        object_done: 1,
-                        object_remaining: 1,
-                        progress: EdgeDiskProgressSummary {
-                            total_bytes: 99,
-                            done_bytes: 10,
-                            remaining_bytes: 89,
-                            speed_bytes_per_sec: 5,
-                            object_total: 2,
-                            object_done: 1,
-                            object_remaining: 1,
-                        },
-                        current_object: Some(DashboardCurrentObject {
-                            bucket: "test".to_string(),
-                            key: "alpha.bin".to_string(),
-                            display_name: "alpha.bin".to_string(),
-                            relative_data_path: "alpha.bin".to_string(),
-                            size_bytes: 99,
-                            done_bytes: 10,
-                            remaining_bytes: 89,
-                            speed_bytes_per_sec: 5,
-                            object_status: "COPYING".to_string(),
-                        }),
-                        last_error_code: None,
-                        error_message: None,
-                        message: "disk runtime_status=READY".to_string(),
-                    }],
+                    disks: vec![disk],
                     ws_connected: false,
                     last_http_refresh_at: Utc::now(),
                     message: "summary".to_string(),
@@ -962,7 +1021,13 @@ mod tests {
     #[tokio::test]
     async fn controlled_summary_requires_token_but_dashboard_summary_is_public_readonly() {
         let control = Arc::new(FakeControl::default());
-        let router = app(test_state(control.clone()));
+        let rescan_calls = Arc::new(AtomicUsize::new(0));
+        let router = app(test_state_with_rescan(
+            control.clone(),
+            DiskRescanCoordinator::new(Arc::new(CountingRescanRunner {
+                calls: rescan_calls.clone(),
+            })),
+        ));
 
         let controlled = router
             .clone()
@@ -994,7 +1059,13 @@ mod tests {
         assert_eq!(body["edge_code"], "edge-a");
         assert_eq!(body["edge_name"], "edge-a");
         assert_eq!(body["export_job_status"], "PENDING");
+        assert_eq!(body["object_inventory"]["total_bytes"], 99);
+        assert_eq!(body["object_inventory"]["exported_count"], 1);
+        assert_eq!(body["export_job"]["export_job_status"], "PENDING");
+        assert_eq!(body["global"], body["global_progress"]);
         assert_eq!(body["global_progress"]["total_bytes"], 99);
+        assert_eq!(body["global_progress"]["percent"], 0.0);
+        assert_eq!(body["disk_runtime"], body["disks"]);
         assert_eq!(body["disks"][0]["disk_status_code"], "IMPORTED");
         assert_eq!(body["disks"][0]["hardware_serial"], "SN-A");
         assert_eq!(body["disks"][0]["device_path"], "/dev/sdb1");
@@ -1006,14 +1077,22 @@ mod tests {
         assert_eq!(body["disks"][0]["fs_uuid"], "fs-uuid-a");
         assert_eq!(body["disks"][0]["runtime_status"], "READY");
         assert_eq!(body["disks"][0]["progress"]["object_total"], 2);
+        assert_eq!(body["disks"][0]["progress"]["percent"], 10.1010101010101);
+        assert_eq!(
+            body["disks"][0]["export_job_id"],
+            control.export_job_id.to_string()
+        );
+        assert_eq!(body["disks"][0]["current_file"], "alpha.bin");
+        assert_eq!(body["disks"][0]["current_file_size"], 99);
+        assert_eq!(body["disks"][0]["current_file_done"], 10);
         assert_eq!(
             body["disks"][0]["current_object"]["object_status"],
             "COPYING"
         );
-        assert_eq!(body["disks"][0]["disk_status_code"], "IMPORTED");
         assert!(body.get("status").is_none());
         assert!(body.get("disk_data_key").is_none());
         assert_eq!(control.calls.lock().unwrap().as_slice(), &["summary"]);
+        assert_eq!(rescan_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -1055,7 +1134,7 @@ mod tests {
         assert_eq!(detail.status(), StatusCode::OK);
         let detail_body = json_body(detail).await;
         assert_eq!(detail_body["export_job_id"], export_job_id.to_string());
-        assert_eq!(detail_body["disks"][0]["disk_status_code"], "IMPORTED");
+        assert_eq!(detail_body["disks"][0]["disk_status_code"], "ERROR");
         assert_eq!(detail_body["events"][0]["event_type"], "EXPORT_JOB_STARTED");
         assert!(detail_body.get("status").is_none());
         assert!(detail_body.get("disk_data_key").is_none());
@@ -1283,7 +1362,25 @@ mod tests {
         assert_eq!(value["source"], "edge");
         assert_eq!(value["disk_status_code"], "EDGE_COPYING");
         assert_eq!(value["export_job_status"], "COPYING");
+        assert_eq!(value["edge_name"], "edge-a");
+        assert!(value["object_inventory"].is_object());
+        assert!(value["export_job"].is_object());
+        assert_eq!(value["global"], value["global_progress"]);
         assert!(value["disks"].is_array());
+        assert_eq!(value["disk_runtime"], value["disks"]);
+        assert_eq!(value["disks"][0]["disk_status_code"], "EDGE_COPYING");
+        assert!(value["disks"][0]["progress"].is_object());
+        assert!(value["disks"][0]["progress"]["percent"].is_number());
+        assert_eq!(
+            value["disks"][0]["export_job_id"],
+            control.export_job_id.to_string()
+        );
+        assert!(value["disks"][0].get("current_file").is_some());
+        assert!(value["disks"][0].get("current_file_size").is_some());
+        assert!(value["disks"][0].get("current_file_done").is_some());
+        assert!(value["disks"][0].get("device_path").is_some());
+        assert!(value["disks"][0].get("filesystem_type").is_some());
+        assert!(value["disks"][0].get("task_pool_eligible").is_some());
         assert!(value.get("status").is_none());
     }
 

@@ -4,7 +4,10 @@ use crate::{
         assign_export_objects, create_export_plan_from_stable_snapshots, AssignedExportObject,
     },
     export_runtime::{ExportWorkerLauncher, ProductionExportWorkerLauncher},
-    progress::{CopyProgressEvent, ProgressAggregator as CopyProgressAggregator},
+    progress::{
+        CopyProgressEvent, DashboardExportJobSnapshot, ObjectInventorySnapshot,
+        ProgressAggregator as CopyProgressAggregator,
+    },
     scanner::{
         AwsS3RustFsReadClient, ObjectScanner, PgObjectSnapshotRepository, ProgressAggregator,
         ScanOptions, ScanProgressSnapshot, ScanReport,
@@ -283,7 +286,7 @@ pub struct ExportJobRecord {
     pub error_message: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct DiskRuntimeSummary {
     pub hardware_serial: String,
     pub disk_sn: String,
@@ -304,18 +307,23 @@ pub struct DiskRuntimeSummary {
     pub remaining_bytes: u64,
     pub free_bytes: u64,
     pub object_budget_bytes: u64,
+    pub export_job_id: Option<String>,
+    pub seal_id: Option<String>,
     pub speed_bytes_per_sec: u64,
     pub object_total: u64,
     pub object_done: u64,
     pub object_remaining: u64,
     pub progress: EdgeDiskProgressSummary,
     pub current_object: Option<DashboardCurrentObject>,
+    pub current_file: Option<String>,
+    pub current_file_size: u64,
+    pub current_file_done: u64,
     pub last_error_code: Option<String>,
     pub error_message: Option<String>,
     pub message: String,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct EdgeDiskProgressSummary {
     pub total_bytes: u64,
     pub done_bytes: u64,
@@ -324,6 +332,7 @@ pub struct EdgeDiskProgressSummary {
     pub object_total: u64,
     pub object_done: u64,
     pub object_remaining: u64,
+    pub percent: f64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -349,6 +358,7 @@ impl EdgeDiskProgressSummary {
             object_total: 0,
             object_done: 0,
             object_remaining: 0,
+            percent: 0.0,
         }
     }
 }
@@ -361,8 +371,12 @@ pub struct EdgeControlSummary {
     pub export_job_id: Option<Uuid>,
     pub export_job_status: String,
     pub disk_status_code: String,
+    pub object_inventory: ObjectInventorySnapshot,
+    pub export_job: Option<DashboardExportJobSnapshot>,
     pub scan: ScanProgressSnapshot,
+    pub global: EdgeGlobalSummary,
     pub global_progress: EdgeGlobalSummary,
+    pub disk_runtime: Vec<DiskRuntimeSummary>,
     pub latest_export_job: Option<ExportJobResponse>,
     pub disks: Vec<DiskRuntimeSummary>,
     pub ws_connected: bool,
@@ -370,7 +384,7 @@ pub struct EdgeControlSummary {
     pub message: String,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct EdgeGlobalSummary {
     pub total_bytes: u64,
     pub done_bytes: u64,
@@ -379,6 +393,7 @@ pub struct EdgeGlobalSummary {
     pub object_total: u64,
     pub object_done: u64,
     pub object_remaining: u64,
+    pub percent: f64,
 }
 
 #[derive(Debug)]
@@ -742,6 +757,7 @@ impl EdgeControlService for ProductionEdgeControlService {
                 Some(export_job_id) => Some(load_export_job(&self.pool, export_job_id).await?),
                 None => None,
             };
+            let object_inventory = load_object_inventory(&self.pool).await?;
             let copy_progress =
                 self.copy_progress.read().await.as_ref().map(|progress| {
                     progress.snapshot("COPY_PROGRESS", "edge copy progress snapshot")
@@ -761,6 +777,9 @@ impl EdgeControlService for ProductionEdgeControlService {
                         .map(|job| job.export_job_status.clone())
                 })
                 .unwrap_or_else(|| "PENDING".to_string());
+            let export_job = latest_export_job
+                .as_ref()
+                .map(|job| export_job_snapshot(job, &global_progress));
 
             Ok(EdgeControlSummary {
                 source: "edge",
@@ -772,8 +791,12 @@ impl EdgeControlService for ProductionEdgeControlService {
                     .as_ref()
                     .map(|event| event.disk_status_code.clone())
                     .unwrap_or_else(|| aggregate_disk_status_code(&disks)),
+                object_inventory,
+                export_job,
                 scan: self.scan_progress.snapshot(),
+                global: global_progress.clone(),
                 global_progress,
+                disk_runtime: disks.clone(),
                 latest_export_job,
                 disks,
                 ws_connected: false,
@@ -1090,8 +1113,8 @@ async fn load_export_job_disks(
             dr.error_message,
             COUNT(*) AS object_total,
             COUNT(*) FILTER (WHERE eo.status = 'EXPORTED') AS object_done,
-            COALESCE(SUM(eo.chunk_size_bytes), 0)::BIGINT AS total_bytes,
-            COALESCE(SUM(CASE WHEN eo.status = 'EXPORTED' THEN eo.chunk_size_bytes ELSE 0 END), 0)::BIGINT AS done_bytes
+            COALESCE(SUM(eo.chunk_size_bytes), 0)::bigint AS total_bytes,
+            COALESCE(SUM(CASE WHEN eo.status = 'EXPORTED' THEN eo.chunk_size_bytes ELSE 0 END), 0)::bigint AS done_bytes
         FROM export_object eo
         LEFT JOIN disk_runtime dr ON dr.disk_id = eo.disk_id
         WHERE eo.export_job_id = $1
@@ -1258,12 +1281,17 @@ async fn load_disk_runtime(pool: &PgPool) -> Result<Vec<DiskRuntimeSummary>, Con
                 remaining_bytes: progress.remaining_bytes,
                 free_bytes,
                 object_budget_bytes,
+                export_job_id: None,
+                seal_id: None,
                 speed_bytes_per_sec: progress.speed_bytes_per_sec,
                 object_total: progress.object_total,
                 object_done: progress.object_done,
                 object_remaining: progress.object_remaining,
                 progress,
                 current_object: None,
+                current_file: None,
+                current_file_size: 0,
+                current_file_done: 0,
                 last_error_code,
                 error_message,
                 message,
@@ -1316,6 +1344,7 @@ fn global_from_latest_job(job: Option<&ExportJobResponse>) -> EdgeGlobalSummary 
             object_total: 0,
             object_done: 0,
             object_remaining: 0,
+            percent: 0.0,
         };
     };
 
@@ -1327,6 +1356,7 @@ fn global_from_latest_job(job: Option<&ExportJobResponse>) -> EdgeGlobalSummary 
         object_total: job.object_count,
         object_done: job.copied_count,
         object_remaining: job.object_count.saturating_sub(job.copied_count),
+        percent: percent(job.copied_bytes, job.total_bytes),
     }
 }
 
@@ -1339,6 +1369,58 @@ fn global_from_copy_progress(event: &CopyProgressEvent) -> EdgeGlobalSummary {
         object_total: event.global_progress.object_total,
         object_done: event.global_progress.object_done,
         object_remaining: event.global_progress.object_remaining,
+        percent: event.global_progress.percent,
+    }
+}
+
+async fn load_object_inventory(pool: &PgPool) -> Result<ObjectInventorySnapshot, ControlError> {
+    let local = sqlx::query(
+        r#"
+        SELECT COUNT(*)::bigint AS total_count,
+               COALESCE(SUM(size_bytes), 0)::bigint AS total_bytes
+        FROM local_object_snapshot
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .context("load local object inventory")?;
+    let exported = sqlx::query(
+        r#"
+        SELECT COUNT(*)::bigint AS exported_count,
+               COALESCE(SUM(chunk_size_bytes), 0)::bigint AS exported_bytes
+        FROM export_object
+        WHERE status = 'EXPORTED'
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .context("load exported object inventory")?;
+
+    Ok(ObjectInventorySnapshot {
+        total_bytes: local.get::<i64, _>("total_bytes").max(0) as u64,
+        exported_bytes: exported.get::<i64, _>("exported_bytes").max(0) as u64,
+        total_count: local.get::<i64, _>("total_count").max(0) as u64,
+        exported_count: exported.get::<i64, _>("exported_count").max(0) as u64,
+    })
+}
+
+fn export_job_snapshot(
+    job: &ExportJobResponse,
+    progress: &EdgeGlobalSummary,
+) -> DashboardExportJobSnapshot {
+    DashboardExportJobSnapshot {
+        export_job_id: job.export_job_id.to_string(),
+        export_job_status: job.export_job_status.clone(),
+        start_time: job.start_time,
+        finish_time: job.finish_time,
+        total_bytes: progress.total_bytes,
+        done_bytes: progress.done_bytes,
+        remaining_bytes: progress.remaining_bytes,
+        speed_bytes_per_sec: progress.speed_bytes_per_sec,
+        object_total: progress.object_total,
+        object_done: progress.object_done,
+        object_remaining: progress.object_remaining,
+        percent: progress.percent,
     }
 }
 
@@ -1367,6 +1449,7 @@ fn enrich_disks_from_copy_progress(
             object_total: progress.object_total,
             object_done: progress.object_done,
             object_remaining: progress.object_remaining,
+            percent: progress.progress.percent,
         };
         disk.total_bytes = disk.progress.total_bytes;
         disk.done_bytes = disk.progress.done_bytes;
@@ -1376,6 +1459,8 @@ fn enrich_disks_from_copy_progress(
         disk.object_done = disk.progress.object_done;
         disk.object_remaining = disk.progress.object_remaining;
         disk.disk_status_code = progress.disk_status_code.clone();
+        disk.export_job_id = progress.export_job_id.clone();
+        disk.seal_id = progress.seal_id.clone();
         disk.task_pool_eligible = false;
         disk.message = progress.message.clone();
         disk.last_error_code = progress
@@ -1401,6 +1486,9 @@ fn enrich_disks_from_copy_progress(
                     speed_bytes_per_sec: current.speed_bytes_per_sec,
                     object_status: current.object_status.clone(),
                 });
+        disk.current_file = progress.current_file.clone();
+        disk.current_file_size = progress.current_file_size;
+        disk.current_file_done = progress.current_file_done;
     }
 }
 
@@ -1502,6 +1590,14 @@ fn assigned_bytes(objects: &[AssignedExportObject]) -> u64 {
         .iter()
         .map(|object| object.chunk_size_bytes.max(0) as u64)
         .sum()
+}
+
+fn percent(done_bytes: u64, total_bytes: u64) -> f64 {
+    if total_bytes == 0 {
+        0.0
+    } else {
+        (done_bytes as f64 / total_bytes as f64) * 100.0
+    }
 }
 
 async fn validate_export_recovery(

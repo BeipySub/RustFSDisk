@@ -7,6 +7,7 @@ use crate::{
     disk_detection::{DiskRuntimeEventPublisher, DiskRuntimeRecord},
     progress::{
         CopyProgressEvent, DiskProgressFields, DiskProgressSnapshot, GlobalProgressSnapshot,
+        ObjectInventorySnapshot,
     },
 };
 
@@ -80,24 +81,33 @@ fn disk_runtime_event(
         .status_code
         .clone()
         .unwrap_or_else(|| "UNREGISTERED".to_string());
+    let global_progress = GlobalProgressSnapshot {
+        total_bytes: 0,
+        done_bytes: 0,
+        remaining_bytes: 0,
+        speed_bytes_per_sec: 0,
+        object_total: 0,
+        object_done: 0,
+        object_remaining: 0,
+        percent: 0.0,
+    };
     CopyProgressEvent {
         event_type: event_type.to_string(),
         event_time: Utc::now(),
         source: "edge".to_string(),
         edge_code: edge_code.to_string(),
+        edge_name: edge_code.to_string(),
+        object_inventory: ObjectInventorySnapshot::default(),
         export_job_id: String::new(),
+        export_job: None,
         disk_status_code: disk_status_code.clone(),
         export_job_status: "PENDING".to_string(),
-        global_progress: GlobalProgressSnapshot {
-            total_bytes: 0,
-            done_bytes: 0,
-            remaining_bytes: 0,
-            speed_bytes_per_sec: 0,
-            object_total: 0,
-            object_done: 0,
-            object_remaining: 0,
-        },
+        global: global_progress.clone(),
+        global_progress,
+        disk_runtime: disks.clone(),
         disks,
+        ws_connected: true,
+        last_http_refresh_at: Utc::now(),
         message,
     }
 }
@@ -137,12 +147,17 @@ fn disk_progress_snapshot(record: &DiskRuntimeRecord, message: String) -> DiskPr
         remaining_bytes: progress.remaining_bytes,
         free_bytes: record.free_bytes,
         object_budget_bytes: record.object_budget_bytes,
+        export_job_id: None,
+        seal_id: None,
         speed_bytes_per_sec: progress.speed_bytes_per_sec,
         object_total: progress.object_total,
         object_done: progress.object_done,
         object_remaining: progress.object_remaining,
         progress,
         current_object: None,
+        current_file: None,
+        current_file_size: 0,
+        current_file_done: 0,
         last_error_code: record.last_error_code.clone(),
         error_message: record.error_message.clone(),
         message,
@@ -199,7 +214,15 @@ mod tests {
 
         assert_eq!(value["event_type"], "DISK_READY");
         assert_eq!(value["source"], "edge");
+        assert_eq!(value["edge_name"], "edge-a");
         assert_eq!(value["disk_status_code"], "INITIALIZED");
+        assert!(value["object_inventory"].is_object());
+        assert!(value["global"].is_object());
+        assert!(value["global_progress"].is_object());
+        assert!(value["disk_runtime"].is_array());
+        assert_eq!(value["disk_runtime"], value["disks"]);
+        assert_eq!(value["ws_connected"], true);
+        assert!(value.get("last_http_refresh_at").is_some());
         assert_eq!(value["disks"][0]["runtime_status"], "READY");
         assert_eq!(value["disks"][0]["disk_status_code"], "INITIALIZED");
         assert_eq!(value["disks"][0]["hardware_serial"], "SN-A");
@@ -213,8 +236,14 @@ mod tests {
         assert_eq!(value["disks"][0]["filesystem_uuid"], "fs-uuid-SN-A");
         assert_eq!(value["disks"][0]["capacity_bytes"], 100);
         assert_eq!(value["disks"][0]["object_budget_bytes"], 70);
+        assert!(value["disks"][0].get("export_job_id").is_some());
+        assert!(value["disks"][0].get("seal_id").is_some());
         assert_eq!(value["disks"][0]["task_pool_eligible"], true);
         assert!(value["disks"][0]["progress"].is_object());
+        assert_eq!(value["disks"][0]["progress"]["percent"], 0.0);
+        assert!(value["disks"][0].get("current_file").is_some());
+        assert!(value["disks"][0].get("current_file_size").is_some());
+        assert!(value["disks"][0].get("current_file_done").is_some());
         assert!(value["disks"][0].get("last_error_code").is_some());
         assert!(value["disks"][0].get("error_message").is_some());
         assert!(value.get("status").is_none());

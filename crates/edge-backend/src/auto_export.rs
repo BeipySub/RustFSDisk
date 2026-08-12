@@ -501,6 +501,17 @@ mod tests {
         fn summary<'a>(&'a self) -> ControlFuture<'a, EdgeControlSummary> {
             Box::pin(async move {
                 self.calls.lock().unwrap().push("summary");
+                let disk = disk_summary(self.disk_status_code, self.runtime_status);
+                let global_progress = EdgeGlobalSummary {
+                    total_bytes: 0,
+                    done_bytes: 0,
+                    remaining_bytes: 0,
+                    speed_bytes_per_sec: 0,
+                    object_total: 0,
+                    object_done: 0,
+                    object_remaining: 0,
+                    percent: 0.0,
+                };
                 Ok(EdgeControlSummary {
                     source: "edge",
                     edge_code: "edge-a".to_owned(),
@@ -508,18 +519,14 @@ mod tests {
                     export_job_id: None,
                     export_job_status: "PENDING".to_owned(),
                     disk_status_code: self.disk_status_code.to_owned(),
+                    object_inventory: crate::progress::ObjectInventorySnapshot::default(),
+                    export_job: None,
                     scan: ScanProgressSnapshot::default(),
-                    global_progress: EdgeGlobalSummary {
-                        total_bytes: 0,
-                        done_bytes: 0,
-                        remaining_bytes: 0,
-                        speed_bytes_per_sec: 0,
-                        object_total: 0,
-                        object_done: 0,
-                        object_remaining: 0,
-                    },
+                    global: global_progress.clone(),
+                    global_progress,
+                    disk_runtime: vec![disk.clone()],
                     latest_export_job: None,
-                    disks: vec![disk_summary(self.disk_status_code, self.runtime_status)],
+                    disks: vec![disk],
                     ws_connected: false,
                     last_http_refresh_at: Utc::now(),
                     message: "summary".to_owned(),
@@ -720,6 +727,8 @@ mod tests {
             remaining_bytes: 0,
             free_bytes: 80,
             object_budget_bytes: 64,
+            export_job_id: None,
+            seal_id: None,
             speed_bytes_per_sec: 0,
             object_total: 0,
             object_done: 0,
@@ -732,6 +741,7 @@ mod tests {
                 object_total: 0,
                 object_done: 0,
                 object_remaining: 0,
+                percent: 0.0,
             },
             current_object: Some(DashboardCurrentObject {
                 bucket: "bucket".to_owned(),
@@ -744,6 +754,9 @@ mod tests {
                 speed_bytes_per_sec: 0,
                 object_status: "PENDING".to_owned(),
             }),
+            current_file: Some("key".to_owned()),
+            current_file_size: 10,
+            current_file_done: 0,
             last_error_code: None,
             error_message: None,
             message: format!("disk runtime_status={runtime_status}"),
