@@ -368,16 +368,11 @@ pub struct EdgeControlSummary {
     pub source: &'static str,
     pub edge_code: String,
     pub edge_name: String,
-    pub export_job_id: Option<Uuid>,
-    pub export_job_status: String,
-    pub disk_status_code: String,
     pub object_inventory: ObjectInventorySnapshot,
     pub export_job: Option<DashboardExportJobSnapshot>,
-    pub scan: ScanProgressSnapshot,
     pub global: EdgeGlobalSummary,
     pub global_progress: EdgeGlobalSummary,
     pub disk_runtime: Vec<DiskRuntimeSummary>,
-    pub latest_export_job: Option<ExportJobResponse>,
     pub disks: Vec<DiskRuntimeSummary>,
     pub ws_connected: bool,
     pub last_http_refresh_at: DateTime<Utc>,
@@ -768,15 +763,6 @@ impl EdgeControlService for ProductionEdgeControlService {
                 .as_ref()
                 .map(global_from_copy_progress)
                 .unwrap_or_else(|| global_from_latest_job(latest_export_job.as_ref()));
-            let export_job_status = copy_progress
-                .as_ref()
-                .map(|event| event.export_job_status.clone())
-                .or_else(|| {
-                    latest_export_job
-                        .as_ref()
-                        .map(|job| job.export_job_status.clone())
-                })
-                .unwrap_or_else(|| "PENDING".to_string());
             let export_job = latest_export_job
                 .as_ref()
                 .map(|job| export_job_snapshot(job, &global_progress));
@@ -785,19 +771,11 @@ impl EdgeControlService for ProductionEdgeControlService {
                 source: "edge",
                 edge_code: self.config.center.edge_code.clone(),
                 edge_name: self.config.center.edge_code.clone(),
-                export_job_id: latest_export_job.as_ref().map(|job| job.export_job_id),
-                export_job_status,
-                disk_status_code: copy_progress
-                    .as_ref()
-                    .map(|event| event.disk_status_code.clone())
-                    .unwrap_or_else(|| aggregate_disk_status_code(&disks)),
                 object_inventory,
                 export_job,
-                scan: self.scan_progress.snapshot(),
                 global: global_progress.clone(),
                 global_progress,
                 disk_runtime: disks.clone(),
-                latest_export_job,
                 disks,
                 ws_connected: false,
                 last_http_refresh_at: Utc::now(),
@@ -1489,19 +1467,6 @@ fn enrich_disks_from_copy_progress(
         disk.current_file = progress.current_file.clone();
         disk.current_file_size = progress.current_file_size;
         disk.current_file_done = progress.current_file_done;
-    }
-}
-
-fn aggregate_disk_status_code(disks: &[DiskRuntimeSummary]) -> String {
-    if disks
-        .iter()
-        .any(|disk| disk.disk_status_code == "EDGE_COPYING")
-    {
-        "EDGE_COPYING".to_string()
-    } else if disks.iter().any(|disk| disk.disk_status_code == "ERROR") {
-        "ERROR".to_string()
-    } else {
-        "INITIALIZED".to_string()
     }
 }
 

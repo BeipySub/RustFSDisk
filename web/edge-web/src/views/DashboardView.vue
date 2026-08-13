@@ -56,21 +56,7 @@ function emptySummary(): EdgeDashboardSummary {
       exported_count: 0,
     },
     export_job: null,
-    export_job_id: "",
-    export_job_status: "PENDING",
     disk_status_code: undefined,
-    scan: {
-      scan_event_type: "SCAN_PROGRESS",
-      scanned_bucket_count: 0,
-      scanned_object_count: 0,
-      scanned_bytes: 0,
-      stable_object_count: 0,
-      skipped_object_count: 0,
-      current_bucket: "",
-      current_key: "",
-      last_scan_at: now,
-      message: "等待 Edge 后端返回扫描状态",
-    },
     global_progress: {
       total_bytes: 0,
       done_bytes: 0,
@@ -127,9 +113,12 @@ const transportSlots = computed(() =>
   })),
 );
 const selectedDisk = computed(() => disks.value.find((disk) => disk.disk_id === selectedDiskId.value) ?? null);
+const currentExportJob = computed(() => viewSummary.value.export_job);
+const currentExportStatus = computed(() => currentExportJob.value?.export_job_status);
+const currentExportJobId = computed(() => currentExportJob.value?.export_job_id ?? "");
 const showParticleStream = computed(
   () =>
-    isActiveExportJobStatus(viewSummary.value.export_job_status) &&
+    isActiveExportJobStatus(currentExportStatus.value) &&
     viewSummary.value.global_progress.total_bytes > 0 &&
     viewSummary.value.global_progress.done_bytes < viewSummary.value.global_progress.total_bytes,
 );
@@ -141,11 +130,9 @@ const globalProgressPercent = computed(() =>
 const objectInventory = computed(() => {
   const inventory = viewSummary.value.object_inventory;
   return {
-    total_bytes: inventory?.total_bytes ?? viewSummary.value.scan.scanned_bytes,
-    exported_bytes: inventory?.exported_bytes ?? viewSummary.value.global_progress.done_bytes,
-    total_count:
-      inventory?.total_count ??
-      (viewSummary.value.scan.scanned_object_count || viewSummary.value.global_progress.object_total),
+    total_bytes: inventory?.total_bytes ?? viewSummary.value.global_progress.total_bytes,
+    exported_bytes: inventory?.exported_bytes ?? currentExportJob.value?.done_bytes ?? viewSummary.value.global_progress.done_bytes,
+    total_count: inventory?.total_count ?? viewSummary.value.global_progress.object_total,
     exported_count: inventory?.exported_count ?? viewSummary.value.global_progress.object_done,
   };
 });
@@ -194,7 +181,7 @@ const currentObjectProgressPercent = computed(() =>
 );
 const selectedCurrentObjectName = computed(() => {
   const currentObject = selectedDisk.value?.current_object;
-  return currentObject?.display_name || currentObject?.key || viewSummary.value.scan.current_key || "暂无";
+  return currentObject?.display_name || currentObject?.key || "暂无";
 });
 const selectedCurrentObjectSizeLabel = computed(() => {
   const currentObject = selectedDisk.value?.current_object;
@@ -203,11 +190,8 @@ const selectedCurrentObjectSizeLabel = computed(() => {
 const exportedObjectPercent = computed(() =>
   progressPercent(
     viewSummary.value.global_progress.object_done,
-    viewSummary.value.scan.scanned_object_count || viewSummary.value.global_progress.object_total,
+    viewSummary.value.global_progress.object_total,
   ),
-);
-const skippedObjectPercent = computed(() =>
-  progressPercent(viewSummary.value.scan.skipped_object_count, viewSummary.value.scan.scanned_object_count),
 );
 const selectedDiskShortName = computed(() => {
   const disk = selectedDisk.value;
@@ -218,9 +202,9 @@ const selectedDiskShortName = computed(() => {
 const sealedJobReadyForPickup = computed(
   () =>
     !httpError.value &&
-    viewSummary.value.export_job_status === "SEALED" &&
+    currentExportStatus.value === "SEALED" &&
     viewSummary.value.disks.length > 0 &&
-    Boolean(viewSummary.value.export_job_id || viewSummary.value.global_progress.done_bytes > 0),
+    Boolean(currentExportJobId.value || viewSummary.value.global_progress.done_bytes > 0),
 );
 const estimatedDone = computed(() => {
   const speed = viewSummary.value.global_progress.speed_bytes_per_sec;
@@ -231,8 +215,8 @@ const isEmpty = computed(() => !isRefreshing.value && !httpError.value && disks.
 const edgeDisplayName = computed(() => viewSummary.value.edge_name || viewSummary.value.edge_code || "Edge 本地节点");
 const hasCurrentExport = computed(
   () =>
-    isActiveExportJobStatus(viewSummary.value.export_job_status) &&
-    Boolean(viewSummary.value.export_job_id || viewSummary.value.global_progress.total_bytes > 0),
+    isActiveExportJobStatus(currentExportStatus.value) &&
+    Boolean(currentExportJobId.value || viewSummary.value.global_progress.total_bytes > 0),
 );
 const exportStatusTitle = computed(() => {
   if (httpError.value) return "只读接口不可用";
@@ -549,7 +533,7 @@ onMounted(() => {
   progressSocket = connectEdgeProgressSocket({
     onEvent(event) {
       summary.value = applyCopyProgressEvent(summary.value ?? emptySummary(), event);
-      wsMessage.value = event.message || event.event_type || "";
+      wsMessage.value = event.message || "";
       wsConnected.value = true;
     },
     onConnectionChange(connected, message) {
@@ -614,7 +598,7 @@ onBeforeUnmount(() => {
                 <small>扫描 -> 汇聚装载 -> 传输 -> 校验 -> 可运输</small>
               </span>
               <button type="button" :class="{ 'is-playing': particleSamplePlaying }" :aria-pressed="particleSamplePlaying" @click="toggleParticleSample">
-                {{ particleSamplePlaying ? "停止" : "播放" }}
+                {{ particleSamplePlaying ? "暂停" : "播放" }}
               </button>
             </div>
             <div class="motion-sample-steps" aria-label="业务动效阶段">
@@ -701,7 +685,7 @@ onBeforeUnmount(() => {
         <span>{{ exportStatusTitle }}</span>
         <strong v-if="hasCurrentExport">{{ globalProgressPercent.toFixed(0) }}<small>%</small></strong>
         <strong v-else>--<small></small></strong>
-        <em>{{ hasCurrentExport ? viewSummary.export_job_status : "IDLE" }}</em>
+        <em>{{ hasCurrentExport ? currentExportStatus : "IDLE" }}</em>
       </div>
       <div v-if="hasCurrentExport" class="progress-main">
         <p>
@@ -713,7 +697,7 @@ onBeforeUnmount(() => {
         <dl>
           <div><dt>文件</dt><dd>{{ rustFsObjectTotal.toLocaleString() }}</dd></div>
           <div><dt>对象</dt><dd>{{ exportedInventoryObjectCount.toLocaleString() }}</dd></div>
-          <div><dt>批次</dt><dd>{{ viewSummary.export_job_id || "暂无" }}</dd></div>
+          <div><dt>批次</dt><dd>{{ currentExportJobId || "暂无" }}</dd></div>
           <div><dt>预计完成</dt><dd>{{ estimatedDone }}</dd></div>
         </dl>
       </div>
@@ -744,8 +728,8 @@ onBeforeUnmount(() => {
       <div class="selected-disk-content">
         <strong>最近导出任务已封盘，可拔盘</strong>
         <dl>
-          <div><dt>导出任务</dt><dd>{{ viewSummary.export_job_id || "未返回" }}</dd></div>
-          <div><dt>export_job_status</dt><dd class="tone-running">SEALED</dd></div>
+          <div><dt>导出任务</dt><dd>{{ currentExportJobId || "未返回" }}</dd></div>
+          <div><dt>导出任务状态</dt><dd class="tone-running">{{ currentExportStatus ?? "未返回" }}</dd></div>
           <div><dt>盘内状态</dt><dd class="tone-running">已封盘</dd></div>
           <div><dt>已导出</dt><dd>{{ formatBytes(viewSummary.global_progress.done_bytes) }}</dd></div>
         </dl>
@@ -779,28 +763,6 @@ onBeforeUnmount(() => {
       </button>
     </section>
 
-    <section v-if="false" class="global-progress glass-panel" aria-label="导出任务总进度">
-      <div class="progress-title">
-        <span>导出任务总进度</span>
-        <strong v-if="hasCurrentExport">{{ globalProgressPercent.toFixed(0) }}<small>%</small></strong>
-        <em>所有运行中任务汇总</em>
-      </div>
-      <div class="progress-main">
-        <p>
-          <span>已完成 <b>{{ formatBytes(viewSummary.global_progress.done_bytes) }}</b> / {{ formatBytes(viewSummary.global_progress.total_bytes) }}</span>
-          <span>剩余 <b>{{ formatBytes(viewSummary.global_progress.remaining_bytes) }}</b></span>
-          <span>速度 <b>{{ formatSpeed(viewSummary.global_progress.speed_bytes_per_sec) }}</b></span>
-        </p>
-        <div class="progress-track"><b :style="{ width: `${globalProgressPercent}%` }"></b></div>
-        <dl>
-          <div><dt>扫描字节</dt><dd>{{ formatBytes(viewSummary.scan.scanned_bytes) }} / {{ formatBytes(viewSummary.global_progress.total_bytes) }}</dd></div>
-          <div><dt>跳过对象</dt><dd>{{ viewSummary.scan.skipped_object_count.toLocaleString() }}（{{ skippedObjectPercent.toFixed(2) }}%）</dd></div>
-          <div><dt>批次</dt><dd>{{ viewSummary.export_job_id || "暂无" }}</dd></div>
-          <div><dt>预计完成</dt><dd>{{ estimatedDone }}</dd></div>
-        </dl>
-      </div>
-    </section>
-
     <section v-if="!httpError" :class="['dashboard-lower-grid', { compact: !hasCurrentExport }]">
       <article class="overview-panel glass-panel">
         <h2>扫描与导出概览</h2>
@@ -817,7 +779,7 @@ onBeforeUnmount(() => {
           <h2>当前对象与异常处理</h2>
           <div v-if="selectedDisk" class="object-detail-grid">
             <dl>
-              <dt>对象路径</dt><dd>{{ selectedDisk.current_object?.key ?? (viewSummary.scan.current_key || "暂无") }}</dd>
+              <dt>对象路径</dt><dd>{{ selectedDisk.current_object?.key ?? "暂无" }}</dd>
               <dt>对象状态</dt><dd class="tone-running">{{ selectedDisk.current_object?.object_status ?? "等待对象" }}</dd>
               <dt>剩余大小</dt><dd>{{ formatBytes(selectedDisk.current_object?.remaining_bytes ?? 0) }} / {{ formatBytes(selectedDisk.current_object?.size_bytes ?? 0) }}</dd>
             </dl>
@@ -842,74 +804,5 @@ onBeforeUnmount(() => {
         </div>
       </article>
     </section>
-
-    <section v-if="false" class="dashboard-grid">
-      <article class="overview-panel glass-panel">
-        <h2>扫描与导出概览</h2>
-        <dl class="metric-strip">
-          <div><dt>扫描字节</dt><dd>{{ formatBytes(viewSummary.scan.scanned_bytes) }}</dd><small>{{ viewSummary.scan.scan_event_type }}</small></div>
-          <div><dt>已发现对象</dt><dd>{{ discoveredObjectCount.toLocaleString() }}</dd><small>总计对象</small></div>
-          <div><dt>已导出对象</dt><dd>{{ exportedInventoryObjectCount.toLocaleString() }}</dd><small>{{ globalProgressPercent.toFixed(2) }}%</small></div>
-          <div><dt>预计完成</dt><dd>{{ estimatedDone }}</dd><small>剩余时间</small></div>
-        </dl>
-        <h2>只读接口边界</h2>
-        <ul class="check-list">
-          <li>浏览器仅请求本机 Edge Dashboard API</li>
-          <li>浏览器不携带控制 token</li>
-          <li>WebSocket 只接收本端实时状态</li>
-          <li>隐藏中控导入生命周期</li>
-          <li>生产页面仅保留观察入口</li>
-          <li>异常处理遵循 Edge 后端受保护流程</li>
-        </ul>
-      </article>
-
-      <article class="warning-panel glass-panel">
-        <h2>异常盘汇总</h2>
-        <div class="warning-cards">
-          <span><b>{{ attentionDisks }}</b>需关注</span>
-          <span><b>{{ removedDisks }}</b>已移除</span>
-          <span class="danger"><b>{{ rejectedDisks }}</b>被拒绝</span>
-          <span class="danger"><b>{{ errorDisks }}</b>错误</span>
-          <span><b>{{ otherWarningDisks }}</b>其他告警</span>
-        </div>
-        <h3>盘位运行状态（{{ disks.length }} 盘位）</h3>
-        <div class="runtime-table">
-          <button
-            v-for="(disk, index) in disks.slice(0, 6)"
-            :key="disk.disk_id"
-            :class="{ selected: selectedDisk?.disk_id === disk.disk_id }"
-            type="button"
-            @click="selectDisk(disk)"
-          >
-            <span>{{ String(index + 1).padStart(2, "0") }}</span>
-            <span>{{ disk.disk_sn }}</span>
-            <span>{{ formatBytes(disk.total_bytes) }}</span>
-            <strong :class="`tone-${diskTone(disk)}`">{{ disk.message }}</strong>
-            <em>{{ disk.runtime_status }}</em>
-          </button>
-        </div>
-      </article>
-
-      <article class="object-panel glass-panel">
-        <h2>当前对象（{{ selectedDisk?.message ?? "等待状态" }}）</h2>
-        <dl v-if="selectedDisk">
-          <dt>对象路径</dt><dd>{{ selectedDisk?.current_object?.key ?? (viewSummary.scan.current_key || "暂无") }}</dd>
-          <dt>对象状态</dt><dd class="tone-running">{{ selectedDisk?.current_object?.object_status ?? "等待对象" }}</dd>
-          <dt>剩余大小</dt><dd>{{ formatBytes(selectedDisk?.current_object?.remaining_bytes ?? 0) }}</dd>
-          <dt>传输速度</dt><dd>{{ formatSpeed(selectedDisk?.speed_bytes_per_sec ?? 0) }}</dd>
-          <dt>文件系统</dt><dd>{{ selectedDisk?.filesystem ?? "未返回" }}</dd>
-          <dt>FS UUID</dt><dd>{{ selectedDisk?.filesystem_uuid ?? "未返回" }}</dd>
-          <dt>硬件 SN</dt><dd>{{ selectedDisk?.disk_sn ?? "未返回" }}</dd>
-          <dt>设备路径</dt><dd>{{ selectedDisk?.device_path ?? "未返回" }}</dd>
-          <dt>盘内状态</dt><dd>{{ diskLifecycleStatusLabel(selectedDisk) }}</dd>
-        </dl>
-        <p v-else class="object-empty">
-          未选中运输盘。插入后，未注册或异常盘也会显示在右侧盘位区。
-        </p>
-        <div v-if="selectedDisk" class="progress-track object-progress"><b :style="{ width: `${selectedProgressPercent}%` }"></b></div>
-        <span v-if="selectedDisk" class="object-percent">{{ selectedProgressPercent.toFixed(2) }}%</span>
-      </article>
-    </section>
-
   </main>
 </template>

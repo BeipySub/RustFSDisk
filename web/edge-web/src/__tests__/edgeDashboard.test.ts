@@ -16,6 +16,22 @@ import {
 } from "../api/edgeDashboard.ts";
 import { applyCopyProgressEvent, parseCopyProgressEvent } from "../ws/edgeCopyProgress.ts";
 
+function exportJob(export_job_id, export_job_status, overrides = {}) {
+  return {
+    export_job_id,
+    edge_code: "edge-demo",
+    export_job_status,
+    total_bytes: 0,
+    done_bytes: 0,
+    remaining_bytes: 0,
+    speed_bytes_per_sec: 0,
+    object_total: 0,
+    object_done: 0,
+    object_remaining: 0,
+    ...overrides,
+  };
+}
+
 test("builds final export job list URL without empty filters", () => {
   assert.equal(
     buildExportJobsUrl("/api/edge/dashboard/export-jobs", {
@@ -60,15 +76,20 @@ test("normalizes summary and keeps imported disk lifecycle visible in Edge UI", 
     source: "edge",
     edge_code: "edge-hz-01",
     disk_status_code: "IMPORTED",
-    latest_export_job: {
-      export_job_id: "job-1",
-      edge_code: "edge-hz-01",
-      export_job_status: "COPYING",
+    object_inventory: {
       total_bytes: 100,
-      copied_bytes: 30,
-      object_count: 10,
-      copied_count: 3,
+      exported_bytes: 30,
+      total_count: 10,
+      exported_count: 3,
     },
+    export_job: exportJob("job-1", "COPYING", {
+      total_bytes: 100,
+      done_bytes: 30,
+      remaining_bytes: 70,
+      object_total: 10,
+      object_done: 3,
+      object_remaining: 7,
+    }),
     disks: [
       {
         disk_id: "disk-1",
@@ -260,8 +281,7 @@ test("accepts scan and copy start websocket events from Edge realtime stream", (
       event_type: "SCAN_PROGRESS",
       source: "edge",
       edge_code: "edge-demo",
-      export_job_id: "",
-      export_job_status: "SCANNING",
+      export_job: exportJob("", "SCANNING"),
       global_progress: {
         total_bytes: 0,
         done_bytes: 0,
@@ -279,8 +299,15 @@ test("accepts scan and copy start websocket events from Edge realtime stream", (
       event_type: "COPY_STARTED",
       source: "edge",
       edge_code: "edge-demo",
-      export_job_id: "job-copying",
-      export_job_status: "COPYING",
+      export_job: exportJob("job-copying", "COPYING", {
+        total_bytes: 100,
+        done_bytes: 0,
+        remaining_bytes: 100,
+        speed_bytes_per_sec: 0,
+        object_total: 1,
+        object_done: 0,
+        object_remaining: 1,
+      }),
       global_progress: {
         total_bytes: 100,
         done_bytes: 0,
@@ -333,36 +360,35 @@ test("normalizes deployed dashboard summary wire shape", () => {
     source: "edge",
     edge_code: "edge-demo",
     edge_name: "edge-demo",
-    export_job_status: "SEALED",
-    scan: {
-      event_type: "SCAN_DONE",
-      event_time: "2026-08-11T05:32:02Z",
-      scan_phase: "DONE",
-      bucket_done: 3,
-      object_seen: 59,
-      total_bytes: 1428414961,
+    object_inventory: {
+      total_bytes: 3331017885,
+      exported_bytes: 1428414961,
+      total_count: 173,
+      exported_count: 59,
     },
     global_progress: {
       total_bytes: 3331017885,
       done_bytes: 1428414961,
+      remaining_bytes: 1902602924,
+      speed_bytes_per_sec: 0,
       object_total: 173,
       object_done: 59,
+      object_remaining: 114,
     },
-    latest_export_job: {
-      export_job_id: "job-sealed",
-      edge_code: "edge-demo",
-      export_job_status: "SEALED",
-      object_count: 173,
-      copied_count: 59,
+    export_job: exportJob("job-sealed", "SEALED", {
       total_bytes: 3331017885,
-      copied_bytes: 1428414961,
-    },
+      done_bytes: 1428414961,
+      remaining_bytes: 1902602924,
+      object_total: 173,
+      object_done: 59,
+      object_remaining: 114,
+    }),
     disks: [],
     message: "edge controlled HTTP API summary",
   });
 
-  assert.equal(summary.export_job_status, "SEALED");
-  assert.equal(summary.scan.scan_event_type, "SCAN_DONE");
+  assert.equal(summary.export_job?.export_job_status, "SEALED");
+  assert.equal(summary.export_job?.export_job_id, "job-sealed");
   assert.equal(summary.global_progress.object_total, 173);
 });
 
@@ -371,20 +397,20 @@ test("replaces dashboard disks with the latest websocket disk list", () => {
     source: "edge",
     edge_code: "edge-demo",
     edge_name: "edge-demo",
-    export_job_id: "job-copying",
-    export_job_status: "COPYING",
-    scan: {
-      scan_event_type: "SCAN_DONE",
-      scanned_bucket_count: 1,
-      scanned_object_count: 2,
-      scanned_bytes: 300,
-      stable_object_count: 2,
-      skipped_object_count: 0,
-      current_bucket: "",
-      current_key: "",
-      last_scan_at: "2026-08-11T05:32:02Z",
-      message: "done",
+    object_inventory: {
+      total_bytes: 300,
+      exported_bytes: 0,
+      total_count: 2,
+      exported_count: 0,
     },
+    export_job: exportJob("job-copying", "COPYING", {
+      total_bytes: 300,
+      done_bytes: 0,
+      remaining_bytes: 300,
+      object_total: 2,
+      object_done: 0,
+      object_remaining: 2,
+    }),
     global_progress: {
       total_bytes: 300,
       done_bytes: 0,
@@ -438,8 +464,15 @@ test("replaces dashboard disks with the latest websocket disk list", () => {
     event_time: "2026-08-11T05:33:00Z",
     source: "edge",
     edge_code: "edge-demo",
-    export_job_id: "job-copying",
-    export_job_status: "COPYING",
+    export_job: exportJob("job-copying", "COPYING", {
+      total_bytes: 300,
+      done_bytes: 50,
+      remaining_bytes: 250,
+      speed_bytes_per_sec: 10,
+      object_total: 2,
+      object_done: 0,
+      object_remaining: 2,
+    }),
     global_progress: {
       total_bytes: 300,
       done_bytes: 50,
@@ -480,20 +513,20 @@ test("replaces terminal HTTP summary with websocket snapshot", () => {
     source: "edge",
     edge_code: "edge-demo",
     edge_name: "edge-demo",
-    export_job_id: "job-sealed",
-    export_job_status: "SEALED",
-    scan: {
-      scan_event_type: "SCAN_DONE",
-      scanned_bucket_count: 1,
-      scanned_object_count: 1,
-      scanned_bytes: 100,
-      stable_object_count: 1,
-      skipped_object_count: 0,
-      current_bucket: "",
-      current_key: "",
-      last_scan_at: "2026-08-11T05:32:02Z",
-      message: "done",
+    object_inventory: {
+      total_bytes: 100,
+      exported_bytes: 100,
+      total_count: 1,
+      exported_count: 1,
     },
+    export_job: exportJob("job-sealed", "SEALED", {
+      total_bytes: 100,
+      done_bytes: 100,
+      remaining_bytes: 0,
+      object_total: 1,
+      object_done: 1,
+      object_remaining: 0,
+    }),
     global_progress: {
       total_bytes: 100,
       done_bytes: 100,
@@ -514,8 +547,14 @@ test("replaces terminal HTTP summary with websocket snapshot", () => {
     event_time: "2026-08-11T05:34:00Z",
     source: "edge",
     edge_code: "edge-demo",
-    export_job_id: "job-sealed",
-    export_job_status: "COPYING",
+    export_job: exportJob("job-sealed", "COPYING", {
+      total_bytes: 100,
+      done_bytes: 0,
+      remaining_bytes: 100,
+      object_total: 1,
+      object_done: 0,
+      object_remaining: 1,
+    }),
     global_progress: {
       total_bytes: 100,
       done_bytes: 0,
@@ -529,7 +568,7 @@ test("replaces terminal HTTP summary with websocket snapshot", () => {
     message: "stale copying",
   });
 
-  assert.equal(merged.export_job_status, "COPYING");
+  assert.equal(merged.export_job?.export_job_status, "COPYING");
   assert.equal(merged.global_progress.done_bytes, 0);
   assert.equal(merged.message, "stale copying");
   assert.equal(merged.ws_connected, true);
@@ -540,20 +579,20 @@ test("uses websocket disks as the current snapshot", () => {
     source: "edge",
     edge_code: "edge-demo",
     edge_name: "edge-demo",
-    export_job_id: "job-sealed",
-    export_job_status: "SEALED",
-    scan: {
-      scan_event_type: "SCAN_DONE",
-      scanned_bucket_count: 1,
-      scanned_object_count: 59,
-      scanned_bytes: 1428414961,
-      stable_object_count: 59,
-      skipped_object_count: 0,
-      current_bucket: "",
-      current_key: "",
-      last_scan_at: "2026-08-11T08:27:40Z",
-      message: "done",
+    object_inventory: {
+      total_bytes: 1428414961,
+      exported_bytes: 1428414961,
+      total_count: 59,
+      exported_count: 59,
     },
+    export_job: exportJob("job-sealed", "SEALED", {
+      total_bytes: 1428414961,
+      done_bytes: 1428414961,
+      remaining_bytes: 0,
+      object_total: 59,
+      object_done: 59,
+      object_remaining: 0,
+    }),
     global_progress: {
       total_bytes: 1428414961,
       done_bytes: 1428414961,
@@ -574,8 +613,14 @@ test("uses websocket disks as the current snapshot", () => {
     event_time: "2026-08-11T08:27:41Z",
     source: "edge",
     edge_code: "edge-demo",
-    export_job_id: "stale-copying-job",
-    export_job_status: "COPYING",
+    export_job: exportJob("stale-copying-job", "COPYING", {
+      total_bytes: 1428414961,
+      done_bytes: 0,
+      remaining_bytes: 1428414961,
+      object_total: 59,
+      object_done: 0,
+      object_remaining: 59,
+    }),
     global_progress: {
       total_bytes: 1428414961,
       done_bytes: 0,
@@ -608,8 +653,8 @@ test("uses websocket disks as the current snapshot", () => {
 
   assert.equal(merged.disks.length, 1);
   assert.equal(merged.disks[0]?.disk_id, "disk-a");
-  assert.equal(merged.export_job_status, "COPYING");
-  assert.equal(merged.export_job_id, "stale-copying-job");
+  assert.equal(merged.export_job?.export_job_status, "COPYING");
+  assert.equal(merged.export_job?.export_job_id, "stale-copying-job");
   assert.equal(merged.global_progress.done_bytes, 0);
 });
 
@@ -618,20 +663,20 @@ test("does not resurrect a removed disk when HTTP summary has no current disks",
     source: "edge",
     edge_code: "edge-demo",
     edge_name: "edge-demo",
-    export_job_id: "job-sealed",
-    export_job_status: "SEALED",
-    scan: {
-      scan_event_type: "SCAN_DONE",
-      scanned_bucket_count: 1,
-      scanned_object_count: 59,
-      scanned_bytes: 1428414961,
-      stable_object_count: 59,
-      skipped_object_count: 0,
-      current_bucket: "",
-      current_key: "",
-      last_scan_at: "2026-08-12T10:31:58Z",
-      message: "done",
+    object_inventory: {
+      total_bytes: 1428414961,
+      exported_bytes: 1428414961,
+      total_count: 59,
+      exported_count: 59,
     },
+    export_job: exportJob("job-sealed", "SEALED", {
+      total_bytes: 1428414961,
+      done_bytes: 1428414961,
+      remaining_bytes: 0,
+      object_total: 59,
+      object_done: 59,
+      object_remaining: 0,
+    }),
     global_progress: {
       total_bytes: 1428414961,
       done_bytes: 1428414961,
@@ -652,9 +697,8 @@ test("does not resurrect a removed disk when HTTP summary has no current disks",
     event_time: "2026-08-12T10:23:01Z",
     source: "edge",
     edge_code: "edge-demo",
-    export_job_id: "",
     disk_status_code: "UNREGISTERED",
-    export_job_status: "PENDING",
+    export_job: exportJob("", "PENDING"),
     global_progress: {
       total_bytes: 0,
       done_bytes: 0,
@@ -679,20 +723,15 @@ test("keeps imported lifecycle when websocket updates rejected runtime", () => {
     source: "edge",
     edge_code: "edge-demo",
     edge_name: "edge-demo",
-    export_job_id: "job-copying",
-    export_job_status: "COPYING",
-    scan: {
-      scan_event_type: "SCAN_DONE",
-      scanned_bucket_count: 1,
-      scanned_object_count: 0,
-      scanned_bytes: 0,
-      stable_object_count: 0,
-      skipped_object_count: 0,
-      current_bucket: "",
-      current_key: "",
-      last_scan_at: "2026-08-12T10:31:58Z",
-      message: "done",
-    },
+    export_job: exportJob("job-copying", "COPYING", {
+      total_bytes: 300,
+      done_bytes: 50,
+      remaining_bytes: 250,
+      speed_bytes_per_sec: 10,
+      object_total: 2,
+      object_done: 0,
+      object_remaining: 2,
+    }),
     global_progress: {
       total_bytes: 0,
       done_bytes: 0,
@@ -732,8 +771,7 @@ test("keeps imported lifecycle when websocket updates rejected runtime", () => {
     event_time: "2026-08-12T10:32:00Z",
     source: "edge",
     edge_code: "edge-demo",
-    export_job_id: "job-copying",
-    export_job_status: "COPYING",
+    export_job: exportJob("job-copying", "COPYING"),
     global_progress: summary.global_progress,
     disks: [
       {
@@ -773,20 +811,7 @@ test("keeps sealed lifecycle when websocket updates rejected runtime", () => {
     source: "edge",
     edge_code: "edge-demo",
     edge_name: "edge-demo",
-    export_job_id: "job-copying",
-    export_job_status: "COPYING",
-    scan: {
-      scan_event_type: "SCAN_DONE",
-      scanned_bucket_count: 1,
-      scanned_object_count: 0,
-      scanned_bytes: 0,
-      stable_object_count: 0,
-      skipped_object_count: 0,
-      current_bucket: "",
-      current_key: "",
-      last_scan_at: "2026-08-12T10:31:58Z",
-      message: "done",
-    },
+    export_job: exportJob("job-copying", "COPYING"),
     global_progress: {
       total_bytes: 0,
       done_bytes: 0,
@@ -825,8 +850,7 @@ test("keeps sealed lifecycle when websocket updates rejected runtime", () => {
     event_time: "2026-08-12T10:32:00Z",
     source: "edge",
     edge_code: "edge-demo",
-    export_job_id: "job-copying",
-    export_job_status: "COPYING",
+    export_job: exportJob("job-copying", "COPYING"),
     global_progress: summary.global_progress,
     disks: [
       {
@@ -862,20 +886,7 @@ test("clears dashboard disks when websocket sends an empty disk list", () => {
     source: "edge",
     edge_code: "edge-demo",
     edge_name: "edge-demo",
-    export_job_id: "job-copying",
-    export_job_status: "COPYING",
-    scan: {
-      scan_event_type: "SCAN_DONE",
-      scanned_bucket_count: 1,
-      scanned_object_count: 0,
-      scanned_bytes: 0,
-      stable_object_count: 0,
-      skipped_object_count: 0,
-      current_bucket: "",
-      current_key: "",
-      last_scan_at: "2026-08-12T10:31:58Z",
-      message: "done",
-    },
+    export_job: exportJob("job-copying", "COPYING"),
     global_progress: {
       total_bytes: 0,
       done_bytes: 0,
@@ -914,8 +925,7 @@ test("clears dashboard disks when websocket sends an empty disk list", () => {
     event_time: "2026-08-12T10:32:00Z",
     source: "edge",
     edge_code: "edge-demo",
-    export_job_id: "job-copying",
-    export_job_status: "COPYING",
+    export_job: exportJob("job-copying", "COPYING"),
     global_progress: summary.global_progress,
     disks: [],
     message: "removed",

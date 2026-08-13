@@ -77,10 +77,6 @@ fn disk_runtime_event(
         "DONE" => "COPY_DONE",
         _ => "DISK_RUNTIME_CHANGED",
     };
-    let disk_status_code = record
-        .status_code
-        .clone()
-        .unwrap_or_else(|| "UNREGISTERED".to_string());
     let global_progress = GlobalProgressSnapshot {
         total_bytes: 0,
         done_bytes: 0,
@@ -98,10 +94,7 @@ fn disk_runtime_event(
         edge_code: edge_code.to_string(),
         edge_name: edge_code.to_string(),
         object_inventory: ObjectInventorySnapshot::default(),
-        export_job_id: String::new(),
         export_job: None,
-        disk_status_code: disk_status_code.clone(),
-        export_job_status: "PENDING".to_string(),
         global: global_progress.clone(),
         global_progress,
         disk_runtime: disks.clone(),
@@ -215,7 +208,9 @@ mod tests {
         assert_eq!(value["event_type"], "DISK_READY");
         assert_eq!(value["source"], "edge");
         assert_eq!(value["edge_name"], "edge-a");
-        assert_eq!(value["disk_status_code"], "INITIALIZED");
+        assert!(value.get("export_job_id").is_none());
+        assert!(value.get("export_job_status").is_none());
+        assert!(value.get("disk_status_code").is_none());
         assert!(value["object_inventory"].is_object());
         assert!(value["global"].is_object());
         assert!(value["global_progress"].is_object());
@@ -266,8 +261,11 @@ mod tests {
         let value = serde_json::to_value(hub.latest_disk_event().await.unwrap()).unwrap();
 
         assert_eq!(value["event_type"], "DISK_REJECTED");
-        assert_eq!(value["disk_status_code"], "UNREGISTERED");
         assert_eq!(value["disks"][0]["runtime_status"], "REJECTED");
+        assert_eq!(value["disks"][0]["disk_status_code"], "UNREGISTERED");
+        assert!(value.get("export_job_id").is_none());
+        assert!(value.get("export_job_status").is_none());
+        assert!(value.get("disk_status_code").is_none());
         assert!(value["message"]
             .as_str()
             .unwrap()

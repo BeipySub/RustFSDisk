@@ -134,11 +134,8 @@ pub struct CopyProgressEvent {
     pub edge_name: String,
     #[serde(default)]
     pub object_inventory: ObjectInventorySnapshot,
-    pub export_job_id: String,
     #[serde(default)]
     pub export_job: Option<DashboardExportJobSnapshot>,
-    pub disk_status_code: String,
-    pub export_job_status: String,
     #[serde(default)]
     pub global: GlobalProgressSnapshot,
     pub global_progress: GlobalProgressSnapshot,
@@ -433,10 +430,7 @@ impl ProgressAggregator {
             edge_code: state.edge_code.clone(),
             edge_name: state.edge_code.clone(),
             object_inventory: ObjectInventorySnapshot::default(),
-            export_job_id: state.export_job_id.clone(),
             export_job: Some(export_job),
-            disk_status_code: state.disk_status_code.clone(),
-            export_job_status: state.export_job_status.clone(),
             global: global_progress.clone(),
             global_progress,
             disk_runtime: disks.clone(),

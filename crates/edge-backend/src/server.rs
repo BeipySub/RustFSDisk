@@ -400,15 +400,7 @@ fn scan_progress_event(edge_code: &str, snapshot: ScanProgressSnapshot) -> CopyP
             total_count: snapshot.object_seen,
             exported_count: snapshot.stable_object_count,
         },
-        export_job_id: String::new(),
         export_job: None,
-        disk_status_code: "INITIALIZED".to_string(),
-        export_job_status: match snapshot.scan_phase {
-            "SCANNING" => "SCANNING",
-            "ERROR" => "FAILED",
-            _ => "PENDING",
-        }
-        .to_string(),
         global: global_progress.clone(),
         global_progress,
         disk_runtime: Vec::new(),
@@ -439,10 +431,7 @@ fn idle_copy_progress_event(edge_code: &str) -> CopyProgressEvent {
         edge_code: edge_code.to_string(),
         edge_name: edge_code.to_string(),
         object_inventory: ObjectInventorySnapshot::default(),
-        export_job_id: String::new(),
         export_job: None,
-        disk_status_code: "INITIALIZED".to_string(),
-        export_job_status: "PENDING".to_string(),
         global: global_progress.clone(),
         global_progress,
         disk_runtime: Vec::new(),
@@ -937,9 +926,6 @@ mod tests {
                     source: "edge",
                     edge_code: "edge-a".to_string(),
                     edge_name: "edge-a".to_string(),
-                    export_job_id: Some(self.export_job_id),
-                    export_job_status: "PENDING".to_string(),
-                    disk_status_code: "INITIALIZED".to_string(),
                     object_inventory: ObjectInventorySnapshot {
                         total_bytes: 99,
                         exported_bytes: 10,
@@ -960,11 +946,9 @@ mod tests {
                         object_remaining: 2,
                         percent: 0.0,
                     }),
-                    scan: ScanProgressSnapshot::default(),
                     global: global_progress.clone(),
                     global_progress,
                     disk_runtime: vec![disk.clone()],
-                    latest_export_job: Some(export_job_response(self.export_job_id)),
                     disks: vec![disk],
                     ws_connected: false,
                     last_http_refresh_at: Utc::now(),
@@ -1058,7 +1042,11 @@ mod tests {
         assert_eq!(body["source"], "edge");
         assert_eq!(body["edge_code"], "edge-a");
         assert_eq!(body["edge_name"], "edge-a");
-        assert_eq!(body["export_job_status"], "PENDING");
+        assert!(body.get("export_job_id").is_none());
+        assert!(body.get("export_job_status").is_none());
+        assert!(body.get("disk_status_code").is_none());
+        assert!(body.get("scan").is_none());
+        assert!(body.get("latest_export_job").is_none());
         assert_eq!(body["object_inventory"]["total_bytes"], 99);
         assert_eq!(body["object_inventory"]["exported_count"], 1);
         assert_eq!(body["export_job"]["export_job_status"], "PENDING");
@@ -1360,8 +1348,9 @@ mod tests {
 
         assert_eq!(value["event_type"], "COPY_STARTED");
         assert_eq!(value["source"], "edge");
-        assert_eq!(value["disk_status_code"], "EDGE_COPYING");
-        assert_eq!(value["export_job_status"], "COPYING");
+        assert!(value.get("export_job_id").is_none());
+        assert!(value.get("export_job_status").is_none());
+        assert!(value.get("disk_status_code").is_none());
         assert_eq!(value["edge_name"], "edge-a");
         assert!(value["object_inventory"].is_object());
         assert!(value["export_job"].is_object());
@@ -1410,7 +1399,9 @@ mod tests {
         assert_eq!(value["event_type"], "SCAN_STARTED");
         assert_eq!(value["source"], "edge");
         assert_eq!(value["edge_code"], "edge-a");
-        assert_eq!(value["export_job_status"], "SCANNING");
+        assert!(value.get("export_job_id").is_none());
+        assert!(value.get("export_job_status").is_none());
+        assert!(value.get("disk_status_code").is_none());
         assert!(value["disks"].as_array().unwrap().is_empty());
         assert!(value.get("status").is_none());
     }
@@ -1439,13 +1430,19 @@ mod tests {
         progress.complete_object("11111111-1111-1111-1111-111111111111");
         let copy_done = progress.snapshot("COPY_PROGRESS", "copy done");
         assert_eq!(copy_done.event_type, "COPY_DONE");
-        assert_eq!(copy_done.export_job_status, "COPYING");
+        assert_eq!(
+            copy_done.export_job.as_ref().unwrap().export_job_status,
+            "COPYING"
+        );
 
         progress.mark_disk_done("11111111-1111-1111-1111-111111111111");
         let seal_done = progress.snapshot("COPY_PROGRESS", "seal done");
         assert_eq!(seal_done.event_type, "SEAL_DONE");
-        assert_eq!(seal_done.disk_status_code, "SEALED");
-        assert_eq!(seal_done.export_job_status, "SEALED");
+        assert_eq!(seal_done.disks[0].disk_status_code, "SEALED");
+        assert_eq!(
+            seal_done.export_job.as_ref().unwrap().export_job_status,
+            "SEALED"
+        );
     }
 
     fn test_state(control: Arc<dyn EdgeControlService>) -> AppState {
