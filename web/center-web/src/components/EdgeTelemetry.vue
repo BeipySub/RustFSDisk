@@ -23,7 +23,7 @@ const emit = defineEmits<{
 </script>
 
 <template>
-  <section class="top-telemetry" aria-label="Edge 连接状态">
+  <section class="top-telemetry" aria-label="连接状态">
     <template v-if="showStatusPills">
       <span :class="['status-pill', httpTone]"><i></i> HTTP</span>
       <span :class="['status-pill', localTone]"><i></i> 本机服务</span>

@@ -20,6 +20,7 @@ pub const ENCRYPTION_ALG_AES_256_GCM: &str = "AES-256-GCM";
 
 const WRAPPED_KEY_PREFIX: &str = "local-master-key:v1";
 const DATA_KEY_CONTEXT: &str = "rustfs-transfer:data-key";
+const EDGE_AUTH_SECRET_CONTEXT: &str = "rustfs-transfer:edge-auth-secret";
 const OFFLINE_DISK_DATA_KEY_CONTEXT: &str = "rustfs-transfer:offline-disk-data-key:v1";
 const DISK_INFO_CONTEXT: &str = "rustfs-transfer:disk-info";
 
@@ -143,6 +144,83 @@ impl CenterSecurity {
             .map_err(|_| anyhow!("unwrapped disk data key is not 32 bytes"))
     }
 
+    pub fn wrap_edge_auth_secret(
+        &self,
+        edge_code: &str,
+        auth_key_id: &str,
+        edge_auth_secret: &str,
+    ) -> Result<String> {
+        let secret = edge_auth_secret.trim();
+        if secret.is_empty() {
+            bail!("edge_auth_secret must not be empty");
+        }
+        let cipher = Aes256Gcm::new_from_slice(&self.local_master_key)
+            .map_err(|_| anyhow!("invalid local master key length"))?;
+        let nonce = generate_nonce();
+        let mut encrypted = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: secret.as_bytes(),
+                    aad: edge_auth_secret_aad(edge_code, auth_key_id).as_bytes(),
+                },
+            )
+            .map_err(|_| anyhow!("failed to wrap edge auth secret"))?;
+        let tag = encrypted.split_off(encrypted.len() - AES_GCM_TAG_LEN);
+        Ok(format!(
+            "{WRAPPED_KEY_PREFIX}:{}:{}:{}",
+            encode_base64(&nonce),
+            encode_base64(&encrypted),
+            encode_base64(&tag)
+        ))
+    }
+
+    pub fn unwrap_edge_auth_secret(
+        &self,
+        edge_code: &str,
+        auth_key_id: &str,
+        auth_secret_ciphertext: &str,
+    ) -> Result<String> {
+        let value = auth_secret_ciphertext.trim();
+        if !value.starts_with(WRAPPED_KEY_PREFIX) {
+            return Ok(value.to_string());
+        }
+        let mut parts = value.split(':');
+        let prefix = [parts.next(), parts.next()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(":");
+        if prefix != WRAPPED_KEY_PREFIX {
+            bail!("unsupported edge auth secret wrap format");
+        }
+        let nonce = decode_required_b64(parts.next(), "edge auth secret is missing nonce")?;
+        let ciphertext =
+            decode_required_b64(parts.next(), "edge auth secret is missing ciphertext")?;
+        let tag = decode_required_b64(parts.next(), "edge auth secret is missing tag")?;
+        if parts.next().is_some() {
+            bail!("edge auth secret has unexpected fields");
+        }
+        if nonce.len() != 12 || tag.len() != AES_GCM_TAG_LEN {
+            bail!("edge auth secret nonce or tag length is invalid");
+        }
+
+        let cipher = Aes256Gcm::new_from_slice(&self.local_master_key)
+            .map_err(|_| anyhow!("invalid local master key length"))?;
+        let mut payload = ciphertext;
+        payload.extend_from_slice(&tag);
+        let plaintext = cipher
+            .decrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: payload.as_ref(),
+                    aad: edge_auth_secret_aad(edge_code, auth_key_id).as_bytes(),
+                },
+            )
+            .map_err(|_| anyhow!("failed to unwrap edge auth secret with configured master key"))?;
+        String::from_utf8(plaintext).map_err(|_| anyhow!("edge auth secret is not valid UTF-8"))
+    }
+
     pub fn sign_disk_info<T: Serialize>(&self, disk_info: &T) -> Result<String> {
         sign_disk_info_with_key(disk_info, &self.center_signature_key)
     }
@@ -219,6 +297,14 @@ fn data_key_aad(disk_id: Uuid, data_key_id: Uuid) -> String {
     format!("{DATA_KEY_CONTEXT}:{disk_id}:{data_key_id}")
 }
 
+fn edge_auth_secret_aad(edge_code: &str, auth_key_id: &str) -> String {
+    format!(
+        "{EDGE_AUTH_SECRET_CONTEXT}:{}:{}",
+        edge_code.trim(),
+        auth_key_id.trim()
+    )
+}
+
 fn decode_required_b64(value: Option<&str>, missing_message: &str) -> Result<Vec<u8>> {
     let value = value.ok_or_else(|| anyhow!(missing_message.to_string()))?;
     decode_base64(value).map_err(|error| anyhow!(error.to_string()))
@@ -266,6 +352,26 @@ mod tests {
 
         assert!(other
             .unwrap_disk_data_key(disk_id, data_key_id, &wrapped)
+            .is_err());
+    }
+
+    #[test]
+    fn wraps_edge_auth_secret_without_plaintext_equivalence() {
+        let security = CenterSecurity::test();
+        let wrapped = security
+            .wrap_edge_auth_secret("edge-a", "auth-key-a", "edge-secret-a")
+            .unwrap();
+
+        assert!(wrapped.starts_with(WRAPPED_KEY_PREFIX));
+        assert!(!wrapped.contains("edge-secret-a"));
+        assert_eq!(
+            security
+                .unwrap_edge_auth_secret("edge-a", "auth-key-a", &wrapped)
+                .unwrap(),
+            "edge-secret-a"
+        );
+        assert!(security
+            .unwrap_edge_auth_secret("edge-b", "auth-key-a", &wrapped)
             .is_err());
     }
 

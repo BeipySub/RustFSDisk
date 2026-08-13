@@ -21,6 +21,7 @@ base64 = "0.22"
 chrono = { version = "0.4", features = ["clock", "serde"] }
 hex = "0.4"
 hmac = "0.12"
+libc = "0.2"
 percent-encoding = "2"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }

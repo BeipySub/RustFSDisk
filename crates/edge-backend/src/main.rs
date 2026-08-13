@@ -10,6 +10,7 @@ const DEFAULT_CONFIG_PATH: &str = "/etc/rustfs-transfer/edge.toml";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    configure_open_file_creation_permissions();
     init_tracing();
 
     let config_path = config_path();
@@ -34,6 +35,15 @@ async fn main() -> anyhow::Result<()> {
         .context("edge axum server exited")?;
     Ok(())
 }
+
+#[cfg(unix)]
+fn configure_open_file_creation_permissions() {
+    // Transport disk files and directories must be usable by every Linux user.
+    unsafe { libc::umask(0) };
+}
+
+#[cfg(not(unix))]
+fn configure_open_file_creation_permissions() {}
 
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));

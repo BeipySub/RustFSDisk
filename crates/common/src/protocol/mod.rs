@@ -511,10 +511,14 @@ impl TransferDisk {
             META_DIR,
             MANIFESTS_DIR,
             LOGS_DIR,
+            "quarantine",
             QUARANTINE_PARTIAL_DIR,
         ] {
-            fs::create_dir_all(self.resolve_relative(relative)?)?;
+            let path = self.resolve_relative(relative)?;
+            fs::create_dir_all(&path)?;
+            make_directory_writable_by_all(&path)?;
         }
+        make_directory_writable_by_all(&self.root)?;
         sync_dir(&self.root)?;
         Ok(())
     }
@@ -621,17 +625,20 @@ impl TransferDisk {
             )
         })?;
         fs::create_dir_all(parent)?;
+        make_directory_writable_by_all(parent)?;
 
         let temp_path = temp_path_for(&final_path, kind);
         let mut file = OpenOptions::new()
             .create_new(true)
             .write(true)
             .open(&temp_path)?;
+        make_file_writable_by_all(&temp_path)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
 
         fs::rename(&temp_path, &final_path)?;
+        make_file_writable_by_all(&final_path)?;
         sync_file(&final_path)?;
         sync_dir(parent)?;
         Ok(())
@@ -661,6 +668,32 @@ impl TransferDisk {
         }
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn make_directory_writable_by_all(path: &Path) -> TransferResult<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o777))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn make_directory_writable_by_all(_path: &Path) -> TransferResult<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn make_file_writable_by_all(path: &Path) -> TransferResult<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o666))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn make_file_writable_by_all(_path: &Path) -> TransferResult<()> {
+    Ok(())
 }
 
 pub fn validate_relative_path(relative_path: &str) -> TransferResult<()> {

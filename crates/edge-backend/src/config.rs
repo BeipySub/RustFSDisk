@@ -13,6 +13,8 @@ pub struct EdgeConfig {
     #[serde(default)]
     pub rescan: RescanConfig,
     #[serde(default)]
+    pub scan: ScanConfig,
+    #[serde(default)]
     pub auto_export: AutoExportConfig,
 }
 
@@ -71,6 +73,12 @@ pub struct RescanConfig {
     pub endpoint_url: Option<String>,
     pub token: Option<String>,
     pub token_env: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ScanConfig {
+    #[serde(default = "default_scan_reuse_window_minutes")]
+    pub reuse_window_minutes: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -192,6 +200,10 @@ impl EdgeConfig {
                 self.rescan.token = Some(token);
             }
         }
+        override_u64(
+            "RUSTFS_TRANSFER__SCAN__REUSE_WINDOW_MINUTES",
+            &mut self.scan.reuse_window_minutes,
+        );
         override_bool(
             "RUSTFS_TRANSFER__AUTO_EXPORT__ENABLED",
             &mut self.auto_export.enabled,
@@ -260,6 +272,14 @@ impl Default for PathConfig {
             log_dir: default_log_dir(),
             disk_mount_roots: default_disk_mount_roots(),
             transport_mount_root: None,
+        }
+    }
+}
+
+impl Default for ScanConfig {
+    fn default() -> Self {
+        Self {
+            reuse_window_minutes: default_scan_reuse_window_minutes(),
         }
     }
 }
@@ -378,6 +398,10 @@ fn default_auto_export_min_ready_disk_count() -> usize {
     1
 }
 
+fn default_scan_reuse_window_minutes() -> u64 {
+    24 * 60
+}
+
 fn default_auto_export_cooldown_seconds() -> u64 {
     60
 }
@@ -418,6 +442,7 @@ mod tests {
         assert_eq!(config.paths.disk_mount_roots, vec!["/mnt/rustfs-transfer"]);
         assert!(!config.auto_export.enabled);
         assert!(!config.auto_export.start_on_ready);
+        assert_eq!(config.scan.reuse_window_minutes, 24 * 60);
         assert_eq!(config.auto_export.min_ready_disk_count, 1);
         assert_eq!(config.auto_export.cooldown_seconds, 60);
         assert_eq!(
@@ -505,6 +530,7 @@ mod tests {
         std::env::set_var("RUSTFS_TRANSFER__AUTO_EXPORT__START_ON_READY", "1");
         std::env::set_var("RUSTFS_TRANSFER__AUTO_EXPORT__MIN_READY_DISK_COUNT", "2");
         std::env::set_var("RUSTFS_TRANSFER__AUTO_EXPORT__COOLDOWN_SECONDS", "300");
+        std::env::set_var("RUSTFS_TRANSFER__SCAN__REUSE_WINDOW_MINUTES", "15");
         let raw = r#"
             [database]
             url = "postgres://edge:edge@localhost/edge"
@@ -527,6 +553,7 @@ mod tests {
         assert!(config.auto_export.start_on_ready);
         assert_eq!(config.auto_export.min_ready_disk_count, 2);
         assert_eq!(config.auto_export.cooldown_seconds, 300);
+        assert_eq!(config.scan.reuse_window_minutes, 15);
 
         std::env::set_var("RUSTFS_TRANSFER__AUTO_EXPORT__ENABLED", "false");
         std::env::set_var("RUSTFS_TRANSFER__AUTO_EXPORT__START_ON_READY", "off");
@@ -539,6 +566,7 @@ mod tests {
         std::env::remove_var("RUSTFS_TRANSFER__AUTO_EXPORT__START_ON_READY");
         std::env::remove_var("RUSTFS_TRANSFER__AUTO_EXPORT__MIN_READY_DISK_COUNT");
         std::env::remove_var("RUSTFS_TRANSFER__AUTO_EXPORT__COOLDOWN_SECONDS");
+        std::env::remove_var("RUSTFS_TRANSFER__SCAN__REUSE_WINDOW_MINUTES");
     }
 
     #[test]

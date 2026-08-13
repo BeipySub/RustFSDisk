@@ -10,7 +10,7 @@ use crate::{
     disk_detection::{
         ConfiguredMountProbe, EdgeDiskDetector, EdgeDiskDetectorConfig, PgDiskRuntimeLedger,
     },
-    progress::{CopyProgressEvent, GlobalProgressSnapshot, ObjectInventorySnapshot},
+    progress::{CopyProgressEvent, GlobalProgressSnapshot},
     realtime::EdgeRealtimeHub,
     rescan::{DiskRescanAccepted, DiskRescanCoordinator, DiskRescanTrigger},
     scanner::ScanProgressSnapshot,
@@ -330,81 +330,57 @@ async fn publish_edge_copy_progress(
     edge_code: String,
 ) {
     let mut interval = time::interval(Duration::from_secs(1));
-    let mut last_object_inventory: Option<ObjectInventorySnapshot> = None;
+    let mut receiver = realtime.subscribe();
     loop {
-        interval.tick().await;
-        let copy_event = match control.copy_progress_snapshot().await {
-            Ok(event) => event,
-            Err(error) => {
-                tracing::warn!(
-                    error_code = error.error_code,
-                    message = error.message,
-                    "failed to load edge copy progress snapshot"
-                );
-                None
+        let event = tokio::select! {
+            biased;
+            received = receiver.recv() => {
+                match received {
+                    Ok(event) => event,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "edge websocket client lagged behind realtime events");
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
             }
-        };
-        let scan_event = match control.scan_progress_snapshot().await {
-            Ok(snapshot) if snapshot.scan_phase != "IDLE" => {
-                Some(scan_progress_event(&edge_code, snapshot))
+            _ = interval.tick() => {
+                let copy_event = match control.copy_progress_snapshot().await {
+                    Ok(event) => event.map(edge_ws_v2_copy_progress_event),
+                    Err(error) => {
+                        tracing::warn!(
+                            error_code = error.error_code,
+                            message = error.message,
+                            "failed to load edge copy progress snapshot"
+                        );
+                        None
+                    }
+                };
+                let scan_event = match control.scan_progress_snapshot().await {
+                    Ok(snapshot) if snapshot.scan_phase != "IDLE" => {
+                        Some(scan_progress_event(&edge_code, snapshot))
+                    }
+                    Ok(_) => None,
+                    Err(error) => {
+                        tracing::warn!(
+                            error_code = error.error_code,
+                            message = error.message,
+                            "failed to load edge scan progress snapshot"
+                        );
+                        None
+                    }
+                };
+                let Some(event) = copy_event.or(scan_event) else {
+                    continue;
+                };
+                event
             }
-            Ok(_) => None,
-            Err(error) => {
-                tracing::warn!(
-                    error_code = error.error_code,
-                    message = error.message,
-                    "failed to load edge scan progress snapshot"
-                );
-                None
-            }
-        };
-        let event = if let Some(event) = copy_event {
-            event
-        } else if let Some(event) = scan_event {
-            event
-        } else if let Some(event) = realtime.latest_disk_event().await {
-            event
-        } else {
-            idle_copy_progress_event(&edge_code)
-        };
-        let Some(event) =
-            attach_summary_object_inventory(control.as_ref(), event, &mut last_object_inventory)
-                .await
-        else {
-            continue;
         };
         let Ok(payload) = serde_json::to_string(&event) else {
             break;
         };
         if socket.send(Message::Text(payload.into())).await.is_err() {
             break;
-        }
-    }
-}
-
-async fn attach_summary_object_inventory(
-    control: &dyn EdgeControlService,
-    mut event: CopyProgressEvent,
-    last_object_inventory: &mut Option<ObjectInventorySnapshot>,
-) -> Option<CopyProgressEvent> {
-    match control.summary().await {
-        Ok(summary) => {
-            event.object_inventory = summary.object_inventory.clone();
-            *last_object_inventory = Some(summary.object_inventory);
-            Some(event)
-        }
-        Err(error) => {
-            tracing::warn!(
-                error_code = error.error_code,
-                message = error.message,
-                "failed to load edge object inventory for websocket snapshot"
-            );
-            if let Some(inventory) = last_object_inventory.clone() {
-                event.object_inventory = inventory;
-                Some(event)
-            } else {
-                None
-            }
         }
     }
 }
@@ -423,17 +399,26 @@ fn scan_progress_event(edge_code: &str, snapshot: ScanProgressSnapshot) -> CopyP
         percent: 0.0,
     };
     CopyProgressEvent {
-        event_type: snapshot.event_type.to_string(),
+        protocol_version: "edge-ws-v2".to_string(),
+        event_id: Uuid::new_v4().to_string(),
+        event_type: "COPY_PROGRESS".to_string(),
         event_time: snapshot.event_time,
         source: snapshot.source.to_string(),
         edge_code: edge_code.to_string(),
+        stage: Some("SCANNING_RUSTFS".to_string()),
         edge_name: edge_code.to_string(),
-        object_inventory: ObjectInventorySnapshot {
-            total_bytes: snapshot.total_bytes,
-            exported_bytes: 0,
-            total_count: snapshot.object_seen,
-            exported_count: snapshot.stable_object_count,
-        },
+        scan: Some(serde_json::json!({
+            "scan_status": snapshot.scan_phase,
+            "bucket_count": snapshot.bucket_total,
+            "object_seen": snapshot.object_seen,
+            "stable_object_count": snapshot.stable_object_count,
+            "source_changed_count": snapshot.source_changed_count,
+            "total_bytes": snapshot.total_bytes,
+            "current_bucket": snapshot.current_bucket,
+            "current_object_key": snapshot.current_object_key,
+            "last_error_code": snapshot.last_error_code,
+        })),
+        object_inventory: Default::default(),
         export_job: None,
         global: global_progress.clone(),
         global_progress,
@@ -447,33 +432,33 @@ fn scan_progress_event(edge_code: &str, snapshot: ScanProgressSnapshot) -> CopyP
     }
 }
 
-fn idle_copy_progress_event(edge_code: &str) -> CopyProgressEvent {
-    let global_progress = GlobalProgressSnapshot {
-        total_bytes: 0,
-        done_bytes: 0,
-        remaining_bytes: 0,
-        speed_bytes_per_sec: 0,
-        object_total: 0,
-        object_done: 0,
-        object_remaining: 0,
-        percent: 0.0,
-    };
-    CopyProgressEvent {
-        event_type: "COPY_PROGRESS".to_string(),
-        event_time: chrono::Utc::now(),
-        source: "edge".to_string(),
-        edge_code: edge_code.to_string(),
-        edge_name: edge_code.to_string(),
-        object_inventory: ObjectInventorySnapshot::default(),
-        export_job: None,
-        global: global_progress.clone(),
-        global_progress,
-        disk_runtime: Vec::new(),
-        disks: Vec::new(),
-        ws_connected: true,
-        last_http_refresh_at: chrono::Utc::now(),
-        message: "no active edge copy progress snapshot".to_string(),
+fn edge_ws_v2_copy_progress_event(mut event: CopyProgressEvent) -> CopyProgressEvent {
+    event.protocol_version = "edge-ws-v2".to_string();
+    if event.event_id.is_empty() {
+        event.event_id = Uuid::new_v4().to_string();
     }
+    event.event_type = "COPY_PROGRESS".to_string();
+    event.stage = Some(
+        match event
+            .export_job
+            .as_ref()
+            .map(|job| job.export_job_status.as_str())
+        {
+            Some("SEALED") => "SEALED",
+            Some("FAILED") => "FAILED",
+            Some("SEALING") => "SEALING",
+            Some("PENDING") | Some("SCANNING") => "PLANNING",
+            _ if event.disks.iter().any(|disk| disk.runtime_status == "DONE")
+                && event.global_progress.remaining_bytes == 0 =>
+            {
+                "SEALED"
+            }
+            _ => "COPYING",
+        }
+        .to_string(),
+    );
+    event.scan = None;
+    event
 }
 
 async fn trigger_scan(
@@ -700,6 +685,7 @@ mod tests {
             ExportJobResponse, ScanTriggerResponse, StartExportJobResponse,
         },
         disk_detection::DiskDetectionError,
+        progress::ObjectInventorySnapshot,
         rescan::{DiskRescanRunner, DiskRescanTrigger},
         scanner::ScanProgressSnapshot,
     };
@@ -893,6 +879,7 @@ mod tests {
             Box::pin(async move {
                 self.calls.lock().unwrap().push("summary");
                 let disk = DiskRuntimeSummary {
+                    disk_presence_id: Some(Uuid::new_v4().to_string()),
                     hardware_serial: "SN-A".to_string(),
                     disk_sn: "SN-A".to_string(),
                     stable_hardware_id: "fs-uuid-a".to_string(),
@@ -1410,23 +1397,22 @@ mod tests {
     #[tokio::test]
     async fn websocket_event_uses_summary_object_inventory_instead_of_default_zero() {
         let control = FakeControl::default();
-        let event = idle_copy_progress_event("edge-a");
-        assert_eq!(event.object_inventory.total_count, 0);
-
-        let mut last_object_inventory = None;
-        let event = attach_summary_object_inventory(&control, event, &mut last_object_inventory)
-            .await
-            .expect("summary inventory should be attached");
-
-        assert_eq!(event.object_inventory.total_bytes, 99);
-        assert_eq!(event.object_inventory.exported_bytes, 10);
-        assert_eq!(event.object_inventory.total_count, 2);
-        assert_eq!(event.object_inventory.exported_count, 1);
-        assert_eq!(
-            last_object_inventory.expect("cached inventory").total_count,
-            2
+        let event = edge_ws_v2_copy_progress_event(
+            control
+                .copy_progress_snapshot()
+                .await
+                .unwrap()
+                .expect("fake progress event"),
         );
-        assert_eq!(control.calls.lock().unwrap().as_slice(), &["summary"]);
+
+        assert_eq!(event.protocol_version, "edge-ws-v2");
+        assert_eq!(event.event_type, "COPY_PROGRESS");
+        assert_eq!(event.stage.as_deref(), Some("COPYING"));
+        assert_eq!(event.object_inventory.total_count, 0);
+        assert_eq!(
+            control.calls.lock().unwrap().as_slice(),
+            &["copy_progress_snapshot"]
+        );
     }
 
     #[test]
@@ -1452,9 +1438,13 @@ mod tests {
         );
         let value = serde_json::to_value(event).unwrap();
 
-        assert_eq!(value["event_type"], "SCAN_STARTED");
+        assert_eq!(value["protocol_version"], "edge-ws-v2");
+        assert!(value["event_id"].is_string());
+        assert_eq!(value["event_type"], "COPY_PROGRESS");
+        assert_eq!(value["stage"], "SCANNING_RUSTFS");
         assert_eq!(value["source"], "edge");
         assert_eq!(value["edge_code"], "edge-a");
+        assert_eq!(value["scan"]["scan_status"], "SCANNING");
         assert!(value.get("export_job_id").is_none());
         assert!(value.get("export_job_status").is_none());
         assert!(value.get("disk_status_code").is_none());

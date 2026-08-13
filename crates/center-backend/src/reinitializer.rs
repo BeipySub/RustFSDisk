@@ -604,13 +604,22 @@ impl Drop for SealedPayloadBackup {
 
 fn create_protocol_dirs(mount_path: &Path) -> Result<(), ReinitializeError> {
     let root = protocol_root(mount_path);
-    for dir_name in ["data", "meta", "manifests", "logs", "quarantine/partial"] {
+    for dir_name in [
+        "data",
+        "meta",
+        "manifests",
+        "logs",
+        "quarantine",
+        "quarantine/partial",
+    ] {
         let path = root.join(dir_name);
         fs::create_dir_all(&path).map_err(|source| ReinitializeError::Fs {
             action: format!("create {}", path.display()),
             source,
         })?;
+        make_directory_writable_by_all(&path)?;
     }
+    make_directory_writable_by_all(&root)?;
     sync_dir(&root)?;
     Ok(())
 }
@@ -734,6 +743,7 @@ pub fn write_disk_info(mount_path: &Path, disk_info: &DiskInfo) -> Result<(), Re
         action: format!("create {}", root.display()),
         source,
     })?;
+    make_directory_writable_by_all(&root)?;
     let path = root.join(DISK_INFO_FILE);
     let temp_path = root.join(format!("{}.tmp-{}", DISK_INFO_FILE, Uuid::new_v4()));
     let bytes = serde_json::to_vec_pretty(disk_info).map_err(ReinitializeError::Json)?;
@@ -743,6 +753,7 @@ pub fn write_disk_info(mount_path: &Path, disk_info: &DiskInfo) -> Result<(), Re
             action: format!("create {}", temp_path.display()),
             source,
         })?;
+        make_file_writable_by_all(&temp_path)?;
         file.write_all(&bytes)
             .map_err(|source| ReinitializeError::Fs {
                 action: format!("write {}", temp_path.display()),
@@ -758,7 +769,42 @@ pub fn write_disk_info(mount_path: &Path, disk_info: &DiskInfo) -> Result<(), Re
         action: format!("rename {} to {}", temp_path.display(), path.display()),
         source,
     })?;
+    make_file_writable_by_all(&path)?;
     sync_dir(&root)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn make_directory_writable_by_all(path: &Path) -> Result<(), ReinitializeError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o777)).map_err(|source| {
+        ReinitializeError::Fs {
+            action: format!("chmod 0777 {}", path.display()),
+            source,
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn make_directory_writable_by_all(_path: &Path) -> Result<(), ReinitializeError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn make_file_writable_by_all(path: &Path) -> Result<(), ReinitializeError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o666)).map_err(|source| {
+        ReinitializeError::Fs {
+            action: format!("chmod 0666 {}", path.display()),
+            source,
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn make_file_writable_by_all(_path: &Path) -> Result<(), ReinitializeError> {
     Ok(())
 }
 

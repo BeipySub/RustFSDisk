@@ -5,7 +5,9 @@ use uuid::Uuid;
 pub const GIB: u64 = 1_073_741_824;
 pub const MIN_RESERVE_BYTES: u64 = GIB;
 pub const MAX_RESERVE_BYTES: u64 = 8 * GIB;
-pub const DEFAULT_CHUNK_SIZE_BYTES: u64 = 10_737_418_240;
+// DiskWorker authenticates one protocol chunk with AES-GCM in memory. Keep a
+// chunk comfortably below the Edge VM memory budget, independent of disk size.
+pub const DEFAULT_CHUNK_SIZE_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_CHUNK_TOTAL: u64 = 1_000_000;
 pub const CHUNK_INDEX_OVERFLOW: &str = "CHUNK_INDEX_OVERFLOW";
 
@@ -91,13 +93,20 @@ pub fn calculate_capacity_budget(free_bytes: u64, overhead: CapacityOverhead) ->
 }
 
 pub fn plan_object(size_bytes: u64, max_single_disk_object_budget_bytes: u64) -> PlannedObject {
-    if size_bytes <= max_single_disk_object_budget_bytes {
+    let chunk_size_limit = max_single_disk_object_budget_bytes.min(DEFAULT_CHUNK_SIZE_BYTES);
+    if chunk_size_limit == 0 {
+        return PlannedObject::Failed {
+            error_code: CHUNK_INDEX_OVERFLOW,
+            error_message: "transport disk object budget must be greater than zero".to_string(),
+        };
+    }
+    if size_bytes <= chunk_size_limit {
         return PlannedObject::Plain {
             chunk_size_bytes: saturating_i64(size_bytes),
         };
     }
 
-    let chunk_total = size_bytes.div_ceil(DEFAULT_CHUNK_SIZE_BYTES);
+    let chunk_total = size_bytes.div_ceil(chunk_size_limit);
     if chunk_total > MAX_CHUNK_TOTAL {
         return PlannedObject::Failed {
             error_code: CHUNK_INDEX_OVERFLOW,
@@ -110,9 +119,9 @@ pub fn plan_object(size_bytes: u64, max_single_disk_object_budget_bytes: u64) ->
     let chunk_group_id = Uuid::new_v4();
     let mut chunks = Vec::with_capacity(chunk_total as usize);
     for chunk_index in 0..chunk_total {
-        let offset = chunk_index * DEFAULT_CHUNK_SIZE_BYTES;
+        let offset = chunk_index * chunk_size_limit;
         let remaining = size_bytes - offset;
-        let chunk_size = remaining.min(DEFAULT_CHUNK_SIZE_BYTES);
+        let chunk_size = remaining.min(chunk_size_limit);
         chunks.push(ChunkSpec {
             chunk_index: chunk_index as i32,
             chunk_total: chunk_total as i32,
@@ -444,7 +453,7 @@ mod tests {
     }
 
     #[test]
-    fn large_object_is_split_into_contiguous_10_gib_chunks() {
+    fn large_object_is_split_into_contiguous_memory_safe_chunks() {
         let planned = plan_object(DEFAULT_CHUNK_SIZE_BYTES * 2 + 7, GIB);
         let PlannedObject::Chunked { chunks, .. } = planned else {
             panic!("expected chunked object");
@@ -464,6 +473,22 @@ mod tests {
         );
         assert_eq!(chunks[2].chunk_size_bytes, 7);
         assert!(chunks.iter().all(|chunk| chunk.chunk_total == 3));
+    }
+
+    #[test]
+    fn object_larger_than_memory_safe_chunk_is_split_even_when_one_disk_can_hold_it() {
+        let planned = plan_object(DEFAULT_CHUNK_SIZE_BYTES + 1, DEFAULT_CHUNK_SIZE_BYTES * 100);
+        let PlannedObject::Chunked { chunks, .. } = planned else {
+            panic!("expected a memory-safe chunked object");
+        };
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].chunk_size_bytes, DEFAULT_CHUNK_SIZE_BYTES as i64);
+        assert_eq!(
+            chunks[1].chunk_offset_bytes,
+            DEFAULT_CHUNK_SIZE_BYTES as i64
+        );
+        assert_eq!(chunks[1].chunk_size_bytes, 1);
     }
 
     #[test]

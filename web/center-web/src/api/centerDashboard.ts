@@ -33,6 +33,7 @@ export interface ImportObject {
 }
 
 export interface CenterDiskProgress {
+  presence_id?: string;
   disk_id: string;
   disk_sn: string;
   hardware_serial?: string;
@@ -43,13 +44,16 @@ export interface CenterDiskProgress {
   device_path?: string;
   filesystem?: string;
   filesystem_uuid?: string;
+  capacity_bytes?: number;
   partition_uuid?: string;
   model?: string;
   vendor?: string;
   transport?: string;
   disk_enabled: boolean;
   registered: boolean;
+  can_register?: boolean;
   can_initialize: boolean;
+  can_reinitialize?: boolean;
   reusable: boolean;
   imported_before: boolean;
   disk_status_code: DiskLifecycleCode;
@@ -65,6 +69,51 @@ export interface CenterDiskProgress {
   current_object?: ImportObject;
   last_error_code?: string;
   error_message?: string;
+  message: string;
+}
+
+export interface RegisterCenterDiskRequest {
+  sn: string;
+  capacity_bytes: number;
+  remark?: string;
+}
+
+export interface RegisterCenterDiskResponse {
+  disk_id: string;
+  disk_enabled: boolean;
+  message?: string;
+}
+
+export interface InitializeCenterDiskRequest {
+  disk_id: string;
+  sn?: string;
+  capacity_bytes: number;
+  mount_path: string;
+}
+
+export interface InitializeCenterDiskResponse {
+  disk_id: string;
+  data_key_id: string;
+  status_code: DiskLifecycleCode;
+  message?: string;
+}
+
+export interface ReinitializeCenterDiskRequest {
+  mount_path: string;
+  seal_id: string;
+  expected_status_code: "SEALED" | "IMPORTED";
+  operator_reason: string;
+  confirm_reinitialize: boolean;
+  confirm_discard_sealed_export?: boolean;
+}
+
+export interface ReinitializeCenterDiskResponse {
+  disk_id: string;
+  old_seal_id: string;
+  old_data_key_id: string;
+  new_data_key_id: string;
+  disk_status_code: DiskLifecycleCode;
+  runtime_status: RuntimeStatus;
   message: string;
 }
 
@@ -141,6 +190,45 @@ export async function fetchCenterDashboardSummary(
   } finally {
     window.clearTimeout(timeout);
   }
+}
+
+export async function registerCenterDisk(
+  payload: RegisterCenterDiskRequest,
+): Promise<RegisterCenterDiskResponse> {
+  return postCenterJson("/api/disk/register", payload);
+}
+
+export async function initializeCenterDisk(
+  payload: InitializeCenterDiskRequest,
+): Promise<InitializeCenterDiskResponse> {
+  return postCenterJson("/api/disk/initialize", payload);
+}
+
+export async function reinitializeCenterDisk(
+  diskId: string,
+  payload: ReinitializeCenterDiskRequest,
+): Promise<ReinitializeCenterDiskResponse> {
+  return postCenterJson(`/api/center/disks/${encodeURIComponent(diskId)}/reinitialize`, payload);
+}
+
+async function postCenterJson<TResponse>(path: string, payload: unknown): Promise<TResponse> {
+  const response = await fetch(path, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  const body = await response.json().catch(() => null);
+  if (!response.ok) {
+    throw new DashboardHttpError(
+      "CENTER_ACTION_FAILED",
+      body?.message ?? body?.error ?? `HTTP ${response.status} while posting ${path}`,
+      response.status,
+    );
+  }
+  return body as TResponse;
 }
 
 export function normalizeCenterDashboardSummary(

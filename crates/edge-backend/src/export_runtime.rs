@@ -12,7 +12,7 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use sqlx::{PgPool, Row};
-use tokio::{runtime::Handle, task};
+use tokio::{runtime::Handle, sync::RwLock, task};
 use uuid::Uuid;
 
 use crate::{
@@ -58,14 +58,21 @@ pub struct ProductionExportWorkerLauncher {
     config: std::sync::Arc<EdgeConfig>,
     pool: PgPool,
     s3_client: Client,
+    copy_progress: std::sync::Arc<RwLock<Option<ProgressAggregator>>>,
 }
 
 impl ProductionExportWorkerLauncher {
-    pub fn new(config: std::sync::Arc<EdgeConfig>, pool: PgPool, s3_client: Client) -> Self {
+    pub fn new(
+        config: std::sync::Arc<EdgeConfig>,
+        pool: PgPool,
+        s3_client: Client,
+        copy_progress: std::sync::Arc<RwLock<Option<ProgressAggregator>>>,
+    ) -> Self {
         Self {
             config,
             pool,
             s3_client,
+            copy_progress,
         }
     }
 }
@@ -78,7 +85,12 @@ impl ExportWorkerLauncher for ProductionExportWorkerLauncher {
     ) -> ExportWorkerFuture<'a> {
         Box::pin(async move {
             let disks = load_worker_disks(&self.pool, &disk_ids).await?;
-            let progress = ProgressAggregator::new(&self.config.center.edge_code, export_job_id);
+            let progress = install_copy_progress(
+                &self.copy_progress,
+                &self.config.center.edge_code,
+                export_job_id,
+            )
+            .await;
             let handle = Handle::current();
             let mut tasks = Vec::new();
 
@@ -163,6 +175,16 @@ impl ExportWorkerLauncher for ProductionExportWorkerLauncher {
             })
         })
     }
+}
+
+async fn install_copy_progress(
+    slot: &std::sync::Arc<RwLock<Option<ProgressAggregator>>>,
+    edge_code: &str,
+    export_job_id: Uuid,
+) -> ProgressAggregator {
+    let progress = ProgressAggregator::new(edge_code, export_job_id);
+    *slot.write().await = Some(progress.clone());
+    progress
 }
 
 #[derive(Debug)]
@@ -602,16 +624,29 @@ impl ExportObjectRepository for PgExportObjectRepository {
     fn mark_job_sealed_checkpoint(
         &self,
         export_job_id: Uuid,
-        copied_count: u64,
-        copied_bytes: u64,
+        _copied_count: u64,
+        _copied_bytes: u64,
     ) -> Result<(), DiskWorkerError> {
         self.handle.block_on(async {
             sqlx::query(
-                "UPDATE export_job SET copied_count = copied_count + $2, copied_bytes = copied_bytes + $3 WHERE export_job_id = $1",
+                r#"
+                UPDATE export_job
+                SET copied_count = (
+                        SELECT COUNT(*)
+                        FROM export_object
+                        WHERE export_job_id = $1
+                          AND status = 'EXPORTED'
+                    ),
+                    copied_bytes = COALESCE((
+                        SELECT SUM(chunk_size_bytes)
+                        FROM export_object
+                        WHERE export_job_id = $1
+                          AND status = 'EXPORTED'
+                    ), 0)
+                WHERE export_job_id = $1
+                "#,
             )
             .bind(export_job_id)
-            .bind(copied_count as i64)
-            .bind(copied_bytes as i64)
             .execute(&self.pool)
             .await
             .map_err(sqlx_err)?;
@@ -688,6 +723,34 @@ fn sanitize_audit_value(value: &str) -> String {
 mod tests {
     use super::*;
     use std::io;
+
+    #[tokio::test]
+    async fn installed_copy_progress_is_the_snapshot_shared_with_websocket() {
+        let slot = std::sync::Arc::new(RwLock::new(None));
+        let export_job_id = Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap();
+        let worker_progress = install_copy_progress(&slot, "edge-a", export_job_id).await;
+
+        worker_progress.register_disk("disk-a", "sn-a", "/media/edge/disk-a", 100, 1, 50);
+        worker_progress.start_object("disk-a", "source", "objects/a.bin", "data/a.bin", 100);
+        worker_progress.add_bytes("disk-a", 40);
+
+        let websocket_snapshot = slot
+            .read()
+            .await
+            .as_ref()
+            .expect("copy progress must be installed for websocket snapshots")
+            .snapshot("COPY_PROGRESS", "edge copy progress snapshot");
+
+        assert_eq!(
+            websocket_snapshot.export_job.unwrap().export_job_id,
+            export_job_id.to_string()
+        );
+        assert_eq!(websocket_snapshot.disks[0].done_bytes, 40);
+        assert_eq!(
+            websocket_snapshot.disks[0].current_file.as_deref(),
+            Some("a.bin")
+        );
+    }
 
     #[test]
     fn derives_offline_disk_data_key_from_fixed_hmac_message() {

@@ -303,6 +303,7 @@ onMounted(() => {
       <a-form-item>
         <a-input-search
           v-model:value.trim="query"
+          class="record-search"
           placeholder="源 bucket/key / 导入任务 ID / ETag"
           size="middle"
           @search="submitSearch"
@@ -317,79 +318,81 @@ onMounted(() => {
       </span>
     </section>
 
-    <a-table
-      class="records-table glass-panel"
-      size="middle"
-      :columns="recordColumns"
-      :custom-row="recordRowProps"
-      :data-source="records"
-      :loading="loading"
-      :pagination="tablePagination"
-      :row-class-name="recordRowClassName"
-      :row-key="recordKey"
-      :scroll="{ y: 282 }"
-      @change="handleTableChange"
-    >
-      <template #emptyText>
-        <span>{{ error ? "对象账本记录接口不可用" : "没有符合条件的 object_ledger 记录" }}</span>
-      </template>
-      <template #bodyCell="{ column, record }">
-        <template v-if="column.key === 'imported_at'">
-          {{ formatTime(record.imported_at) }}
+    <section class="records-content">
+      <a-table
+        class="records-table glass-panel"
+        size="middle"
+        :columns="recordColumns"
+        :custom-row="recordRowProps"
+        :data-source="records"
+        :loading="loading"
+        :pagination="tablePagination"
+        :row-class-name="recordRowClassName"
+        :row-key="recordKey"
+        :scroll="{ x: 980, y: 'calc(100vh - 470px)' }"
+        @change="handleTableChange"
+      >
+        <template #emptyText>
+          <span>{{ error ? "对象账本记录接口不可用" : "没有符合条件的 object_ledger 记录" }}</span>
         </template>
-        <template v-else-if="column.key === 'edge'">
-          <strong>{{ edgeLabel(record) }}</strong>
+        <template #bodyCell="{ column, record }">
+          <template v-if="column.key === 'imported_at'">
+            {{ formatTime(record.imported_at) }}
+          </template>
+          <template v-else-if="column.key === 'edge'">
+            <strong>{{ edgeLabel(record) }}</strong>
+          </template>
+          <template v-else-if="column.key === 'source'">
+            <span :title="objectPath(record)">{{ objectPath(record) }}</span>
+          </template>
+          <template v-else-if="column.key === 'archive'">
+            <span :title="importPath(record)">{{ importPath(record) }}</span>
+          </template>
+          <template v-else-if="column.key === 'size'">
+            {{ formatBytes(record.source_size_bytes) }}
+          </template>
+          <template v-else-if="column.key === 'import_job'">
+            <span :title="record.import_job_id">{{ shortHash(record.import_job_id) }}</span>
+          </template>
+          <template v-else-if="column.key === 'chunk_group'">
+            <a-tag v-if="record.chunk_group_id" color="blue">跨盘分块</a-tag>
+            <a-tag v-else>普通对象</a-tag>
+          </template>
+          <template v-else-if="column.key === 'action'">
+            <a-button type="link" size="small" @click.stop="openDetail(record)">查看详情</a-button>
+          </template>
         </template>
-        <template v-else-if="column.key === 'source'">
-          <span :title="objectPath(record)">{{ objectPath(record) }}</span>
-        </template>
-        <template v-else-if="column.key === 'archive'">
-          <span :title="importPath(record)">{{ importPath(record) }}</span>
-        </template>
-        <template v-else-if="column.key === 'size'">
-          {{ formatBytes(record.source_size_bytes) }}
-        </template>
-        <template v-else-if="column.key === 'import_job'">
-          <span :title="record.import_job_id">{{ shortHash(record.import_job_id) }}</span>
-        </template>
-        <template v-else-if="column.key === 'chunk_group'">
-          <a-tag v-if="record.chunk_group_id" color="blue">跨盘分块</a-tag>
-          <a-tag v-else>普通对象</a-tag>
-        </template>
-        <template v-else-if="column.key === 'action'">
-          <a-button type="link" size="small" @click.stop="openDetail(record)">查看详情</a-button>
-        </template>
-      </template>
-    </a-table>
+      </a-table>
 
-    <aside class="record-drawer glass-panel" aria-label="对象账本记录详情">
-      <header>
-        <h2>对象账本详情</h2>
-      </header>
-      <section v-if="detailLoading" class="drawer-loading">正在读取详情</section>
-      <section v-else-if="detailError" class="drawer-loading error-state">详情接口不可用：{{ detailError.error_code }}。当前不展示模拟详情。</section>
-      <section v-else-if="records.length === 0" class="drawer-loading">暂无对象账本记录</section>
-      <section v-else-if="!selected" class="drawer-loading">正在读取对象账本详情</section>
-      <template v-else>
-        <a-descriptions class="drawer-descriptions" :column="1" size="small" :colon="false">
-          <a-descriptions-item label="边缘站点">{{ edgeLabel(selected) }}</a-descriptions-item>
-          <a-descriptions-item label="源对象">{{ objectPath(selected) }}</a-descriptions-item>
-          <a-descriptions-item label="中控归档">{{ importPath(selected) }}</a-descriptions-item>
-          <a-descriptions-item label="源 ETag">{{ selected.source_etag ?? "--" }}</a-descriptions-item>
-          <a-descriptions-item label="源对象大小">{{ formatBytes(selected.source_size_bytes) }}</a-descriptions-item>
-          <a-descriptions-item label="源修改时间">{{ formatTime(selected.source_last_modified) }}</a-descriptions-item>
-          <a-descriptions-item label="导入时间">{{ formatTime(selected.imported_at) }}</a-descriptions-item>
-        </a-descriptions>
-        <h3>账本关联</h3>
-        <a-descriptions class="drawer-descriptions manifest-lines" :column="1" size="small" :colon="false">
-          <a-descriptions-item label="import_job_id">{{ selected.import_job_id || "--" }}</a-descriptions-item>
-          <a-descriptions-item label="export_job_id">{{ selected.export_job_id ?? "--" }}</a-descriptions-item>
-          <a-descriptions-item label="chunk_group_id">{{ selected.chunk_group_id ?? "--" }}</a-descriptions-item>
-          <a-descriptions-item label="plaintext_sha256">{{ shortHash(selected.plaintext_sha256) }}</a-descriptions-item>
-          <a-descriptions-item label="ciphertext_sha256">{{ shortHash(selected.ciphertext_sha256) }}</a-descriptions-item>
-        </a-descriptions>
-        <p class="drawer-note"><i>i</i> object_ledger 是中控对象导入去重和来源追踪权威表；分类来源为 edge_site.edge_code。</p>
-      </template>
-    </aside>
+      <aside class="record-drawer glass-panel" aria-label="对象账本记录详情">
+        <header>
+          <h2>对象账本详情</h2>
+        </header>
+        <section v-if="detailLoading" class="drawer-loading">正在读取详情</section>
+        <section v-else-if="detailError" class="drawer-loading error-state">详情接口不可用：{{ detailError.error_code }}。当前不展示模拟详情。</section>
+        <section v-else-if="records.length === 0" class="drawer-loading">暂无对象账本记录</section>
+        <section v-else-if="!selected" class="drawer-loading">正在读取对象账本详情</section>
+        <template v-else>
+          <a-descriptions class="drawer-descriptions" :column="1" size="small" :colon="false">
+            <a-descriptions-item label="边缘站点">{{ edgeLabel(selected) }}</a-descriptions-item>
+            <a-descriptions-item label="源对象">{{ objectPath(selected) }}</a-descriptions-item>
+            <a-descriptions-item label="中控归档">{{ importPath(selected) }}</a-descriptions-item>
+            <a-descriptions-item label="源 ETag">{{ selected.source_etag ?? "--" }}</a-descriptions-item>
+            <a-descriptions-item label="源对象大小">{{ formatBytes(selected.source_size_bytes) }}</a-descriptions-item>
+            <a-descriptions-item label="源修改时间">{{ formatTime(selected.source_last_modified) }}</a-descriptions-item>
+            <a-descriptions-item label="导入时间">{{ formatTime(selected.imported_at) }}</a-descriptions-item>
+          </a-descriptions>
+          <h3>账本关联</h3>
+          <a-descriptions class="drawer-descriptions manifest-lines" :column="1" size="small" :colon="false">
+            <a-descriptions-item label="import_job_id">{{ selected.import_job_id || "--" }}</a-descriptions-item>
+            <a-descriptions-item label="export_job_id">{{ selected.export_job_id ?? "--" }}</a-descriptions-item>
+            <a-descriptions-item label="chunk_group_id">{{ selected.chunk_group_id ?? "--" }}</a-descriptions-item>
+            <a-descriptions-item label="plaintext_sha256">{{ shortHash(selected.plaintext_sha256) }}</a-descriptions-item>
+            <a-descriptions-item label="ciphertext_sha256">{{ shortHash(selected.ciphertext_sha256) }}</a-descriptions-item>
+          </a-descriptions>
+          <p class="drawer-note"><i>i</i> object_ledger 是中控对象导入去重和来源追踪权威表；分类来源为 edge_site.edge_code。</p>
+        </template>
+      </aside>
+    </section>
   </main>
 </template>

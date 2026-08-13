@@ -1,5 +1,8 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
+#[cfg(unix)]
+use std::process::Command;
+
 use anyhow::{anyhow, Context, Result};
 use axum::{
     body::Body,
@@ -9,7 +12,7 @@ use axum::{
     },
     http::{HeaderMap, Request, StatusCode},
     response::Response,
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
@@ -93,7 +96,14 @@ pub fn router(state: AppState) -> Router {
             "/api/center/sync-records/{ledger_id}",
             get(sync_record_detail_handler),
         )
-        .route("/api/center/edge-sites", get(edge_sites_handler))
+        .route(
+            "/api/center/edge-sites",
+            get(edge_sites_handler).post(create_edge_site_handler),
+        )
+        .route(
+            "/api/center/edge-sites/{edge_code}",
+            put(update_edge_site_handler).delete(delete_edge_site_handler),
+        )
         .route("/ws/center/import-progress", get(center_import_progress_ws))
         .route("/ws/center/progress", get(center_import_progress_ws))
         .route("/api/edge/auth", post(center_auth::edge_auth_handler))
@@ -241,6 +251,37 @@ pub struct EdgeRecord {
     pub edge_status: String,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ManagedEdgeSite {
+    pub edge_code: String,
+    pub edge_name: String,
+    pub auth_key_id: String,
+    pub edge_status: String,
+    pub object_count: Option<u64>,
+    pub create_time: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreateEdgeSiteRequest {
+    pub edge_code: String,
+    pub edge_name: String,
+    pub auth_key_id: String,
+    pub edge_auth_secret: String,
+    pub edge_status: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdateEdgeSiteRequest {
+    pub edge_name: String,
+    pub edge_status: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DeleteEdgeSiteResponse {
+    pub edge_code: String,
+    pub deleted: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct DataKeyRecord {
     pub data_key_id: Uuid,
@@ -292,6 +333,7 @@ pub struct CenterImportObject {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct CenterDiskSummary {
+    pub presence_id: Option<String>,
     pub disk_id: Uuid,
     pub disk_sn: String,
     pub edge_code: String,
@@ -299,9 +341,12 @@ pub struct CenterDiskSummary {
     pub device_path: Option<String>,
     pub filesystem: Option<String>,
     pub filesystem_uuid: Option<String>,
+    pub capacity_bytes: u64,
     pub disk_enabled: bool,
     pub registered: bool,
+    pub can_register: bool,
     pub can_initialize: bool,
+    pub can_reinitialize: bool,
     pub reusable: bool,
     pub imported_before: bool,
     pub disk_status_code: String,
@@ -318,6 +363,14 @@ pub struct CenterDiskSummary {
     pub last_error_code: Option<String>,
     pub error_message: Option<String>,
     pub message: String,
+}
+
+impl CenterDiskSummary {
+    fn with_center_actions(mut self) -> Self {
+        self.can_initialize = center_can_initialize(&self);
+        self.can_reinitialize = center_can_reinitialize(&self);
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -706,7 +759,11 @@ impl CenterService {
     }
 
     pub async fn edge_for_auth(&self, edge_code: &str) -> Result<Option<EdgeRecord>> {
-        self.store.edge_for_auth(edge_code).await
+        self.store
+            .edge_for_auth(edge_code)
+            .await?
+            .map(|edge| self.edge_record_with_plaintext_secret(edge))
+            .transpose()
     }
 
     pub async fn ready(&self) -> bool {
@@ -714,7 +771,8 @@ impl CenterService {
     }
 
     pub async fn dashboard_summary(&self) -> Result<CenterDashboardSummary> {
-        let disks = self.store.center_dashboard_disks().await?;
+        let mut disks = self.store.center_dashboard_disks().await?;
+        merge_detected_center_disks(&mut disks, detect_center_transport_disks());
         Ok(CenterDashboardSummary {
             source: "center",
             center_id: Some(self.center_identity.center_id),
@@ -738,6 +796,71 @@ impl CenterService {
 
     pub async fn edge_sites(&self) -> Result<Vec<EdgeSiteOption>> {
         self.store.edge_sites_with_object_counts().await
+    }
+
+    pub async fn managed_edge_sites(&self) -> Result<Vec<ManagedEdgeSite>> {
+        self.store.managed_edge_sites().await
+    }
+
+    pub async fn create_edge_site(&self, req: CreateEdgeSiteRequest) -> Result<ManagedEdgeSite> {
+        let mut edge = NewEdgeSite::try_from(req)?;
+        edge.edge_auth_secret = self.security.wrap_edge_auth_secret(
+            &edge.edge_code,
+            &edge.auth_key_id,
+            &edge.edge_auth_secret,
+        )?;
+        self.store.create_edge_site(edge).await
+    }
+
+    pub async fn update_edge_site(
+        &self,
+        edge_code: String,
+        req: UpdateEdgeSiteRequest,
+    ) -> Result<ManagedEdgeSite> {
+        let edge_code = normalize_edge_code(&edge_code)?;
+        let edge_name = normalize_required("edge_name", req.edge_name, 255)?;
+        let edge_status = normalize_edge_status(&req.edge_status)?;
+        self.store
+            .update_edge_site(edge_code, edge_name, edge_status)
+            .await
+    }
+
+    pub async fn delete_edge_site(&self, edge_code: String) -> Result<DeleteEdgeSiteResponse> {
+        let edge_code = normalize_edge_code(&edge_code)?;
+        let deleted = self.store.delete_edge_site(&edge_code).await?;
+        Ok(DeleteEdgeSiteResponse { edge_code, deleted })
+    }
+
+    fn edge_record_with_plaintext_secret(&self, mut edge: EdgeRecord) -> Result<EdgeRecord> {
+        edge.auth_secret = self.security.unwrap_edge_auth_secret(
+            &edge.edge_code,
+            &edge.auth_key_id,
+            &edge.auth_secret,
+        )?;
+        Ok(edge)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct NewEdgeSite {
+    edge_code: String,
+    edge_name: String,
+    auth_key_id: String,
+    edge_auth_secret: String,
+    edge_status: String,
+}
+
+impl TryFrom<CreateEdgeSiteRequest> for NewEdgeSite {
+    type Error = anyhow::Error;
+
+    fn try_from(value: CreateEdgeSiteRequest) -> Result<Self> {
+        Ok(Self {
+            edge_code: normalize_edge_code(&value.edge_code)?,
+            edge_name: normalize_required("edge_name", value.edge_name, 255)?,
+            auth_key_id: normalize_required("auth_key_id", value.auth_key_id, 255)?,
+            edge_auth_secret: normalize_required("edge_auth_secret", value.edge_auth_secret, 4096)?,
+            edge_status: normalize_edge_status(value.edge_status.as_deref().unwrap_or("ACTIVE"))?,
+        })
     }
 }
 
@@ -772,6 +895,46 @@ fn non_empty(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn normalize_required(field: &str, value: String, max_len: usize) -> Result<String> {
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        anyhow::bail!("{field} must not be empty");
+    }
+    if value.len() > max_len {
+        anyhow::bail!("{field} is too long");
+    }
+    Ok(value)
+}
+
+fn normalize_edge_code(value: &str) -> Result<String> {
+    let value = value.trim().to_ascii_lowercase();
+    if value.is_empty() {
+        anyhow::bail!("edge_code must not be empty");
+    }
+    if value.len() > 55 {
+        anyhow::bail!("edge_code is too long for archive bucket naming");
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        || value.starts_with('-')
+        || value.ends_with('-')
+        || value.contains("--")
+    {
+        anyhow::bail!("edge_code must use lowercase letters, digits, and single hyphens");
+    }
+    Ok(value)
+}
+
+fn normalize_edge_status(value: &str) -> Result<String> {
+    match value.trim().to_ascii_uppercase().as_str() {
+        "ACTIVE" => Ok("ACTIVE".to_string()),
+        "DISABLED" => Ok("DISABLED".to_string()),
+        "ERROR" => Ok("ERROR".to_string()),
+        _ => anyhow::bail!("edge_status must be ACTIVE, DISABLED, or ERROR"),
+    }
 }
 
 fn parse_optional_rfc3339(field: &str, value: Option<String>) -> Result<Option<DateTime<Utc>>> {
@@ -924,6 +1087,76 @@ impl CenterStore {
         }
     }
 
+    async fn managed_edge_sites(&self) -> Result<Vec<ManagedEdgeSite>> {
+        match self {
+            Self::Pg(pg) => pg.managed_edge_sites().await,
+            Self::Memory(mem) => {
+                let guard = mem.read().await;
+                Ok(memory_managed_edge_sites(&guard))
+            }
+        }
+    }
+
+    async fn create_edge_site(&self, edge: NewEdgeSite) -> Result<ManagedEdgeSite> {
+        match self {
+            Self::Pg(pg) => pg.create_edge_site(edge).await,
+            Self::Memory(mem) => {
+                let mut guard = mem.write().await;
+                if guard.edges.contains_key(&edge.edge_code) {
+                    anyhow::bail!("edge_code already exists");
+                }
+                if guard
+                    .edges
+                    .values()
+                    .any(|existing| existing.auth_key_id == edge.auth_key_id)
+                {
+                    anyhow::bail!("auth_key_id already exists");
+                }
+                guard.edges.insert(
+                    edge.edge_code.clone(),
+                    EdgeRecord {
+                        edge_code: edge.edge_code.clone(),
+                        edge_name: edge.edge_name.clone(),
+                        auth_key_id: edge.auth_key_id.clone(),
+                        auth_secret: edge.edge_auth_secret,
+                        edge_status: edge.edge_status.clone(),
+                    },
+                );
+                Ok(memory_managed_edge_site(&guard, &edge.edge_code)
+                    .expect("inserted edge should be visible"))
+            }
+        }
+    }
+
+    async fn update_edge_site(
+        &self,
+        edge_code: String,
+        edge_name: String,
+        edge_status: String,
+    ) -> Result<ManagedEdgeSite> {
+        match self {
+            Self::Pg(pg) => pg.update_edge_site(edge_code, edge_name, edge_status).await,
+            Self::Memory(mem) => {
+                let mut guard = mem.write().await;
+                let edge = guard
+                    .edges
+                    .get_mut(&edge_code)
+                    .ok_or_else(|| anyhow!("edge_site not found"))?;
+                edge.edge_name = edge_name;
+                edge.edge_status = edge_status;
+                Ok(memory_managed_edge_site(&guard, &edge_code)
+                    .expect("updated edge should be visible"))
+            }
+        }
+    }
+
+    async fn delete_edge_site(&self, edge_code: &str) -> Result<bool> {
+        match self {
+            Self::Pg(pg) => pg.delete_edge_site(edge_code).await,
+            Self::Memory(mem) => Ok(mem.write().await.edges.remove(edge_code).is_some()),
+        }
+    }
+
     async fn stage_initializing_data_key(&self, key: DataKeyRecord) -> Result<()> {
         match self {
             Self::Pg(pg) => pg.stage_initializing_data_key(key).await,
@@ -1061,6 +1294,7 @@ impl PgCenterStore {
             r#"
             SELECT d.disk_id,
                    d.sn,
+                   d.capacity_bytes,
                    d.status AS disk_enabled,
                    ij.import_job_id,
                    ij.seal_id,
@@ -1198,6 +1432,90 @@ impl PgCenterStore {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(edge_site_option_from_row).collect())
+    }
+
+    async fn managed_edge_sites(&self) -> Result<Vec<ManagedEdgeSite>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT es.edge_code,
+                   es.edge_name,
+                   es.auth_key_id,
+                   es.status AS edge_status,
+                   es.create_time,
+                   COUNT(ol.id) AS object_count
+            FROM edge_site AS es
+            LEFT JOIN object_ledger AS ol ON ol.edge_code = es.edge_code
+            GROUP BY es.edge_code, es.edge_name, es.auth_key_id, es.status, es.create_time
+            ORDER BY es.edge_code ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(managed_edge_site_from_row).collect())
+    }
+
+    async fn create_edge_site(&self, edge: NewEdgeSite) -> Result<ManagedEdgeSite> {
+        let row = sqlx::query(
+            r#"
+            INSERT INTO edge_site (edge_code, edge_name, auth_key_id, auth_secret_ciphertext, status)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING edge_code, edge_name, auth_key_id, status AS edge_status, create_time
+            "#,
+        )
+        .bind(&edge.edge_code)
+        .bind(&edge.edge_name)
+        .bind(&edge.auth_key_id)
+        .bind(&edge.edge_auth_secret)
+        .bind(&edge.edge_status)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(ManagedEdgeSite {
+            edge_code: row.get("edge_code"),
+            edge_name: row.get("edge_name"),
+            auth_key_id: row.get("auth_key_id"),
+            edge_status: row.get("edge_status"),
+            object_count: Some(0),
+            create_time: Some(utc_from_naive(row.get("create_time"))),
+        })
+    }
+
+    async fn update_edge_site(
+        &self,
+        edge_code: String,
+        edge_name: String,
+        edge_status: String,
+    ) -> Result<ManagedEdgeSite> {
+        let row = sqlx::query(
+            r#"
+            UPDATE edge_site
+            SET edge_name = $2,
+                status = $3
+            WHERE edge_code = $1
+            RETURNING edge_code, edge_name, auth_key_id, status AS edge_status, create_time
+            "#,
+        )
+        .bind(&edge_code)
+        .bind(&edge_name)
+        .bind(&edge_status)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| anyhow!("edge_site not found"))?;
+        Ok(ManagedEdgeSite {
+            edge_code: row.get("edge_code"),
+            edge_name: row.get("edge_name"),
+            auth_key_id: row.get("auth_key_id"),
+            edge_status: row.get("edge_status"),
+            object_count: None,
+            create_time: Some(utc_from_naive(row.get("create_time"))),
+        })
+    }
+
+    async fn delete_edge_site(&self, edge_code: &str) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM edge_site WHERE edge_code = $1")
+            .bind(edge_code)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     async fn stage_initializing_data_key(&self, key: DataKeyRecord) -> Result<()> {
@@ -1412,6 +1730,17 @@ fn edge_site_option_from_row(row: sqlx::postgres::PgRow) -> EdgeSiteOption {
     }
 }
 
+fn managed_edge_site_from_row(row: sqlx::postgres::PgRow) -> ManagedEdgeSite {
+    ManagedEdgeSite {
+        edge_code: row.get("edge_code"),
+        edge_name: row.get("edge_name"),
+        auth_key_id: row.get("auth_key_id"),
+        edge_status: row.get("edge_status"),
+        object_count: Some(row.get::<i64, _>("object_count").max(0) as u64),
+        create_time: Some(utc_from_naive(row.get("create_time"))),
+    }
+}
+
 fn utc_from_naive(value: NaiveDateTime) -> DateTime<Utc> {
     Utc.from_utc_datetime(&value)
 }
@@ -1505,6 +1834,34 @@ fn memory_edge_sites(store: &MemoryCenterStore) -> Vec<EdgeSiteOption> {
     edges
 }
 
+fn memory_managed_edge_sites(store: &MemoryCenterStore) -> Vec<ManagedEdgeSite> {
+    let mut edges = store
+        .edges
+        .keys()
+        .filter_map(|edge_code| memory_managed_edge_site(store, edge_code))
+        .collect::<Vec<_>>();
+    edges.sort_by(|left, right| left.edge_code.cmp(&right.edge_code));
+    edges
+}
+
+fn memory_managed_edge_site(store: &MemoryCenterStore, edge_code: &str) -> Option<ManagedEdgeSite> {
+    let edge = store.edges.get(edge_code)?;
+    Some(ManagedEdgeSite {
+        edge_code: edge.edge_code.clone(),
+        edge_name: edge.edge_name.clone(),
+        auth_key_id: edge.auth_key_id.clone(),
+        edge_status: edge.edge_status.clone(),
+        object_count: Some(
+            store
+                .sync_records
+                .iter()
+                .filter(|record| record.edge_code == edge.edge_code)
+                .count() as u64,
+        ),
+        create_time: None,
+    })
+}
+
 fn center_global_progress(disks: &[CenterDiskSummary]) -> CenterGlobalProgress {
     let total_bytes = disks.iter().map(|disk| disk.total_bytes).sum();
     let done_bytes = disks.iter().map(|disk| disk.done_bytes).sum();
@@ -1521,6 +1878,307 @@ fn center_global_progress(disks: &[CenterDiskSummary]) -> CenterGlobalProgress {
     }
 }
 
+#[derive(Debug, Clone)]
+struct DetectedCenterDisk {
+    presence_id: String,
+    disk_id: Option<Uuid>,
+    disk_sn: Option<String>,
+    edge_code: Option<String>,
+    mount_path: String,
+    device_path: Option<String>,
+    filesystem: Option<String>,
+    filesystem_uuid: Option<String>,
+    capacity_bytes: u64,
+    disk_status_code: Option<String>,
+    reusable: bool,
+    imported_before: bool,
+    seal_id: Option<Uuid>,
+    last_error: Option<String>,
+    has_protocol_document: bool,
+}
+
+fn merge_detected_center_disks(
+    disks: &mut Vec<CenterDiskSummary>,
+    detected: Vec<DetectedCenterDisk>,
+) {
+    for detected_disk in detected {
+        if let Some(existing) = disks.iter_mut().find(|disk| {
+            Some(disk.disk_id) == detected_disk.disk_id
+                || detected_disk
+                    .disk_sn
+                    .as_deref()
+                    .is_some_and(|sn| sn == disk.disk_sn)
+        }) {
+            apply_detected_center_disk(existing, detected_disk);
+        } else {
+            disks.push(center_disk_summary_from_detected(detected_disk));
+        }
+    }
+}
+
+fn apply_detected_center_disk(summary: &mut CenterDiskSummary, detected: DetectedCenterDisk) {
+    summary.presence_id = Some(detected.presence_id);
+    if let Some(sn) = detected.disk_sn {
+        summary.disk_sn = sn;
+    }
+    if let Some(edge_code) = detected.edge_code {
+        summary.edge_code = edge_code;
+    }
+    summary.mount_path = Some(detected.mount_path);
+    summary.device_path = detected.device_path;
+    summary.filesystem = detected.filesystem;
+    summary.filesystem_uuid = detected.filesystem_uuid;
+    summary.capacity_bytes = detected.capacity_bytes.max(summary.capacity_bytes);
+    summary.can_register = false;
+
+    let has_active_failure = matches!(
+        summary.import_job_status.as_deref(),
+        Some("FAILED") | Some("CANCELLED")
+    );
+    if !has_active_failure {
+        if let Some(disk_status_code) = detected.disk_status_code {
+            summary.disk_status_code = disk_status_code;
+            summary.runtime_status = center_runtime_status(
+                summary.import_job_status.as_deref(),
+                &summary.disk_status_code,
+            );
+            summary.message = center_disk_message(&summary.disk_status_code).to_string();
+        }
+    }
+
+    summary.reusable = detected.reusable || summary.disk_status_code == "INITIALIZED";
+    summary.imported_before = detected.imported_before || summary.imported_before;
+    if detected.seal_id.is_some() {
+        summary.seal_id = detected.seal_id;
+    }
+    if detected.last_error.is_some() {
+        summary.last_error_code = Some("DISK_INFO_ERROR".to_string());
+        summary.error_message = detected.last_error;
+    }
+    summary.can_initialize = center_can_initialize(summary);
+    summary.can_reinitialize = center_can_reinitialize(summary);
+}
+
+fn center_disk_summary_from_detected(detected: DetectedCenterDisk) -> CenterDiskSummary {
+    let disk_status_code = if detected.has_protocol_document {
+        detected
+            .disk_status_code
+            .clone()
+            .unwrap_or_else(|| "ERROR".to_string())
+    } else {
+        "UNREGISTERED".to_string()
+    };
+    let can_register = center_detected_disk_can_register(&detected);
+    CenterDiskSummary {
+        presence_id: Some(detected.presence_id),
+        disk_id: detected.disk_id.unwrap_or_else(Uuid::nil),
+        disk_sn: detected.disk_sn.unwrap_or_else(|| {
+            detected
+                .filesystem_uuid
+                .clone()
+                .unwrap_or_else(|| "-".to_string())
+        }),
+        edge_code: detected.edge_code.unwrap_or_else(|| "-".to_string()),
+        mount_path: Some(detected.mount_path),
+        device_path: detected.device_path,
+        filesystem: detected.filesystem,
+        filesystem_uuid: detected.filesystem_uuid,
+        capacity_bytes: detected.capacity_bytes,
+        disk_enabled: true,
+        registered: false,
+        can_register,
+        can_initialize: false,
+        can_reinitialize: false,
+        reusable: detected.reusable,
+        imported_before: detected.imported_before,
+        disk_status_code: disk_status_code.clone(),
+        runtime_status: center_runtime_status(None, &disk_status_code),
+        import_job_id: None,
+        import_job_status: None,
+        seal_id: detected.seal_id,
+        total_bytes: 0,
+        done_bytes: 0,
+        object_total: 0,
+        object_done: 0,
+        speed_bytes_per_sec: 0,
+        current_object: None,
+        last_error_code: detected
+            .last_error
+            .as_ref()
+            .map(|_| "DISK_INFO_ERROR".to_string()),
+        error_message: detected.last_error,
+        message: if can_register {
+            "detected unregistered transport disk".to_string()
+        } else {
+            "detected protocol disk not registered in center database".to_string()
+        },
+    }
+}
+
+fn center_detected_disk_can_register(detected: &DetectedCenterDisk) -> bool {
+    detected.capacity_bytes > 0
+        && detected
+            .disk_sn
+            .as_deref()
+            .is_some_and(|sn| !sn.trim().is_empty())
+        && (!detected.has_protocol_document
+            || matches!(
+                detected.disk_status_code.as_deref(),
+                Some("UNREGISTERED" | "REGISTERED")
+            ))
+}
+
+fn center_can_initialize(summary: &CenterDiskSummary) -> bool {
+    summary.registered
+        && summary.disk_enabled
+        && summary.mount_path.is_some()
+        && summary.capacity_bytes > 0
+        && !matches!(
+            summary.disk_status_code.as_str(),
+            "INITIALIZED" | "SEALED" | "CENTER_IMPORTING" | "IMPORTED" | "ERROR"
+        )
+        && summary.import_job_status.is_none()
+}
+
+fn center_can_reinitialize(summary: &CenterDiskSummary) -> bool {
+    summary.registered
+        && summary.disk_enabled
+        && summary.mount_path.is_some()
+        && summary.seal_id.is_some()
+        && matches!(summary.disk_status_code.as_str(), "SEALED" | "IMPORTED")
+        && !is_center_import_active(summary.import_job_status.as_deref())
+}
+
+fn is_center_import_active(status: Option<&str>) -> bool {
+    matches!(status, Some("PENDING" | "IMPORTING"))
+}
+
+fn detect_center_transport_disks() -> Vec<DetectedCenterDisk> {
+    detect_center_transport_disks_impl().unwrap_or_default()
+}
+
+#[cfg(unix)]
+fn detect_center_transport_disks_impl() -> Result<Vec<DetectedCenterDisk>> {
+    let output = Command::new("findmnt")
+        .args(["-rn", "-o", "SOURCE,TARGET,FSTYPE"])
+        .output()
+        .context("list mounted filesystems with findmnt")?;
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut disks = Vec::new();
+    for line in stdout.lines() {
+        let parts = line.split_whitespace().collect::<Vec<_>>();
+        if parts.len() < 3 {
+            continue;
+        }
+        let device_path = parts[0].to_string();
+        let mount_path = parts[1].to_string();
+        let filesystem = parts[2].to_string();
+        if filesystem != "ext4" || !is_center_transport_mount_path(&mount_path) {
+            continue;
+        }
+        disks.push(detected_center_disk_from_mount(
+            device_path,
+            mount_path,
+            filesystem,
+        ));
+    }
+    Ok(disks)
+}
+
+#[cfg(not(unix))]
+fn detect_center_transport_disks_impl() -> Result<Vec<DetectedCenterDisk>> {
+    Ok(Vec::new())
+}
+
+#[cfg(unix)]
+fn is_center_transport_mount_path(mount_path: &str) -> bool {
+    mount_path.starts_with("/media/")
+        || mount_path.starts_with("/mnt/")
+        || mount_path.starts_with("/run/media/")
+}
+
+#[cfg(unix)]
+fn detected_center_disk_from_mount(
+    device_path: String,
+    mount_path: String,
+    filesystem: String,
+) -> DetectedCenterDisk {
+    let mount = std::path::Path::new(&mount_path);
+    let document = reinitializer::read_disk_info_document(mount).ok();
+    let disk_info = document.as_ref().map(|document| &document.disk_info);
+    let filesystem_uuid = command_stdout("blkid", &["-o", "value", "-s", "UUID", &device_path]);
+    let capacity_bytes = disk_info
+        .map(|info| info.disk.capacity_bytes)
+        .filter(|capacity| *capacity > 0)
+        .or_else(|| device_capacity_bytes(&device_path))
+        .unwrap_or_default();
+    let disk_sn = disk_info
+        .and_then(|info| info.disk.sn.clone())
+        .or_else(|| command_stdout("lsblk", &["-dn", "-o", "SERIAL", &device_path]))
+        .or_else(|| filesystem_uuid.as_ref().map(|uuid| format!("fs:{uuid}")));
+    let disk_id = disk_info.map(|info| info.disk.disk_id);
+    let edge_code = disk_info
+        .and_then(|info| info.edge.as_ref())
+        .map(|edge| edge.edge_code.clone())
+        .filter(|edge_code| !edge_code.trim().is_empty());
+    let seal_id = disk_info
+        .and_then(|info| info.edge.as_ref())
+        .and_then(|edge| edge.seal_id_uuid());
+    let disk_status_code = disk_info.map(|info| info.status.code.as_str().to_string());
+    let reusable = disk_info
+        .map(|info| {
+            info.status.reusable || info.status.code == reinitializer::DiskStatusCode::Initialized
+        })
+        .unwrap_or(false);
+    let imported_before = disk_info
+        .map(|info| {
+            info.status.imported || info.status.code == reinitializer::DiskStatusCode::Imported
+        })
+        .unwrap_or(false);
+    let last_error = disk_info.and_then(|info| info.status.last_error.clone());
+
+    DetectedCenterDisk {
+        presence_id: format!("{}@{}", device_path, mount_path),
+        disk_id,
+        disk_sn,
+        edge_code,
+        mount_path,
+        device_path: Some(device_path),
+        filesystem: Some(filesystem),
+        filesystem_uuid,
+        capacity_bytes,
+        disk_status_code,
+        reusable,
+        imported_before,
+        seal_id,
+        last_error,
+        has_protocol_document: document.is_some(),
+    }
+}
+
+#[cfg(unix)]
+fn device_capacity_bytes(device_path: &str) -> Option<u64> {
+    command_stdout("lsblk", &["-b", "-dn", "-o", "SIZE", device_path])
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+#[cfg(unix)]
+fn command_stdout(program: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(program).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
 fn center_disk_summary_from_row(row: sqlx::postgres::PgRow) -> CenterDiskSummary {
     let import_job_status = row.get::<Option<String>, _>("import_job_status");
     let disk_enabled = row.get("disk_enabled");
@@ -1529,6 +2187,7 @@ fn center_disk_summary_from_row(row: sqlx::postgres::PgRow) -> CenterDiskSummary
     let error_message = row.get::<Option<String>, _>("error_message");
 
     CenterDiskSummary {
+        presence_id: Some(format!("registered:{}", row.get::<Uuid, _>("disk_id"))),
         disk_id: row.get("disk_id"),
         disk_sn: row.get("sn"),
         edge_code: row
@@ -1538,9 +2197,15 @@ fn center_disk_summary_from_row(row: sqlx::postgres::PgRow) -> CenterDiskSummary
         device_path: None,
         filesystem: Some("ext4".to_string()),
         filesystem_uuid: None,
+        capacity_bytes: row
+            .get::<Option<i64>, _>("capacity_bytes")
+            .unwrap_or_default()
+            .max(0) as u64,
         disk_enabled,
         registered: true,
-        can_initialize: disk_enabled && import_job_status.is_none(),
+        can_register: false,
+        can_initialize: false,
+        can_reinitialize: false,
         reusable: disk_status_code == "INITIALIZED",
         imported_before: import_job_status.as_deref() == Some("DONE"),
         disk_status_code: disk_status_code.clone(),
@@ -1574,10 +2239,12 @@ fn center_disk_summary_from_row(row: sqlx::postgres::PgRow) -> CenterDiskSummary
         error_message,
         message: center_disk_message(&disk_status_code).to_string(),
     }
+    .with_center_actions()
 }
 
 fn memory_disk_summary(disk: DiskRecord) -> CenterDiskSummary {
     CenterDiskSummary {
+        presence_id: Some(format!("registered:{}", disk.disk_id)),
         disk_id: disk.disk_id,
         disk_sn: disk.sn,
         edge_code: "-".to_string(),
@@ -1585,9 +2252,12 @@ fn memory_disk_summary(disk: DiskRecord) -> CenterDiskSummary {
         device_path: None,
         filesystem: Some("ext4".to_string()),
         filesystem_uuid: None,
+        capacity_bytes: disk.capacity_bytes.max(0) as u64,
         disk_enabled: disk.disk_enabled,
         registered: true,
-        can_initialize: disk.disk_enabled,
+        can_register: false,
+        can_initialize: false,
+        can_reinitialize: false,
         reusable: false,
         imported_before: false,
         disk_status_code: "REGISTERED".to_string(),
@@ -1605,6 +2275,7 @@ fn memory_disk_summary(disk: DiskRecord) -> CenterDiskSummary {
         error_message: None,
         message: "registered center disk".to_string(),
     }
+    .with_center_actions()
 }
 
 fn center_disk_status_code(import_job_status: Option<&str>, disk_enabled: bool) -> String {
@@ -1625,6 +2296,7 @@ fn center_runtime_status(import_job_status: Option<&str>, disk_status_code: &str
         Some("DONE") if disk_status_code == "IMPORTED" => "DONE",
         Some("FAILED") | Some("CANCELLED") => "ERROR",
         Some("PENDING") => "READY",
+        _ if disk_status_code == "INITIALIZED" => "READY",
         _ => "DETECTED",
     }
     .to_string()
@@ -1701,10 +2373,47 @@ async fn sync_record_detail_handler(
 async fn edge_sites_handler(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let edges = state.service.edge_sites().await?;
+    let edges = state.service.managed_edge_sites().await?;
     Ok(Json(
         serde_json::json!({ "items": edges.clone(), "edges": edges }),
     ))
+}
+
+async fn create_edge_site_handler(
+    State(state): State<AppState>,
+    Json(req): Json<CreateEdgeSiteRequest>,
+) -> Result<Json<ManagedEdgeSite>, ApiError> {
+    state
+        .service
+        .create_edge_site(req)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn update_edge_site_handler(
+    State(state): State<AppState>,
+    AxumPath(edge_code): AxumPath<String>,
+    Json(req): Json<UpdateEdgeSiteRequest>,
+) -> Result<Json<ManagedEdgeSite>, ApiError> {
+    state
+        .service
+        .update_edge_site(edge_code, req)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+async fn delete_edge_site_handler(
+    State(state): State<AppState>,
+    AxumPath(edge_code): AxumPath<String>,
+) -> Result<Json<DeleteEdgeSiteResponse>, ApiError> {
+    state
+        .service
+        .delete_edge_site(edge_code)
+        .await
+        .map(Json)
+        .map_err(Into::into)
 }
 
 async fn center_import_progress_ws(
@@ -1848,10 +2557,8 @@ async fn start_import_handler(
 async fn reinitialize_disk_handler(
     State(state): State<AppState>,
     AxumPath(disk_id): AxumPath<Uuid>,
-    headers: HeaderMap,
     Json(req): Json<reinitialize_runtime::CenterReinitializeRequest>,
 ) -> Result<Json<reinitialize_runtime::CenterReinitializeResponse>, ApiError> {
-    authorize_center_control_api(&state, &headers)?;
     let reinitialize_control = state
         .reinitialize_control
         .as_ref()
@@ -2679,9 +3386,127 @@ mod tests {
         let body = json_body(response).await;
         assert_eq!(body["items"][0]["edge_code"], "edge-a");
         assert_eq!(body["items"][0]["edge_status"], "ACTIVE");
+        assert_eq!(body["items"][0]["auth_key_id"], "auth-key-a");
         assert_eq!(body["items"][0]["object_count"], 1);
         assert!(body["items"][0].get("status").is_none());
+        assert!(body["items"][0].get("auth_secret_ciphertext").is_none());
+        assert!(body["items"][0].get("edge_auth_secret").is_none());
         assert_eq!(body["edges"][1]["edge_code"], "edge-b");
+    }
+
+    #[tokio::test]
+    async fn edge_site_management_create_does_not_require_control_token() {
+        let app = router(
+            AppState::new(memory_service())
+                .with_control_api_token(Some("center-control".to_string())),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/center/edge-sites")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "edge_code": "edge-c",
+                            "edge_name": "Edge C",
+                            "auth_key_id": "auth-key-c",
+                            "edge_auth_secret": "edge-auth-secret-c"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["edge_code"], "edge-c");
+        assert_eq!(body["edge_status"], "ACTIVE");
+        assert!(body.get("status").is_none());
+        assert!(body.get("auth_secret_ciphertext").is_none());
+        assert!(body.get("edge_auth_secret").is_none());
+    }
+
+    #[tokio::test]
+    async fn edge_site_management_creates_updates_and_deletes_without_token_or_secret_echo() {
+        let app = router(
+            AppState::new(memory_service())
+                .with_control_api_token(Some("center-control".to_string())),
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/center/edge-sites")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "edge_code": "edge-c",
+                            "edge_name": "Edge C",
+                            "auth_key_id": "auth-key-c",
+                            "edge_auth_secret": "edge-auth-secret-c",
+                            "edge_status": "ACTIVE"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["edge_code"], "edge-c");
+        assert_eq!(body["edge_status"], "ACTIVE");
+        assert_eq!(body["auth_key_id"], "auth-key-c");
+        assert!(body.get("status").is_none());
+        assert!(body.get("auth_secret_ciphertext").is_none());
+        assert!(body.get("edge_auth_secret").is_none());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/api/center/edge-sites/edge-c")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "edge_name": "Edge C Disabled",
+                            "edge_status": "DISABLED"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["edge_name"], "Edge C Disabled");
+        assert_eq!(body["edge_status"], "DISABLED");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/api/center/edge-sites/edge-c")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["edge_code"], "edge-c");
+        assert_eq!(body["deleted"], true);
     }
 
     #[tokio::test]
@@ -2878,26 +3703,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn controlled_reinitialize_route_rejects_missing_token() {
+    async fn controlled_reinitialize_route_allows_local_call_without_token() {
         #[derive(Default)]
-        struct FakeReinitializeControl;
+        struct FakeReinitializeControl {
+            calls: Mutex<Vec<(Uuid, PathBuf)>>,
+        }
 
         impl reinitialize_runtime::CenterReinitializeControlService for FakeReinitializeControl {
             fn reinitialize_disk<'a>(
                 &'a self,
-                _disk_id: Uuid,
-                _request: reinitialize_runtime::CenterReinitializeRequest,
+                disk_id: Uuid,
+                request: reinitialize_runtime::CenterReinitializeRequest,
             ) -> reinitialize_runtime::CenterReinitializeFuture<'a> {
-                Box::pin(async { panic!("reinitialize service must not be called without token") })
+                Box::pin(async move {
+                    self.calls
+                        .lock()
+                        .unwrap()
+                        .push((disk_id, request.mount_path));
+                    Ok(reinitialize_runtime::CenterReinitializeResponse {
+                        disk_id,
+                        old_seal_id: request.seal_id,
+                        old_data_key_id: Uuid::new_v4(),
+                        new_data_key_id: Uuid::new_v4(),
+                        disk_status_code: reinitializer::DiskStatusCode::Initialized,
+                        runtime_status: "DONE".to_string(),
+                        message: "ok".to_string(),
+                    })
+                })
             }
         }
 
         let disk_id = Uuid::new_v4();
         let seal_id = Uuid::new_v4();
+        let control = Arc::new(FakeReinitializeControl::default());
         let app = router(
             AppState::new(memory_service())
                 .with_control_api_token(Some("center-control-token".to_string()))
-                .with_reinitialize_control(Arc::new(FakeReinitializeControl)),
+                .with_reinitialize_control(control.clone()),
         );
         let body = format!(
             r#"{{
@@ -2921,7 +3763,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(control.calls.lock().unwrap().len(), 1);
     }
 
     async fn active_data_key_ids_for_disk(service: &CenterService, disk_id: Uuid) -> Vec<Uuid> {

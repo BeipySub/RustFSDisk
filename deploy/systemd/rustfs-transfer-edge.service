@@ -7,6 +7,7 @@ Wants=network-online.target
 Type=simple
 User=rustfs-transfer
 Group=rustfs-transfer
+UMask=0000
 WorkingDirectory=/opt/rustfs-transfer
 Environment=RUSTFS_TRANSFER__CONFIG_PATH=/etc/rustfs-transfer/edge.toml
 Environment=RUSTFS_TRANSFER__PATHS__DATA_DIR=/var/lib/rustfs-transfer/edge

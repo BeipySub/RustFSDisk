@@ -33,6 +33,11 @@ transport_mount_root = "/mnt/rustfs-transfer"
 [rescan]
 token_env = "RUSTFS_TRANSFER__RESCAN__TOKEN"
 
+[scan]
+# Reuse a successful RustFS scan within this many minutes. Set to 0 to scan
+# RustFS on every automatic orchestration attempt, which is useful for testing.
+reuse_window_minutes = 1440
+
 [auto_export]
 # Conservative default: keep automatic scan/export disabled until an Edge
 # deployment window explicitly enables both flags below.

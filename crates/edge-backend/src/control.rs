@@ -42,6 +42,7 @@ const LOAD_DISK_RUNTIME_SQL: &str = r#"
         )
             id,
             sn,
+            disk_presence_id,
             disk_id,
             device_path,
             mount_path,
@@ -56,14 +57,12 @@ const LOAD_DISK_RUNTIME_SQL: &str = r#"
             COALESCE(disk_id::text, device_path || '|' || COALESCE(mount_path, '')),
             id DESC
     )
-    SELECT sn, disk_id, device_path, mount_path, status, capacity_bytes, free_bytes, object_budget_bytes,
+    SELECT sn, disk_presence_id, disk_id, device_path, mount_path, status, capacity_bytes, free_bytes, object_budget_bytes,
            last_error_code, error_message
     FROM latest
     WHERE status <> 'REMOVED'
     ORDER BY id ASC
     "#;
-const DAILY_SCAN_WINDOW_HOURS: i64 = 24;
-
 pub trait EdgeControlService: Send + Sync {
     fn scan_once<'a>(
         &'a self,
@@ -107,6 +106,8 @@ pub struct ScanTriggerRequest {
     pub export_job_id: Option<Uuid>,
     #[serde(default)]
     pub enqueue_stable_objects: bool,
+    #[serde(default)]
+    pub force_rescan: bool,
     #[serde(default = "default_record_source_changed_objects")]
     pub record_source_changed_objects: bool,
 }
@@ -146,6 +147,7 @@ impl Default for ScanTriggerRequest {
         Self {
             export_job_id: None,
             enqueue_stable_objects: false,
+            force_rescan: false,
             record_source_changed_objects: default_record_source_changed_objects(),
         }
     }
@@ -288,6 +290,7 @@ pub struct ExportJobRecord {
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct DiskRuntimeSummary {
+    pub disk_presence_id: Option<String>,
     pub hardware_serial: String,
     pub disk_sn: String,
     pub stable_hardware_id: String,
@@ -442,12 +445,21 @@ pub struct ProductionEdgeControlService {
 
 impl ProductionEdgeControlService {
     pub fn new(config: Arc<EdgeConfig>, pool: PgPool, s3_client: aws_sdk_s3::Client) -> Self {
+        let copy_progress = Arc::new(tokio::sync::RwLock::new(None));
         let worker_launcher = Arc::new(ProductionExportWorkerLauncher::new(
             config.clone(),
             pool.clone(),
             s3_client.clone(),
+            copy_progress.clone(),
         ));
-        Self::new_with_worker_launcher(config, pool, s3_client, worker_launcher)
+        Self {
+            config,
+            pool,
+            s3_client,
+            scan_progress: ProgressAggregator::default(),
+            copy_progress,
+            worker_launcher,
+        }
     }
 
     pub fn new_with_worker_launcher(
@@ -474,9 +486,14 @@ impl ProductionEdgeControlService {
             ));
         }
 
-        if let Some(report) = load_recent_successful_scan(&self.pool).await? {
-            self.scan_progress.reuse_recent_scan(&report);
-            return Ok(report);
+        let reuse_window_minutes = self.config.scan.reuse_window_minutes;
+        if !request.force_rescan && reuse_window_minutes > 0 {
+            if let Some(report) =
+                load_recent_successful_scan(&self.pool, reuse_window_minutes).await?
+            {
+                self.scan_progress.reuse_recent_scan(&report);
+                return Ok(report);
+            }
         }
 
         let scan_run_id = Uuid::new_v4();
@@ -566,7 +583,10 @@ impl EdgeControlService for ProductionEdgeControlService {
                 source_changed_count: report.source_changed_count,
                 total_bytes: report.total_bytes,
                 message: if report.reused_recent_scan {
-                    "RustFS scan reused: last successful scan is within 24 hours".to_string()
+                    format!(
+                        "RustFS scan reused: last successful scan is within {} minutes",
+                        self.config.scan.reuse_window_minutes
+                    )
                 } else {
                     "RustFS scan completed".to_string()
                 },
@@ -584,6 +604,7 @@ impl EdgeControlService for ProductionEdgeControlService {
                 self.run_scan(ScanTriggerRequest {
                     export_job_id: Some(export_job_id),
                     enqueue_stable_objects: false,
+                    force_rescan: false,
                     record_source_changed_objects: true,
                 })
                 .await?;
@@ -815,10 +836,26 @@ async fn load_export_job(
 ) -> Result<ExportJobResponse, ControlError> {
     let row = sqlx::query(
         r#"
-        SELECT export_job_id, edge_code, status, object_count, copied_count, total_bytes,
-               copied_bytes, start_time, finish_time, error_message
-        FROM export_job
-        WHERE export_job_id = $1
+        SELECT ej.export_job_id,
+               ej.edge_code,
+               ej.status,
+               COALESCE(objects.object_count, 0)::BIGINT AS object_count,
+               COALESCE(objects.copied_count, 0)::BIGINT AS copied_count,
+               COALESCE(objects.total_bytes, 0)::BIGINT AS total_bytes,
+               COALESCE(objects.copied_bytes, 0)::BIGINT AS copied_bytes,
+               ej.start_time,
+               ej.finish_time,
+               ej.error_message
+        FROM export_job ej
+        LEFT JOIN LATERAL (
+            SELECT COUNT(*) AS object_count,
+                   COUNT(*) FILTER (WHERE status = 'EXPORTED') AS copied_count,
+                   COALESCE(SUM(chunk_size_bytes), 0) AS total_bytes,
+                   COALESCE(SUM(chunk_size_bytes) FILTER (WHERE status = 'EXPORTED'), 0) AS copied_bytes
+            FROM export_object
+            WHERE export_job_id = ej.export_job_id
+        ) objects ON TRUE
+        WHERE ej.export_job_id = $1
         "#,
     )
     .bind(export_job_id)
@@ -856,8 +893,12 @@ async fn load_export_job(
     })
 }
 
-async fn load_recent_successful_scan(pool: &PgPool) -> Result<Option<ScanReport>, ControlError> {
-    let cutoff = Utc::now() - ChronoDuration::hours(DAILY_SCAN_WINDOW_HOURS);
+async fn load_recent_successful_scan(
+    pool: &PgPool,
+    reuse_window_minutes: u64,
+) -> Result<Option<ScanReport>, ControlError> {
+    let cutoff =
+        Utc::now() - ChronoDuration::minutes(reuse_window_minutes.min(i64::MAX as u64) as i64);
     let row = sqlx::query(
         r#"
         SELECT bucket_count, object_seen, stable_object_count, source_changed_count, total_bytes
@@ -1240,6 +1281,9 @@ async fn load_disk_runtime(pool: &PgPool) -> Result<Vec<DiskRuntimeSummary>, Con
             );
             let task_pool_eligible = runtime_status == "READY" && disk_status_code == "INITIALIZED";
             DiskRuntimeSummary {
+                disk_presence_id: row
+                    .get::<Option<Uuid>, _>("disk_presence_id")
+                    .map(|value| value.to_string()),
                 hardware_serial: disk_sn.clone(),
                 disk_sn: disk_sn.clone(),
                 stable_hardware_id: fs_uuid.clone().unwrap_or_else(|| disk_sn.clone()),
@@ -2028,7 +2072,7 @@ fn naive_utc(value: Option<NaiveDateTime>) -> Option<DateTime<Utc>> {
 fn is_valid_export_job_status(value: &str) -> bool {
     matches!(
         value,
-        "PENDING" | "SCANNING" | "COPYING" | "SEALED" | "FAILED" | "CANCELLED"
+        "PENDING" | "SCANNING" | "COPYING" | "SEALING" | "SEALED" | "FAILED" | "CANCELLED"
     )
 }
 
@@ -2135,6 +2179,16 @@ mod tests {
     use std::{fs, path::Path};
 
     #[test]
+    fn scan_request_force_rescan_defaults_to_false_and_can_be_enabled() {
+        let default_request: ScanTriggerRequest = serde_json::from_str("{}").unwrap();
+        assert!(!default_request.force_rescan);
+
+        let forced_request: ScanTriggerRequest =
+            serde_json::from_str(r#"{"force_rescan":true}"#).unwrap();
+        assert!(forced_request.force_rescan);
+    }
+
+    #[test]
     fn recovery_job_guard_rejects_non_failed_job() {
         let err = ensure_recovery_job_guard(&RecoveryJobGuard {
             export_job_status: "COPYING".to_string(),
@@ -2145,6 +2199,11 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err.error_code, "EXPORT_JOB_NOT_FAILED");
+    }
+
+    #[test]
+    fn export_job_status_filter_accepts_sealing() {
+        assert!(is_valid_export_job_status("SEALING"));
     }
 
     #[test]

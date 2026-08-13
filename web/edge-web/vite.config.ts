@@ -10,11 +10,11 @@ export default defineConfig(({ mode }) => {
     plugins: [vue()],
     server: {
       proxy: {
-        "/api/edge/dashboard": {
+        "/api/edge": {
           target: edgeBackendOrigin,
           changeOrigin: true,
         },
-        "/ws/edge/progress": {
+        "/ws/edge": {
           target: edgeBackendOrigin,
           changeOrigin: true,
           ws: true,

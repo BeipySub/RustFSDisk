@@ -223,26 +223,6 @@ button:focus-visible {
   color: #8f9dad;
 }
 
-.scan-rustfs-button {
-  height: 28px;
-  padding: 0 12px;
-  color: var(--cyan-2);
-  font-size: 13px;
-  font-weight: 700;
-  white-space: nowrap;
-  cursor: pointer;
-  background: rgb(6 18 32 / 70%);
-  border: 1px solid rgb(0 184 255 / 42%);
-  border-radius: 6px;
-  box-shadow: inset 0 0 14px rgb(0 184 255 / 8%);
-}
-
-.scan-rustfs-button:disabled {
-  color: #9aacbc;
-  cursor: wait;
-  border-color: rgb(98 132 164 / 35%);
-}
-
 .icon-refresh {
   width: 30px;
   height: 30px;
@@ -718,7 +698,7 @@ button:focus-visible {
   align-self: start;
   color: #f2f5f6;
   font-size: 26px;
-  font-weight: 400;
+  font-weight: bold;
   line-height: 1;
   text-shadow: 0 0 9px rgb(255 255 255 / 18%);
 }
@@ -730,8 +710,8 @@ button:focus-visible {
   overflow: hidden;
   color: #8fd0ff;
   font-size: 16px;
-  font-weight: 700;
-  line-height: 1.05;
+  font-weight: bold;
+  /* line-height: 1.05; */
   text-align: right;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -759,8 +739,8 @@ button:focus-visible {
 
 .disk-slot-matrix small {
   color: #eef3f6;
-  font-size: 12px;
-  font-weight: 650;
+  /* font-size: 12px;
+  font-weight: 650; */
   text-align: right;
   white-space: nowrap;
 }
@@ -780,7 +760,7 @@ button:focus-visible {
 .slot-sn {
   position: absolute;
   left: 9px;
-  bottom: 10px;
+  bottom: 4px;
   max-width: calc(100% - 18px);
   color: #aeb8c4 !important;
   text-align: left !important;
@@ -788,11 +768,11 @@ button:focus-visible {
 }
 
 .slot-progress {
-  grid-column: 1 / 3;
-  align-self: end;
+  grid-column: 2 / 3;
+  /* align-self: end; */
   display: block;
   width: 100%;
-  height: 4px;
+  height: 2px;
   overflow: hidden;
   background: rgb(9 35 53 / 86%);
   border-radius: 999px;
@@ -842,7 +822,7 @@ button:focus-visible {
 
 .selected-disk-strip {
   position: absolute;
-  inset: 57% 22px auto;
+  inset: 53% 22px auto;
   z-index: 23;
   display: grid;
   grid-template-columns: minmax(0, 1fr);
@@ -944,7 +924,7 @@ button:focus-visible {
 
 .global-progress {
   position: absolute;
-  inset: 56% 22px auto;
+  inset: 64% 22px auto;
   z-index: 20;
   display: grid;
   grid-template-columns: 142px minmax(0, 1fr);
@@ -1017,15 +997,27 @@ button:focus-visible {
 }
 
 .progress-main.idle-copy {
-  display: grid;
-  grid-template-rows: auto auto;
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 34px;
   align-content: center;
-  gap: 9px;
 }
 
 .progress-main.idle-copy p {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
   color: #d3dde6;
   font-size: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.progress-main.idle-copy dl {
+  flex: 1 1 auto;
+  min-width: 0;
 }
 
 .progress-main b {
@@ -1059,16 +1051,13 @@ dd {
 .dashboard-grid,
 .dashboard-lower-grid {
   position: absolute;
-  inset: 64.1% 22px 12px;
+  inset: 78% 22px 12px;
   z-index: 18;
   display: grid;
   grid-template-columns: 34.2% minmax(0, 1fr);
   gap: 10px;
 }
 
-.dashboard-lower-grid.compact {
-  inset: 70% 22px 12px;
-}
 
 .dashboard-grid article,
 .dashboard-lower-grid article {

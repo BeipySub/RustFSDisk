@@ -79,7 +79,7 @@
 - 浏览器仍只读，不接触控制 token、`disk_data_key`、`edge_auth_secret`、nonce、tag 或 `data_key_id`。
 - 自动导出必须可配置关闭；默认上线可灰度启用，失败时能回退到现有受控 API。
 - udev 仍只触发 rescan，不直接导出；自动编排由 Edge 常驻服务在准入通过后启动。
-- RustFS 全量扫描一天最多成功执行一次；24 小时内重复插盘或重复 udev 事件必须复用最近一次成功扫描快照。
+- RustFS 成功扫描快照复用窗口由 Edge 配置 `scan.reuse_window_minutes` 控制，单位分钟；设为 `0` 时每次自动编排都扫描 RustFS。
 - 导出计划只允许使用最近一次成功扫描窗口内确认上传完成的 `STABLE` 对象；正在上传、覆盖或扫描期间变化的对象不得计入统计和导出队列。
 
 | 泳道 | 建议负责人 | 任务 | 可并行条件 | 交付物 |
@@ -2107,7 +2107,7 @@ disk_data_key = HMAC-SHA256(
 
 - 自动流程只能在 `disk_status_code = INITIALIZED` 且 `runtime_status = READY` 后启动。
 - 同一批 READY 盘已有 `PENDING`、`SCANNING`、`COPYING`、`SEALING` 或未完成 `export_job` 时，不得创建新的自动任务。
-- RustFS 扫描一天最多成功执行一次；最近 24 小时已有 `DONE` 扫描记录时，自动编排必须复用最近扫描快照创建导出任务。
+- RustFS 扫描复用窗口由 `scan.reuse_window_minutes` 控制；窗口内已有 `DONE` 记录时复用最近扫描快照，设为 `0` 时不复用。
 - 导出计划只能读取最近一次成功扫描窗口内的 `stable_status = STABLE` 快照。
 - 自动任务创建后仍使用现有 `export_job_status`、`object_status` 和 `disk_runtime.status`。
 - 不新增裸 `status` 字段。
@@ -2126,7 +2126,7 @@ disk_data_key = HMAC-SHA256(
 - [x] 配置关闭时，插盘只进入 READY，不自动 scan/export。
 - [x] 配置开启时，插入单块 `INITIALIZED` 盘后自动完成 scan、create export_job、start DiskWorker。
 - [x] 服务启动时已有 READY 盘也能自动进入流程。
-- [x] 24 小时内重复触发自动流程不会再次全量扫描 RustFS。
+- [x] 扫描复用按 `scan.reuse_window_minutes` 执行；设为 `0` 时重复自动流程会重新扫描 RustFS。
 - [x] 自动导出只包含最近一次成功扫描确认上传完成的 `STABLE` 对象。
 - [x] 连续 udev 重复事件不会重复创建多个活动 export_job。
 - [x] 已存在活动 export_job 时不会启动第二个自动任务。

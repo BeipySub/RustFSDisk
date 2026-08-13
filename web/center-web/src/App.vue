@@ -2,20 +2,22 @@
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import ProductHeader from "./components/ProductHeader.vue";
 import DashboardView from "./views/DashboardView.vue";
+import EdgeSitesView from "./views/EdgeSitesView.vue";
 import SyncRecordsView from "./views/SyncRecordsView.vue";
 
-type EdgeRoute = "/dashboard" | "/sync-records";
+type EdgeRoute = "/dashboard" | "/sync-records" | "/edge-sites";
 interface EdgeIdentityDetail {
   edge_name?: string;
   edge_code?: string;
 }
 
-const routes: EdgeRoute[] = ["/dashboard", "/sync-records"];
+const routes: EdgeRoute[] = ["/dashboard", "/sync-records", "/edge-sites"];
 const currentPath = ref<EdgeRoute>(normalizePath(window.location.pathname));
 const edgeIdentity = ref("Center 中控端");
 
 const currentView = computed(() => {
   if (currentPath.value === "/sync-records") return SyncRecordsView;
+  if (currentPath.value === "/edge-sites") return EdgeSitesView;
   return DashboardView;
 });
 
@@ -60,6 +62,7 @@ onBeforeUnmount(() => {
         :edge-identity="edgeIdentity"
         @dashboard="navigate('/dashboard')"
         @sync-records="navigate('/sync-records')"
+        @edge-sites="navigate('/edge-sites')"
       />
       <component :is="currentView" class="page-host" />
     </div>

@@ -598,8 +598,16 @@ where
     }
 
     fn ensure_protocol_dirs(&self) -> Result<()> {
-        for relative in ["data", "meta", "manifests", "logs", "quarantine/partial"] {
-            fs::create_dir_all(self.root().join(relative))?;
+        for relative in [
+            "data",
+            "meta",
+            "manifests",
+            "logs",
+            "quarantine",
+            "quarantine/partial",
+        ] {
+            let path = self.root().join(relative);
+            fs::create_dir_all(&path)?;
         }
         Ok(())
     }
@@ -728,11 +736,25 @@ fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     ));
     {
         let mut file = File::create(&tmp_path).map_err(classify_io_error)?;
+        make_file_writable_by_all(&tmp_path)?;
         file.write_all(bytes).map_err(classify_io_error)?;
         file.sync_all().map_err(classify_io_error)?;
     }
     fs::rename(&tmp_path, path).map_err(classify_io_error)?;
+    make_file_writable_by_all(path)?;
     fsync_parent(path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn make_file_writable_by_all(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o666)).map_err(classify_io_error)
+}
+
+#[cfg(not(unix))]
+fn make_file_writable_by_all(_path: &Path) -> Result<()> {
     Ok(())
 }
 

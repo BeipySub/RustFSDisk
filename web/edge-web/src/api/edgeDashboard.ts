@@ -66,6 +66,7 @@ export interface EdgeDiskProgressSnapshot extends EdgeGlobalProgress {
 }
 
 export interface EdgeDiskProgress {
+  disk_presence_id?: string;
   disk_id: string;
   disk_sn: string;
   hardware_serial?: string;
@@ -213,6 +214,7 @@ interface EdgeWireExportJob extends Partial<EdgeGlobalProgress> {
 }
 
 interface EdgeControlDiskRuntime {
+  disk_presence_id?: string | null;
   disk_id?: string | null;
   disk_sn?: string | null;
   hardware_serial?: string | null;
@@ -334,10 +336,6 @@ export function edgeReadinessPath(): string {
   return envValue("VITE_EDGE_READINESS_PATH", "/readyz");
 }
 
-export function edgeScanPath(): string {
-  return envValue("VITE_EDGE_SCAN_PATH", "/api/edge/scan");
-}
-
 export async function fetchEdgeReadiness(path = edgeReadinessPath()): Promise<EdgeReadiness> {
   return getJson<EdgeReadiness>(localEdgePath(path, "/readyz"));
 }
@@ -369,10 +367,6 @@ export async function fetchEdgeExportJobDetail(
   const safeBasePath = localEdgePath(basePath, "/api/edge/dashboard/export-jobs");
   const payload = await getJson<Partial<EdgeExportJobDetail>>(`${safeBasePath}/${safeId}`);
   return normalizeExportJobDetail(payload);
-}
-
-export async function triggerEdgeRustFsScan(path = edgeScanPath()): Promise<void> {
-  await postJson(localEdgePath(path, "/api/edge/scan"));
 }
 
 export function buildExportJobsUrl(basePath: string, query: EdgeExportJobsQuery): string {
@@ -439,6 +433,7 @@ export function normalizeDiskProgress(
 
   return {
     ...disk,
+    disk_presence_id: nullableString(disk.disk_presence_id),
     disk_id: diskId,
     disk_sn: disk.disk_sn ?? disk.hardware_serial ?? "",
     hardware_serial: nullableString(disk.hardware_serial),
@@ -751,38 +746,6 @@ async function getJson<T>(path: string): Promise<T> {
     throw new DashboardHttpError(
       "DASHBOARD_UNAVAILABLE",
       error instanceof Error ? error.message : `Unable to load ${path}`,
-    );
-  } finally {
-    globalThis.clearTimeout(timeout);
-  }
-}
-
-async function postJson(path: string): Promise<void> {
-  const controller = new AbortController();
-  const timeout = globalThis.setTimeout(() => controller.abort(), 6000);
-
-  try {
-    const response = await fetch(path, {
-      method: "POST",
-      headers: { Accept: "application/json" },
-      signal: controller.signal,
-    });
-
-    if (!response.ok) {
-      throw new DashboardHttpError(
-        response.status === 404 ? "EDGE_SCAN_ENDPOINT_NOT_READY" : "EDGE_SCAN_HTTP_ERROR",
-        `HTTP ${response.status} while posting ${path}`,
-        response.status,
-      );
-    }
-  } catch (error) {
-    if (error instanceof DashboardHttpError) throw error;
-    if (error instanceof DOMException && error.name === "AbortError") {
-      throw new DashboardHttpError("EDGE_SCAN_TIMEOUT", `Timed out while posting ${path}`);
-    }
-    throw new DashboardHttpError(
-      "EDGE_SCAN_UNAVAILABLE",
-      error instanceof Error ? error.message : `Unable to post ${path}`,
     );
   } finally {
     globalThis.clearTimeout(timeout);

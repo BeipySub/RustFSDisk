@@ -7,8 +7,6 @@ interface Props {
   wsTone: TelemetryTone;
   refreshLabel: string;
   refreshDisabled?: boolean;
-  scanLabel?: string;
-  scanDisabled?: boolean;
   showStatusPills?: boolean;
 }
 
@@ -18,7 +16,6 @@ withDefaults(defineProps<Props>(), {
 
 const emit = defineEmits<{
   refresh: [];
-  scan: [];
 }>();
 </script>
 
@@ -29,15 +26,6 @@ const emit = defineEmits<{
       <span :class="['status-pill', localTone]"><i></i> 本机服务</span>
       <span :class="['status-pill', wsTone]"><i></i> WebSocket</span>
     </template>
-    <button
-      v-if="scanLabel"
-      class="scan-rustfs-button"
-      :disabled="scanDisabled"
-      type="button"
-      @click="emit('scan')"
-    >
-      {{ scanLabel }}
-    </button>
     <button
       :aria-label="refreshLabel"
       class="icon-refresh"

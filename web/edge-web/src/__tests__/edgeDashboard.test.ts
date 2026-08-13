@@ -6,7 +6,6 @@ import {
   edgeDiskPrimaryStatusLabel,
   diskStatusDisplay,
   edgeRejectedDiskStatusLabel,
-  edgeScanPath,
   isActiveExportJobStatus,
   localEdgePath,
   normalizeEdgeDashboardSummary,
@@ -56,10 +55,6 @@ test("keeps browser API paths local to the Edge origin", () => {
     }),
     "/api/edge/dashboard/export-jobs?page=1&page_size=8",
   );
-});
-
-test("uses local Edge scan path for manual RustFS scan", () => {
-  assert.equal(edgeScanPath(), "/api/edge/scan");
 });
 
 test("displays Edge visible disk lifecycle codes in Chinese", () => {
@@ -277,9 +272,12 @@ test("marks sealed historical export disks as removable when runtime was cleared
 test("accepts scan and copy start websocket events from Edge realtime stream", () => {
   const scan = parseCopyProgressEvent(
     JSON.stringify({
-      event_type: "SCAN_PROGRESS",
+      protocol_version: "edge-ws-v2",
+      event_id: "event-scan",
+      event_type: "COPY_PROGRESS",
       source: "edge",
       edge_code: "edge-demo",
+      stage: "SCANNING_RUSTFS",
       export_job: exportJob("", "SCANNING"),
       global_progress: {
         total_bytes: 0,
@@ -295,9 +293,12 @@ test("accepts scan and copy start websocket events from Edge realtime stream", (
   );
   const copyStarted = parseCopyProgressEvent(
     JSON.stringify({
-      event_type: "COPY_STARTED",
+      protocol_version: "edge-ws-v2",
+      event_id: "event-copy",
+      event_type: "COPY_PROGRESS",
       source: "edge",
       edge_code: "edge-demo",
+      stage: "COPYING",
       export_job: exportJob("job-copying", "COPYING", {
         total_bytes: 100,
         done_bytes: 0,
@@ -320,8 +321,10 @@ test("accepts scan and copy start websocket events from Edge realtime stream", (
     }),
   );
 
-  assert.equal(scan?.event_type, "SCAN_PROGRESS");
-  assert.equal(copyStarted?.event_type, "COPY_STARTED");
+  assert.equal(scan?.event_type, "COPY_PROGRESS");
+  assert.equal(scan?.stage, "SCANNING_RUSTFS");
+  assert.equal(copyStarted?.event_type, "COPY_PROGRESS");
+  assert.equal(copyStarted?.stage, "COPYING");
 });
 
 test("keeps production export statuses from the shared contract", () => {
@@ -391,7 +394,7 @@ test("normalizes deployed dashboard summary wire shape", () => {
   assert.equal(summary.global_progress.object_total, 173);
 });
 
-test("replaces dashboard disks with the latest websocket disk list", () => {
+test("merges websocket disk progress by disk id without replacing other disks", () => {
   const summary = normalizeEdgeDashboardSummary({
     source: "edge",
     edge_code: "edge-demo",
@@ -459,10 +462,13 @@ test("replaces dashboard disks with the latest websocket disk list", () => {
   });
 
   const merged = applyCopyProgressEvent(summary, {
+    protocol_version: "edge-ws-v2",
+    event_id: "event-copy",
     event_type: "COPY_PROGRESS",
     event_time: "2026-08-11T05:33:00Z",
     source: "edge",
     edge_code: "edge-demo",
+    stage: "COPYING",
     export_job: exportJob("job-copying", "COPYING", {
       total_bytes: 300,
       done_bytes: 50,
@@ -502,9 +508,67 @@ test("replaces dashboard disks with the latest websocket disk list", () => {
     message: "copying",
   });
 
-  assert.equal(merged.disks.length, 1);
+  assert.equal(merged.disks.length, 2);
   assert.equal(merged.disks.find((disk) => disk.disk_id === "disk-a")?.runtime_status, "COPYING");
-  assert.equal(merged.disks.find((disk) => disk.disk_id === "disk-b"), undefined);
+  assert.equal(merged.disks.find((disk) => disk.disk_id === "disk-b")?.runtime_status, "READY");
+});
+
+test("keeps one disk card while a detected disk receives its protocol disk id", () => {
+  const emptySummary = normalizeEdgeDashboardSummary({
+    source: "edge",
+    edge_code: "edge-demo",
+    edge_name: "edge-demo",
+    global_progress: {
+      total_bytes: 0,
+      done_bytes: 0,
+      remaining_bytes: 0,
+      speed_bytes_per_sec: 0,
+      object_total: 0,
+      object_done: 0,
+      object_remaining: 0,
+    },
+    disks: [],
+    ws_connected: false,
+    last_http_refresh_at: "2026-08-13T00:00:00Z",
+    message: "summary",
+  });
+  const detected = {
+    protocol_version: "edge-ws-v2",
+    event_id: "detected",
+    event_type: "DISK_PLUGGED",
+    event_time: "2026-08-13T00:00:01Z",
+    source: "edge",
+    edge_code: "edge-demo",
+    disks: [{
+      disk_presence_id: "presence-a",
+      disk_id: "",
+      disk_sn: "25386P401831",
+      stable_hardware_id: "2cf552ec-62b8-4e75-84df-eb8da998d2ec",
+      device_path: "/dev/sdb1",
+      mount_path: "/media/edge/RFS-ZERO-FRESH",
+      runtime_status: "CHECKING",
+      disk_status_code: "UNREGISTERED",
+    }],
+  };
+  const ready = {
+    ...detected,
+    event_id: "ready",
+    event_time: "2026-08-13T00:00:02Z",
+    disks: [{
+      ...detected.disks[0],
+      disk_id: "25eb1e1a-2824-4d6d-914f-cbdc10c3da8a",
+      runtime_status: "READY",
+      disk_status_code: "INITIALIZED",
+    }],
+  };
+
+  const afterDetected = applyCopyProgressEvent(emptySummary, detected);
+  const afterReady = applyCopyProgressEvent(afterDetected, ready);
+
+  assert.equal(afterReady.disks.length, 1);
+  assert.equal(afterReady.disks[0]?.disk_presence_id, "presence-a");
+  assert.equal(afterReady.disks[0]?.disk_id, "25eb1e1a-2824-4d6d-914f-cbdc10c3da8a");
+  assert.equal(afterReady.disks[0]?.disk_status_code, "INITIALIZED");
 });
 
 test("replaces terminal HTTP summary with websocket snapshot", () => {
@@ -692,7 +756,9 @@ test("does not resurrect a removed disk when HTTP summary has no current disks",
   });
 
   const merged = applyCopyProgressEvent(summary, {
-    event_type: "DISK_REMOVED",
+    protocol_version: "edge-ws-v2",
+    event_id: "event-removed",
+    event_type: "DISK_UNPLUGGED",
     event_time: "2026-08-12T10:23:01Z",
     source: "edge",
     edge_code: "edge-demo",
@@ -708,12 +774,12 @@ test("does not resurrect a removed disk when HTTP summary has no current disks",
     },
     disks: [],
 
-    message: "DISK_REMOVED",
+    message: "DISK_UNPLUGGED",
   });
 
   assert.equal(merged.disks.length, 0);
   assert.equal(merged.ws_connected, true);
-  assert.equal(merged.message, "DISK_REMOVED");
+  assert.equal(merged.message, "DISK_UNPLUGGED");
 });
 
 test("preserves HTTP object inventory when websocket omits inventory", () => {
@@ -743,7 +809,9 @@ test("preserves HTTP object inventory when websocket omits inventory", () => {
   });
 
   const merged = applyCopyProgressEvent(summary, {
-    event_type: "DISK_REMOVED",
+    protocol_version: "edge-ws-v2",
+    event_id: "event-removed",
+    event_type: "DISK_UNPLUGGED",
     event_time: "2026-08-11T05:34:00Z",
     source: "edge",
     edge_code: "edge-demo",
@@ -781,7 +849,9 @@ test("preserves HTTP object inventory when websocket sends default zero inventor
   });
 
   const merged = applyCopyProgressEvent(summary, {
-    event_type: "DISK_REMOVED",
+    protocol_version: "edge-ws-v2",
+    event_id: "event-removed",
+    event_type: "DISK_UNPLUGGED",
     event_time: "2026-08-11T05:34:00Z",
     source: "edge",
     edge_code: "edge-demo",
@@ -905,7 +975,9 @@ test("keeps imported lifecycle when websocket updates rejected runtime", () => {
   });
 
   const merged = applyCopyProgressEvent(summary, {
-    event_type: "DISK_REJECTED",
+    protocol_version: "edge-ws-v2",
+    event_id: "event-rejected",
+    event_type: "DISK_PLUGGED",
     event_time: "2026-08-12T10:32:00Z",
     source: "edge",
     edge_code: "edge-demo",
@@ -984,7 +1056,9 @@ test("keeps sealed lifecycle when websocket updates rejected runtime", () => {
   });
 
   const merged = applyCopyProgressEvent(summary, {
-    event_type: "DISK_REJECTED",
+    protocol_version: "edge-ws-v2",
+    event_id: "event-rejected",
+    event_type: "DISK_PLUGGED",
     event_time: "2026-08-12T10:32:00Z",
     source: "edge",
     edge_code: "edge-demo",
@@ -1019,7 +1093,7 @@ test("keeps sealed lifecycle when websocket updates rejected runtime", () => {
   assert.equal(edgeDiskPrimaryStatusLabel(merged.disks[0]!), "已封盘");
 });
 
-test("clears dashboard disks when websocket sends an empty disk list", () => {
+test("marks a disk removed when websocket sends an unplug event for that disk", () => {
   const summary = normalizeEdgeDashboardSummary({
     source: "edge",
     edge_code: "edge-demo",
@@ -1059,15 +1133,26 @@ test("clears dashboard disks when websocket sends an empty disk list", () => {
   });
 
   const merged = applyCopyProgressEvent(summary, {
-    event_type: "DISK_REMOVED",
+    protocol_version: "edge-ws-v2",
+    event_id: "event-removed",
+    event_type: "DISK_UNPLUGGED",
     event_time: "2026-08-12T10:32:00Z",
     source: "edge",
     edge_code: "edge-demo",
-    export_job: exportJob("job-copying", "COPYING"),
-    global_progress: summary.global_progress,
-    disks: [],
+    disks: [
+      {
+        disk_id: "disk-a",
+        disk_sn: "SN-A",
+        mount_path: "/media/edge/a",
+        runtime_status: "REMOVED",
+        last_error_code: "DISK_REMOVED",
+        message: "removed",
+      },
+    ],
     message: "removed",
   });
 
-  assert.equal(merged.disks.length, 0);
+  assert.equal(merged.disks.length, 1);
+  assert.equal(merged.disks[0]?.runtime_status, "REMOVED");
+  assert.equal(merged.disks[0]?.last_error_code, "DISK_REMOVED");
 });

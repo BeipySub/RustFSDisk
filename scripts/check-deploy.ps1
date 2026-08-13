@@ -27,6 +27,9 @@ $centerService = Get-Content -Raw (Join-Path $repo "deploy/systemd/rustfs-transf
 if ($centerService -notmatch "EnvironmentFile=-/etc/rustfs-transfer/center.env") {
     Add-Failure "center service must load center.env for security key injection"
 }
+if ($centerService -notmatch "UMask=0000") {
+    Add-Failure "center service must use UMask=0000 for shared transport-disk access"
+}
 
 $edgeService = Get-Content -Raw (Join-Path $repo "deploy/systemd/rustfs-transfer-edge.service")
 if ($edgeService -notmatch "ExecStart=/opt/rustfs-transfer/rustfs-transfer-edge") {
@@ -37,6 +40,9 @@ if ($edgeService -notmatch "RUSTFS_TRANSFER__CONFIG_PATH=/etc/rustfs-transfer/ed
 }
 if ($edgeService -notmatch "EnvironmentFile=-/etc/rustfs-transfer/edge.env") {
     Add-Failure "edge service must load edge.env for deploy-time toggles"
+}
+if ($edgeService -notmatch "UMask=0000") {
+    Add-Failure "edge service must use UMask=0000 for shared transport-disk access"
 }
 
 $centerToml = Get-Content -Raw (Join-Path $repo "deploy/config/center.example.toml")

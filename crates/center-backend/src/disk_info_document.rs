@@ -176,11 +176,19 @@ pub fn write_initialized_disk_info(
     document: &InitializedDiskInfoDocument,
 ) -> Result<()> {
     let root = mount_path.join(PROTOCOL_ROOT);
-    fs::create_dir_all(root.join("data"))?;
-    fs::create_dir_all(root.join("meta"))?;
-    fs::create_dir_all(root.join("manifests"))?;
-    fs::create_dir_all(root.join("logs"))?;
-    fs::create_dir_all(root.join("quarantine").join("partial"))?;
+    for relative in [
+        "data",
+        "meta",
+        "manifests",
+        "logs",
+        "quarantine",
+        "quarantine/partial",
+    ] {
+        let path = root.join(relative);
+        fs::create_dir_all(&path)?;
+        make_directory_writable_by_all(&path)?;
+    }
+    make_directory_writable_by_all(&root)?;
 
     let disk_info_path = root.join(DISK_INFO_FILE);
     let tmp_path = root.join(format!("{}.tmp-{}", DISK_INFO_FILE, Uuid::new_v4()));
@@ -189,6 +197,7 @@ pub fn write_initialized_disk_info(
     {
         let mut file =
             File::create(&tmp_path).with_context(|| format!("create {}", tmp_path.display()))?;
+        make_file_writable_by_all(&tmp_path)?;
         file.write_all(&bytes)
             .with_context(|| format!("write {}", tmp_path.display()))?;
         file.sync_all()
@@ -201,7 +210,34 @@ pub fn write_initialized_disk_info(
             disk_info_path.display()
         )
     })?;
+    make_file_writable_by_all(&disk_info_path)?;
     sync_directory_best_effort(&root)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn make_directory_writable_by_all(path: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o777))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn make_directory_writable_by_all(_path: &std::path::Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn make_file_writable_by_all(path: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o666))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn make_file_writable_by_all(_path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 

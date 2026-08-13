@@ -69,7 +69,7 @@ impl CenterImportControlService for ProductionCenterImportControlService {
             let handle = Handle::current();
 
             task::spawn_blocking(move || {
-                let mut repo = PgImportRepository::new(pool, handle.clone());
+                let mut repo = PgImportRepository::new(pool, handle.clone(), security);
                 let mut storage = S3ArchiveStorage::new(s3_client, handle);
                 let mut progress = ProgressAggregator::default();
                 let outcome =
@@ -171,11 +171,16 @@ fn is_import_job_status(status: &str) -> bool {
 struct PgImportRepository {
     pool: PgPool,
     handle: Handle,
+    security: CenterSecurity,
 }
 
 impl PgImportRepository {
-    fn new(pool: PgPool, handle: Handle) -> Self {
-        Self { pool, handle }
+    fn new(pool: PgPool, handle: Handle, security: CenterSecurity) -> Self {
+        Self {
+            pool,
+            handle,
+            security,
+        }
     }
 }
 
@@ -361,11 +366,12 @@ impl ImportRepository for PgImportRepository {
     }
 
     fn active_edge_auth_secret(&self, edge_code: &str) -> Option<String> {
-        self.handle
+        let row = self
+            .handle
             .block_on(async {
-                sqlx::query_scalar::<_, String>(
+                sqlx::query(
                     r#"
-                    SELECT auth_secret_ciphertext
+                    SELECT auth_key_id, auth_secret_ciphertext
                     FROM edge_site
                     WHERE edge_code = $1
                       AND status = 'ACTIVE'
@@ -376,7 +382,12 @@ impl ImportRepository for PgImportRepository {
                 .await
             })
             .ok()
-            .flatten()
+            .flatten()?;
+        let auth_key_id: String = row.get("auth_key_id");
+        let ciphertext: String = row.get("auth_secret_ciphertext");
+        self.security
+            .unwrap_edge_auth_secret(edge_code, &auth_key_id, &ciphertext)
+            .ok()
     }
 
     fn validate_data_key_for_import(

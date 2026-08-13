@@ -11,7 +11,6 @@ import {
   isEdgeUnregisteredDiskIssue,
   isEdgeUnsupportedDiskIssue,
   isActiveExportJobStatus,
-  triggerEdgeRustFsScan,
   type EdgeDashboardSummary,
   type EdgeDiskProgress,
   type EdgeReadiness,
@@ -81,8 +80,6 @@ const isRefreshing = ref(false);
 const httpError = ref<DashboardHttpError | null>(null);
 const wsConnected = ref(false);
 const wsMessage = ref("WebSocket 尚未连接");
-const isScanRequested = ref(false);
-const scanRequestLabel = ref("");
 const showParticleDevPanel = import.meta.env.DEV;
 const particlePanelOpen = ref(false);
 const particleSceneState = ref<ParticleSceneState>("running");
@@ -102,6 +99,9 @@ const particlePathAnchors = ref<ParticlePathAnchors>({
 let progressSocket: EdgeProgressSocket | null = null;
 let particleAnchorObserver: ResizeObserver | null = null;
 const TRANSPORT_SLOT_COUNT = 9;
+interface RefreshOptions {
+  silent?: boolean;
+}
 
 const viewSummary = computed(() => summary.value ?? emptySummary());
 const disks = computed(() => viewSummary.value.disks);
@@ -245,9 +245,9 @@ watch(
   { immediate: true },
 );
 
-async function refreshFromHttpSummary() {
+async function refreshFromHttpSummary(options: RefreshOptions = {}) {
   if (isRefreshing.value) return;
-  isRefreshing.value = true;
+  if (!options.silent) isRefreshing.value = true;
   httpError.value = null;
   readyError.value = null;
   try {
@@ -278,7 +278,7 @@ async function refreshFromHttpSummary() {
         ? error
         : new DashboardHttpError("DASHBOARD_UNAVAILABLE", error instanceof Error ? error.message : "HTTP summary unavailable");
   } finally {
-    isRefreshing.value = false;
+    if (!options.silent) isRefreshing.value = false;
   }
 }
 
@@ -289,27 +289,6 @@ function selectDisk(disk: EdgeDiskProgress) {
 
 function clearSelectedDisk() {
   selectedDiskDetailVisible.value = false;
-}
-
-async function requestRustFsScan() {
-  if (isScanRequested.value) return;
-  isScanRequested.value = true;
-  scanRequestLabel.value = "正在提交扫描";
-  try {
-    await triggerEdgeRustFsScan();
-    scanRequestLabel.value = "扫描已提交";
-    await refreshFromHttpSummary();
-  } catch (error) {
-    scanRequestLabel.value =
-      error instanceof DashboardHttpError && error.http_status === 401
-        ? "待后端鉴权联调"
-        : "待后端接口联调";
-  } finally {
-    window.setTimeout(() => {
-      isScanRequested.value = false;
-      scanRequestLabel.value = "";
-    }, 2400);
-  }
 }
 
 function clampParticleAnchor(value: number): number {
@@ -323,9 +302,10 @@ function updateParticlePathAnchors() {
   if (!stageRect || !sourceRect || !nasRect || stageRect.width <= 0 || stageRect.height <= 0) return;
 
   particlePathAnchors.value = {
-    startX: clampParticleAnchor((sourceRect.left - stageRect.left + sourceRect.width * 0.9) / stageRect.width),
+    // Both cabinet PNGs include transparent margins. These factors target the visible transfer ports.
+    startX: clampParticleAnchor((sourceRect.left - stageRect.left + sourceRect.width * 0.76) / stageRect.width),
     startY: clampParticleAnchor((sourceRect.top - stageRect.top + sourceRect.height * 0.43) / stageRect.height),
-    endX: clampParticleAnchor((nasRect.left - stageRect.left + nasRect.width * 0.045) / stageRect.width),
+    endX: clampParticleAnchor((nasRect.left - stageRect.left + nasRect.width * 0.105) / stageRect.width),
     endY: clampParticleAnchor((nasRect.top - stageRect.top + nasRect.height * 0.52) / stageRect.height),
   };
 }
@@ -545,6 +525,7 @@ onMounted(() => {
       wsConnected.value = connected;
       wsMessage.value = message;
       if (summary.value) summary.value = { ...summary.value, ws_connected: connected };
+      if (!connected) void refreshFromHttpSummary({ silent: true });
     },
   });
 });
@@ -564,10 +545,7 @@ onBeforeUnmount(() => {
       :ws-tone="wsConnected ? 'ok' : 'quiet'"
       refresh-label="刷新 Dashboard"
       :refresh-disabled="isRefreshing"
-      :scan-label="scanRequestLabel || '扫描 RustFS'"
-      :scan-disabled="isScanRequested"
       @refresh="refreshFromHttpSummary"
-      @scan="requestRustFsScan"
     />
 
     <section ref="runtimeStageRef" class="runtime-stage" aria-label="Edge 导出运行态">

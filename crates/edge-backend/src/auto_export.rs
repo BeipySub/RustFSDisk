@@ -9,10 +9,12 @@ use crate::{
 };
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::{sync::Mutex, time::Duration};
 use uuid::Uuid;
 
-const ACTIVE_EXPORT_JOB_STATUSES: [&str; 3] = ["PENDING", "SCANNING", "COPYING"];
+const ACTIVE_EXPORT_JOB_STATUSES: [&str; 4] = ["PENDING", "SCANNING", "COPYING", "SEALING"];
+const READY_RECHECK_ATTEMPTS: u8 = 5;
+const READY_RECHECK_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 pub struct AutoExportOrchestrator {
@@ -83,6 +85,11 @@ impl AutoExportOrchestrator {
         let decision = self.run_ready_flow(&trigger).await;
         let mut state = self.state.lock().await;
         state.running = false;
+        // A hot-plug notification can arrive before Linux finishes mounting the partition.
+        // Do not consume the cooldown until an initialized disk is actually ready.
+        if decision.outcome == AutoExportOutcome::NoReadyDisk {
+            state.last_attempt_at = None;
+        }
         drop(state);
 
         log_decision(&trigger, &decision);
@@ -254,10 +261,39 @@ impl DiskRescanRunner for AutoExportRescanRunner {
         trigger: DiskRescanTrigger,
     ) -> BoxFuture<'a, Result<usize, DiskDetectionError>> {
         Box::pin(async move {
-            let record_count = self.inner.run_disk_rescan(trigger.clone()).await?;
-            if trigger.source != DiskRescanSource::ControlRefresh {
-                self.orchestrator
-                    .on_transport_disks_refreshed(AutoExportTrigger::from(trigger))
+            let mut record_count = self.inner.run_disk_rescan(trigger.clone()).await?;
+            if trigger.source == DiskRescanSource::ControlRefresh {
+                return Ok(record_count);
+            }
+
+            let mut decision = self
+                .orchestrator
+                .on_transport_disks_refreshed(AutoExportTrigger::from(trigger.clone()))
+                .await;
+
+            if !matches!(
+                trigger.source,
+                DiskRescanSource::Startup | DiskRescanSource::Udev
+            ) {
+                return Ok(record_count);
+            }
+
+            for attempt in 1..=READY_RECHECK_ATTEMPTS {
+                if decision.outcome != AutoExportOutcome::NoReadyDisk {
+                    break;
+                }
+                tracing::info!(
+                    source = ?trigger.source,
+                    device = trigger.device.as_deref(),
+                    attempt,
+                    max_attempts = READY_RECHECK_ATTEMPTS,
+                    "transport disk is not ready yet; retrying disk rescan before auto export"
+                );
+                tokio::time::sleep(READY_RECHECK_DELAY).await;
+                record_count = self.inner.run_disk_rescan(trigger.clone()).await?;
+                decision = self
+                    .orchestrator
+                    .on_transport_disks_refreshed(AutoExportTrigger::from(trigger.clone()))
                     .await;
             }
             Ok(record_count)
@@ -375,6 +411,7 @@ mod tests {
     struct FakeControl {
         disk_status_code: &'static str,
         runtime_status: &'static str,
+        ready_after_summary_calls: Option<usize>,
         active_status: Option<&'static str>,
         stable_object_count: u64,
         export_object_count: u64,
@@ -387,6 +424,7 @@ mod tests {
             Self {
                 disk_status_code: "INITIALIZED",
                 runtime_status: "READY",
+                ready_after_summary_calls: None,
                 active_status: None,
                 stable_object_count: 1,
                 export_object_count: 1,
@@ -500,8 +538,26 @@ mod tests {
 
         fn summary<'a>(&'a self) -> ControlFuture<'a, EdgeControlSummary> {
             Box::pin(async move {
-                self.calls.lock().unwrap().push("summary");
-                let disk = disk_summary(self.disk_status_code, self.runtime_status);
+                let summary_calls = {
+                    let mut calls = self.calls.lock().unwrap();
+                    calls.push("summary");
+                    calls.iter().filter(|call| **call == "summary").count()
+                };
+                let is_ready = self
+                    .ready_after_summary_calls
+                    .is_none_or(|ready_after| summary_calls >= ready_after);
+                let disk = disk_summary(
+                    if is_ready {
+                        self.disk_status_code
+                    } else {
+                        "INITIALIZED"
+                    },
+                    if is_ready {
+                        self.runtime_status
+                    } else {
+                        "CHECKING"
+                    },
+                );
                 let global_progress = EdgeGlobalSummary {
                     total_bytes: 0,
                     done_bytes: 0,
@@ -583,6 +639,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn udev_rescan_rechecks_until_the_disk_is_ready_before_starting_auto_export() {
+        let control = Arc::new(FakeControl {
+            ready_after_summary_calls: Some(2),
+            ..FakeControl::default()
+        });
+        let orchestrator = AutoExportOrchestrator::new(enabled_config(), control.clone());
+        let runner = AutoExportRescanRunner::new(Arc::new(NoopRescanRunner), orchestrator);
+
+        runner
+            .run_disk_rescan(DiskRescanTrigger::udev(Some("/dev/sdb1".to_owned())))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            control.calls.lock().unwrap().as_slice(),
+            &[
+                "summary",
+                "summary",
+                "export_jobs",
+                "export_jobs",
+                "export_jobs",
+                "export_jobs",
+                "scan_once",
+                "create_export_job",
+                "start_export_job"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn sealing_export_job_blocks_duplicate_auto_start() {
+        let control = Arc::new(FakeControl {
+            active_status: Some("SEALING"),
+            ..FakeControl::default()
+        });
+        let orchestrator = AutoExportOrchestrator::new(enabled_config(), control.clone());
+
+        let decision = orchestrator.on_transport_disks_refreshed(trigger()).await;
+
+        assert_eq!(decision.outcome, AutoExportOutcome::ActiveExportJob);
+        assert_eq!(
+            control.calls.lock().unwrap().as_slice(),
+            &[
+                "summary",
+                "export_jobs",
+                "export_jobs",
+                "export_jobs",
+                "export_jobs"
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn cooldown_blocks_repeated_udev_events_before_scan_or_export() {
         let control = Arc::new(FakeControl::default());
         let orchestrator = AutoExportOrchestrator::new(
@@ -602,6 +711,7 @@ mod tests {
             control.calls.lock().unwrap().as_slice(),
             &[
                 "summary",
+                "export_jobs",
                 "export_jobs",
                 "export_jobs",
                 "export_jobs",
@@ -629,6 +739,7 @@ mod tests {
                 "export_jobs",
                 "export_jobs",
                 "export_jobs",
+                "export_jobs",
                 "scan_once",
                 "create_export_job",
                 "start_export_job"
@@ -651,6 +762,7 @@ mod tests {
             control.calls.lock().unwrap().as_slice(),
             &[
                 "summary",
+                "export_jobs",
                 "export_jobs",
                 "export_jobs",
                 "export_jobs",
@@ -703,6 +815,7 @@ mod tests {
         runtime_status: &str,
     ) -> crate::control::DiskRuntimeSummary {
         crate::control::DiskRuntimeSummary {
+            disk_presence_id: Some(Uuid::new_v4().to_string()),
             hardware_serial: "SN-A".to_owned(),
             disk_sn: "SN-A".to_owned(),
             stable_hardware_id: "fs-uuid-a".to_owned(),

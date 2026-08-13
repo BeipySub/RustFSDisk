@@ -1,9 +1,10 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
     process::Command,
+    sync::{Arc, Mutex},
 };
 
 use chrono::{DateTime, Utc};
@@ -201,6 +202,7 @@ impl PartialResidue {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DiskRuntimeRecord {
+    pub disk_presence_id: String,
     pub sn: String,
     pub fs_uuid: Option<String>,
     pub label: Option<String>,
@@ -298,6 +300,7 @@ pub struct EdgeDiskDetector<P, L, E = NoopDiskRuntimeEventPublisher> {
     probe: P,
     ledger: L,
     event_publisher: E,
+    presence_by_location: Arc<Mutex<HashMap<(String, Option<String>), String>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -430,6 +433,7 @@ impl DiskRuntimeLedger for PgDiskRuntimeLedger {
             sqlx::query(
                 r#"
                 INSERT INTO disk_runtime (
+                    disk_presence_id,
                     sn,
                     disk_id,
                     device_path,
@@ -445,9 +449,10 @@ impl DiskRuntimeLedger for PgDiskRuntimeLedger {
                     partial_residue_bytes,
                     last_seen_at
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
                 "#,
             )
+            .bind(Uuid::parse_str(&record.disk_presence_id).ok())
             .bind(&record.sn)
             .bind(disk_id)
             .bind(&record.device_path)
@@ -505,6 +510,7 @@ impl DiskRuntimeLedger for PgDiskRuntimeLedger {
                     COALESCE(disk_id::text, device_path || '|' || COALESCE(mount_path, ''))
                 )
                     sn,
+                    disk_presence_id,
                     disk_id,
                     device_path,
                     mount_path,
@@ -547,6 +553,10 @@ impl DiskRuntimeLedger for PgDiskRuntimeLedger {
                 }
 
                 let record = DiskRuntimeRecord {
+                    disk_presence_id: row
+                        .get::<Option<Uuid>, _>("disk_presence_id")
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| Uuid::new_v4().to_string()),
                     sn: row.get("sn"),
                     fs_uuid: None,
                     label: None,
@@ -600,6 +610,7 @@ async fn insert_disk_runtime_record(
     sqlx::query(
         r#"
         INSERT INTO disk_runtime (
+            disk_presence_id,
             sn,
             disk_id,
             device_path,
@@ -615,9 +626,10 @@ async fn insert_disk_runtime_record(
             partial_residue_bytes,
             last_seen_at
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
         "#,
     )
+    .bind(Uuid::parse_str(&record.disk_presence_id).ok())
     .bind(&record.sn)
     .bind(disk_id)
     .bind(&record.device_path)
@@ -665,6 +677,7 @@ where
             probe,
             ledger,
             event_publisher,
+            presence_by_location: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -675,9 +688,9 @@ where
         let mut records = Vec::with_capacity(disks.len());
 
         for disk in disks {
-            let detected = base_record(&disk);
+            let detected = self.base_record(&disk);
             self.event_publisher.publish_disk_runtime(&detected);
-            let record = self.evaluate_disk(disk).await?;
+            let record = self.evaluate_disk(disk, detected).await?;
             self.ledger.record_disk_runtime(record.clone()).await?;
             self.event_publisher.publish_disk_runtime(&record);
             records.push(record);
@@ -685,6 +698,10 @@ where
 
         let removed_records = self.ledger.mark_missing_disks_removed(&records).await?;
         for record in &removed_records {
+            self.presence_by_location
+                .lock()
+                .expect("disk presence mutex poisoned")
+                .remove(&(record.device_path.clone(), record.mount_path.clone()));
             self.event_publisher.publish_disk_runtime(record);
         }
         records.extend(removed_records);
@@ -701,9 +718,8 @@ where
     async fn evaluate_disk(
         &self,
         disk: DetectedDisk,
+        mut record: DiskRuntimeRecord,
     ) -> Result<DiskRuntimeRecord, DiskDetectionError> {
-        let mut record = base_record(&disk);
-
         if disk.filesystem != SUPPORTED_FILESYSTEM {
             reject(
                 &mut record,
@@ -821,22 +837,44 @@ where
         }
 
         record.disk_enabled = Some(true);
-        if status_code == DiskStatusCode::Initialized {
-            record.runtime_status = RuntimeStatus::Ready.as_db_value().to_string();
-            record.task_pool_eligible = true;
-        } else {
-            reject(
-                &mut record,
-                RuntimeStatus::Rejected,
-                DiskErrorCode::ManifestInvalid,
-                format!(
-                    "disk status_code {} is not eligible for offline edge export; expected INITIALIZED",
-                    status_code.as_protocol_value()
-                ),
-            );
+        match status_code {
+            DiskStatusCode::Initialized => {
+                record.runtime_status = RuntimeStatus::Ready.as_db_value().to_string();
+                record.task_pool_eligible = true;
+            }
+            DiskStatusCode::Sealed => {
+                // SEALED is a valid terminal state on Edge, not a malformed transport disk.
+                record.runtime_status = RuntimeStatus::Done.as_db_value().to_string();
+            }
+            _ => {
+                reject(
+                    &mut record,
+                    RuntimeStatus::Rejected,
+                    DiskErrorCode::ManifestInvalid,
+                    format!(
+                        "disk status_code {} is not eligible for offline edge export; expected INITIALIZED",
+                        status_code.as_protocol_value()
+                    ),
+                );
+            }
         }
 
         Ok(record)
+    }
+
+    fn base_record(&self, disk: &DetectedDisk) -> DiskRuntimeRecord {
+        let location = (
+            disk.device_path.clone(),
+            Some(disk.mount_path.display().to_string()),
+        );
+        let disk_presence_id = self
+            .presence_by_location
+            .lock()
+            .expect("disk presence mutex poisoned")
+            .entry(location)
+            .or_insert_with(|| Uuid::new_v4().to_string())
+            .clone();
+        base_record(disk, disk_presence_id)
     }
 }
 
@@ -848,11 +886,12 @@ fn has_center_signature(disk_info: &DiskInfo) -> bool {
         .is_some_and(|value| !value.trim().is_empty())
 }
 
-fn base_record(disk: &DetectedDisk) -> DiskRuntimeRecord {
+fn base_record(disk: &DetectedDisk, disk_presence_id: String) -> DiskRuntimeRecord {
     let reserve_bytes = calculate_reserve_bytes(disk.free_bytes);
     let object_budget_bytes = calculate_object_budget_bytes(disk.free_bytes);
 
     DiskRuntimeRecord {
+        disk_presence_id,
         sn: disk.sn.clone(),
         fs_uuid: disk.fs_uuid.clone(),
         label: disk.label.clone(),
@@ -1196,6 +1235,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct MockEventPublisher {
         runtime_statuses: Arc<Mutex<Vec<String>>>,
+        disk_presence_ids: Arc<Mutex<Vec<String>>>,
     }
 
     impl DiskRuntimeEventPublisher for MockEventPublisher {
@@ -1204,6 +1244,10 @@ mod tests {
                 .lock()
                 .expect("runtime status mutex poisoned")
                 .push(record.runtime_status.clone());
+            self.disk_presence_ids
+                .lock()
+                .expect("disk presence mutex poisoned")
+                .push(record.disk_presence_id.clone());
         }
     }
 
@@ -1400,6 +1444,11 @@ mod tests {
             publisher.runtime_statuses.lock().unwrap().as_slice(),
             &["DETECTED", "CHECKING", "READY"]
         );
+        let disk_presence_ids = publisher.disk_presence_ids.lock().unwrap();
+        assert_eq!(disk_presence_ids.len(), 3);
+        assert!(disk_presence_ids
+            .iter()
+            .all(|value| value == &disk_presence_ids[0]));
         fs::remove_dir_all(mount).ok();
     }
 
@@ -1407,7 +1456,7 @@ mod tests {
     async fn empty_rescan_marks_previous_runtime_removed_and_publishes_event() {
         let mount = temp_mount("removed-rescan");
         write_disk_info(&mount, "INITIALIZED");
-        let mut previous = base_record(&disk(&mount, "ext4"));
+        let mut previous = base_record(&disk(&mount, "ext4"), Uuid::new_v4().to_string());
         previous.disk_id = Some("11111111-1111-1111-1111-111111111111".to_string());
         previous.runtime_status = RuntimeStatus::Ready.as_db_value().to_string();
         previous.status_code = Some("INITIALIZED".to_string());
@@ -1438,7 +1487,7 @@ mod tests {
     #[tokio::test]
     async fn empty_rescan_marks_previous_uninitialized_candidate_removed_by_location() {
         let mount = temp_mount("removed-uninitialized-candidate");
-        let mut previous = base_record(&disk(&mount, "ext4"));
+        let mut previous = base_record(&disk(&mount, "ext4"), Uuid::new_v4().to_string());
         previous.runtime_status = RuntimeStatus::Rejected.as_db_value().to_string();
         previous.status_code = Some("UNREGISTERED".to_string());
         previous.last_error_code = Some(DiskErrorCode::ManifestInvalid.as_db_value().to_string());
@@ -1507,18 +1556,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_non_initialized_disk_without_center_verify() {
+    async fn recognizes_sealed_disk_as_completed_without_center_verify() {
         let mount = temp_mount("not-initialized");
         write_disk_info(&mount, "SEALED");
         let detector = detector(vec![disk(&mount, "ext4")], MockLedger::default());
 
         let records = detector.scan_existing_transport_disks().await.unwrap();
 
-        assert_eq!(records[0].runtime_status, "REJECTED");
-        assert_eq!(
-            records[0].last_error_code.as_deref(),
-            Some("MANIFEST_INVALID")
-        );
+        assert_eq!(records[0].runtime_status, "DONE");
+        assert!(records[0].last_error_code.is_none());
         assert_eq!(records[0].status_code.as_deref(), Some("SEALED"));
         assert_eq!(records[0].disk_enabled, Some(true));
         assert!(!records[0].task_pool_eligible);

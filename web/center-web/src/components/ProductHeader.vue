@@ -1,6 +1,6 @@
 <script setup lang="ts">
 interface Props {
-  currentPath: "/dashboard" | "/sync-records";
+  currentPath: "/dashboard" | "/sync-records" | "/edge-sites";
   edgeIdentity: string;
 }
 
@@ -9,6 +9,7 @@ defineProps<Props>();
 const emit = defineEmits<{
   dashboard: [];
   syncRecords: [];
+  edgeSites: [];
 }>();
 </script>
 
@@ -33,6 +34,14 @@ const emit = defineEmits<{
         @click="emit('syncRecords')"
       >
         同步记录
+      </button>
+      <button
+        :aria-current="currentPath === '/edge-sites' ? 'page' : undefined"
+        :class="{ active: currentPath === '/edge-sites' }"
+        type="button"
+        @click="emit('edgeSites')"
+      >
+        Edge 管理
       </button>
     </nav>
   </header>

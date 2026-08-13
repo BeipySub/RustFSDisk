@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CurrentObjectProgress {
@@ -20,6 +21,8 @@ pub struct CurrentObjectProgress {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DiskProgressSnapshot {
+    #[serde(default)]
+    pub disk_presence_id: String,
     pub disk_id: String,
     pub disk_sn: String,
     #[serde(default)]
@@ -126,12 +129,20 @@ pub struct DashboardExportJobSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CopyProgressEvent {
+    #[serde(default)]
+    pub protocol_version: String,
+    #[serde(default)]
+    pub event_id: String,
     pub event_type: String,
     pub event_time: DateTime<Utc>,
     pub source: String,
     pub edge_code: String,
     #[serde(default)]
+    pub stage: Option<String>,
+    #[serde(default)]
     pub edge_name: String,
+    #[serde(default)]
+    pub scan: Option<Value>,
     #[serde(default)]
     pub object_inventory: ObjectInventorySnapshot,
     #[serde(default)]
@@ -358,6 +369,7 @@ impl ProgressAggregator {
                     .map(|object| object.done_bytes)
                     .unwrap_or(0);
                 DiskProgressSnapshot {
+                    disk_presence_id: String::new(),
                     disk_id: disk.disk_id.clone(),
                     disk_sn: disk.disk_sn.clone(),
                     hardware_serial: disk.disk_sn.clone(),
@@ -420,6 +432,8 @@ impl ProgressAggregator {
         };
 
         CopyProgressEvent {
+            protocol_version: "edge-ws-v2".to_string(),
+            event_id: uuid::Uuid::new_v4().to_string(),
             event_type: if requested_event_type == "COPY_PROGRESS" {
                 state.event_type.clone()
             } else {
@@ -428,7 +442,9 @@ impl ProgressAggregator {
             event_time: Utc::now(),
             source: "edge".to_string(),
             edge_code: state.edge_code.clone(),
+            stage: Some(copy_stage(&state.event_type).to_string()),
             edge_name: state.edge_code.clone(),
+            scan: None,
             object_inventory: ObjectInventorySnapshot::default(),
             export_job: Some(export_job),
             global: global_progress.clone(),
@@ -447,5 +463,14 @@ fn percent(done_bytes: u64, total_bytes: u64) -> f64 {
         0.0
     } else {
         (done_bytes as f64 / total_bytes as f64) * 100.0
+    }
+}
+
+fn copy_stage(event_type: &str) -> &'static str {
+    match event_type {
+        "COPY_DONE" => "SEALING",
+        "SEAL_DONE" => "SEALED",
+        "ERROR" => "FAILED",
+        _ => "COPYING",
     }
 }

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, RwLock};
 
 use crate::{
     disk_detection::{DiskRuntimeEventPublisher, DiskRuntimeRecord},
@@ -16,19 +16,30 @@ pub struct EdgeRealtimeHub {
     edge_code: Arc<str>,
     latest_disk_event: Arc<RwLock<Option<CopyProgressEvent>>>,
     current_disks: Arc<RwLock<Vec<DiskProgressSnapshot>>>,
+    sender: broadcast::Sender<CopyProgressEvent>,
 }
 
 impl EdgeRealtimeHub {
     pub fn new(edge_code: impl Into<String>) -> Self {
+        let (sender, _) = broadcast::channel(256);
         Self {
             edge_code: Arc::<str>::from(edge_code.into()),
             latest_disk_event: Arc::new(RwLock::new(None)),
             current_disks: Arc::new(RwLock::new(Vec::new())),
+            sender,
         }
     }
 
     pub async fn latest_disk_event(&self) -> Option<CopyProgressEvent> {
         self.latest_disk_event.read().await.clone()
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<CopyProgressEvent> {
+        self.sender.subscribe()
+    }
+
+    pub fn publish_event(&self, event: CopyProgressEvent) {
+        let _ = self.sender.send(event);
     }
 }
 
@@ -36,26 +47,30 @@ impl DiskRuntimeEventPublisher for EdgeRealtimeHub {
     fn publish_disk_runtime(&self, record: &DiskRuntimeRecord) {
         let hub = self.latest_disk_event.clone();
         let current_disks = self.current_disks.clone();
+        let sender = self.sender.clone();
         let edge_code = self.edge_code.clone();
         let record = record.clone();
         tokio::spawn(async move {
             let message = disk_runtime_message(&record);
             let mut disks = current_disks.write().await;
+            let changed_snapshot = disk_progress_snapshot(&record, message.clone());
             if record.runtime_status == "REMOVED" {
                 disks.retain(|snapshot| !same_disk_snapshot(snapshot, &record));
             } else {
-                let snapshot = disk_progress_snapshot(&record, message.clone());
                 if let Some(existing) = disks
                     .iter_mut()
                     .find(|snapshot| same_disk_snapshot(snapshot, &record))
                 {
-                    *existing = snapshot;
+                    *existing = changed_snapshot.clone();
                 } else {
-                    disks.push(snapshot);
+                    disks.push(changed_snapshot.clone());
                 }
             }
-            let event = disk_runtime_event(&edge_code, &record, disks.clone(), message);
+            let event = disk_runtime_event(&edge_code, &record, vec![changed_snapshot], message);
             *hub.write().await = Some(event);
+            if let Some(event) = hub.read().await.clone() {
+                let _ = sender.send(event);
+            }
         });
     }
 }
@@ -67,15 +82,8 @@ fn disk_runtime_event(
     message: String,
 ) -> CopyProgressEvent {
     let event_type = match record.runtime_status.as_str() {
-        "DETECTED" => "DISK_DETECTED",
-        "CHECKING" => "DISK_CHECKING",
-        "READY" => "DISK_READY",
-        "REJECTED" => "DISK_REJECTED",
-        "REMOVED" => "DISK_REMOVED",
-        "ERROR" => "ERROR",
-        "COPYING" => "COPY_PROGRESS",
-        "DONE" => "COPY_DONE",
-        _ => "DISK_RUNTIME_CHANGED",
+        "REMOVED" => "DISK_UNPLUGGED",
+        _ => "DISK_PLUGGED",
     };
     let global_progress = GlobalProgressSnapshot {
         total_bytes: 0,
@@ -88,11 +96,15 @@ fn disk_runtime_event(
         percent: 0.0,
     };
     CopyProgressEvent {
+        protocol_version: "edge-ws-v2".to_string(),
+        event_id: uuid::Uuid::new_v4().to_string(),
         event_type: event_type.to_string(),
         event_time: Utc::now(),
         source: "edge".to_string(),
         edge_code: edge_code.to_string(),
+        stage: None,
         edge_name: edge_code.to_string(),
+        scan: None,
         object_inventory: ObjectInventorySnapshot::default(),
         export_job: None,
         global: global_progress.clone(),
@@ -121,6 +133,7 @@ fn disk_progress_snapshot(record: &DiskRuntimeRecord, message: String) -> DiskPr
         .clone()
         .unwrap_or_else(|| "UNREGISTERED".to_string());
     DiskProgressSnapshot {
+        disk_presence_id: record.disk_presence_id.clone(),
         disk_id: record.disk_id.clone().unwrap_or_default(),
         disk_sn: record.sn.clone(),
         hardware_serial: record.sn.clone(),
@@ -205,7 +218,9 @@ mod tests {
         tokio::task::yield_now().await;
         let value = serde_json::to_value(hub.latest_disk_event().await.unwrap()).unwrap();
 
-        assert_eq!(value["event_type"], "DISK_READY");
+        assert_eq!(value["protocol_version"], "edge-ws-v2");
+        assert!(value["event_id"].is_string());
+        assert_eq!(value["event_type"], "DISK_PLUGGED");
         assert_eq!(value["source"], "edge");
         assert_eq!(value["edge_name"], "edge-a");
         assert!(value.get("export_job_id").is_none());
@@ -260,7 +275,7 @@ mod tests {
         tokio::task::yield_now().await;
         let value = serde_json::to_value(hub.latest_disk_event().await.unwrap()).unwrap();
 
-        assert_eq!(value["event_type"], "DISK_REJECTED");
+        assert_eq!(value["event_type"], "DISK_PLUGGED");
         assert_eq!(value["disks"][0]["runtime_status"], "REJECTED");
         assert_eq!(value["disks"][0]["disk_status_code"], "UNREGISTERED");
         assert!(value.get("export_job_id").is_none());
@@ -274,7 +289,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn removed_disk_event_publishes_remaining_current_disk_snapshot() {
+    async fn removed_disk_event_publishes_removed_disk_snapshot() {
         let hub = EdgeRealtimeHub::new("edge-a");
         let disk_a = runtime_record(
             "SN-A",
@@ -302,13 +317,10 @@ mod tests {
 
         let value = serde_json::to_value(hub.latest_disk_event().await.unwrap()).unwrap();
 
-        assert_eq!(value["event_type"], "DISK_REMOVED");
+        assert_eq!(value["event_type"], "DISK_UNPLUGGED");
         assert_eq!(value["disks"].as_array().unwrap().len(), 1);
+        assert_eq!(value["disks"][0]["runtime_status"], "REMOVED");
         assert_eq!(
-            value["disks"][0]["mount_path"],
-            "/mnt/rustfs-transfer/disk-b"
-        );
-        assert_ne!(
             value["disks"][0]["mount_path"],
             "/mnt/rustfs-transfer/disk-a"
         );
@@ -345,25 +357,21 @@ mod tests {
         tokio::task::yield_now().await;
 
         let value = serde_json::to_value(hub.latest_disk_event().await.unwrap()).unwrap();
-        assert_eq!(value["event_type"], "DISK_REJECTED");
-        assert_eq!(value["disks"].as_array().unwrap().len(), 2);
+        assert_eq!(value["event_type"], "DISK_PLUGGED");
+        assert_eq!(value["disks"].as_array().unwrap().len(), 1);
         assert_eq!(
             value["disks"][0]["mount_path"],
-            "/mnt/rustfs-transfer/disk-a"
-        );
-        assert_eq!(
-            value["disks"][1]["mount_path"],
             "/mnt/rustfs-transfer/disk-b"
         );
 
         hub.publish_disk_runtime(&removed_a);
         tokio::task::yield_now().await;
         let value = serde_json::to_value(hub.latest_disk_event().await.unwrap()).unwrap();
-        assert_eq!(value["event_type"], "DISK_REMOVED");
+        assert_eq!(value["event_type"], "DISK_UNPLUGGED");
         assert_eq!(value["disks"].as_array().unwrap().len(), 1);
         assert_eq!(
             value["disks"][0]["mount_path"],
-            "/mnt/rustfs-transfer/disk-b"
+            "/mnt/rustfs-transfer/disk-a"
         );
     }
 
@@ -390,7 +398,7 @@ mod tests {
         tokio::task::yield_now().await;
 
         let value = serde_json::to_value(hub.latest_disk_event().await.unwrap()).unwrap();
-        assert_eq!(value["event_type"], "DISK_REJECTED");
+        assert_eq!(value["event_type"], "DISK_PLUGGED");
         assert_eq!(value["disks"].as_array().unwrap().len(), 1);
         assert_eq!(
             value["disks"][0]["disk_id"],
@@ -401,8 +409,9 @@ mod tests {
         tokio::task::yield_now().await;
 
         let value = serde_json::to_value(hub.latest_disk_event().await.unwrap()).unwrap();
-        assert_eq!(value["event_type"], "DISK_REMOVED");
-        assert_eq!(value["disks"].as_array().unwrap().len(), 0);
+        assert_eq!(value["event_type"], "DISK_UNPLUGGED");
+        assert_eq!(value["disks"].as_array().unwrap().len(), 1);
+        assert_eq!(value["disks"][0]["runtime_status"], "REMOVED");
     }
 
     fn runtime_record(
@@ -412,6 +421,7 @@ mod tests {
         runtime_status: &str,
     ) -> DiskRuntimeRecord {
         DiskRuntimeRecord {
+            disk_presence_id: uuid::Uuid::new_v4().to_string(),
             sn: sn.to_string(),
             fs_uuid: Some(format!("fs-uuid-{sn}")),
             label: Some(format!("RUSTFS-{sn}")),
