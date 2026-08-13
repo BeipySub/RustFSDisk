@@ -330,6 +330,7 @@ async fn publish_edge_copy_progress(
     edge_code: String,
 ) {
     let mut interval = time::interval(Duration::from_secs(1));
+    let mut last_object_inventory: Option<ObjectInventorySnapshot> = None;
     loop {
         interval.tick().await;
         let copy_event = match control.copy_progress_snapshot().await {
@@ -366,11 +367,44 @@ async fn publish_edge_copy_progress(
         } else {
             idle_copy_progress_event(&edge_code)
         };
+        let Some(event) =
+            attach_summary_object_inventory(control.as_ref(), event, &mut last_object_inventory)
+                .await
+        else {
+            continue;
+        };
         let Ok(payload) = serde_json::to_string(&event) else {
             break;
         };
         if socket.send(Message::Text(payload.into())).await.is_err() {
             break;
+        }
+    }
+}
+
+async fn attach_summary_object_inventory(
+    control: &dyn EdgeControlService,
+    mut event: CopyProgressEvent,
+    last_object_inventory: &mut Option<ObjectInventorySnapshot>,
+) -> Option<CopyProgressEvent> {
+    match control.summary().await {
+        Ok(summary) => {
+            event.object_inventory = summary.object_inventory.clone();
+            *last_object_inventory = Some(summary.object_inventory);
+            Some(event)
+        }
+        Err(error) => {
+            tracing::warn!(
+                error_code = error.error_code,
+                message = error.message,
+                "failed to load edge object inventory for websocket snapshot"
+            );
+            if let Some(inventory) = last_object_inventory.clone() {
+                event.object_inventory = inventory;
+                Some(event)
+            } else {
+                None
+            }
         }
     }
 }
@@ -1371,6 +1405,28 @@ mod tests {
         assert!(value["disks"][0].get("filesystem_type").is_some());
         assert!(value["disks"][0].get("task_pool_eligible").is_some());
         assert!(value.get("status").is_none());
+    }
+
+    #[tokio::test]
+    async fn websocket_event_uses_summary_object_inventory_instead_of_default_zero() {
+        let control = FakeControl::default();
+        let event = idle_copy_progress_event("edge-a");
+        assert_eq!(event.object_inventory.total_count, 0);
+
+        let mut last_object_inventory = None;
+        let event = attach_summary_object_inventory(&control, event, &mut last_object_inventory)
+            .await
+            .expect("summary inventory should be attached");
+
+        assert_eq!(event.object_inventory.total_bytes, 99);
+        assert_eq!(event.object_inventory.exported_bytes, 10);
+        assert_eq!(event.object_inventory.total_count, 2);
+        assert_eq!(event.object_inventory.exported_count, 1);
+        assert_eq!(
+            last_object_inventory.expect("cached inventory").total_count,
+            2
+        );
+        assert_eq!(control.calls.lock().unwrap().as_slice(), &["summary"]);
     }
 
     #[test]

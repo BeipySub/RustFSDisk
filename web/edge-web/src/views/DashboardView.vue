@@ -56,7 +56,6 @@ function emptySummary(): EdgeDashboardSummary {
       exported_count: 0,
     },
     export_job: null,
-    disk_status_code: undefined,
     global_progress: {
       total_bytes: 0,
       done_bytes: 0,
@@ -129,21 +128,27 @@ const globalProgressPercent = computed(() =>
 );
 const objectInventory = computed(() => {
   const inventory = viewSummary.value.object_inventory;
+  const exportedBytes =
+    inventory?.exported_bytes ||
+    currentExportJob.value?.done_bytes ||
+    viewSummary.value.global_progress.done_bytes ||
+    0;
+  const exportedCount =
+    inventory?.exported_count ||
+    currentExportJob.value?.object_done ||
+    viewSummary.value.global_progress.object_done ||
+    0;
   return {
     total_bytes: inventory?.total_bytes ?? viewSummary.value.global_progress.total_bytes,
-    exported_bytes: inventory?.exported_bytes ?? currentExportJob.value?.done_bytes ?? viewSummary.value.global_progress.done_bytes,
+    exported_bytes: exportedBytes,
     total_count: inventory?.total_count ?? viewSummary.value.global_progress.object_total,
-    exported_count: inventory?.exported_count ?? viewSummary.value.global_progress.object_done,
+    exported_count: exportedCount,
   };
 });
 const rustFsObjectTotal = computed(() => objectInventory.value.total_count);
-const discoveredObjectCount = computed(() =>
-  Math.max(0, objectInventory.value.total_count - objectInventory.value.exported_count),
-);
+const rustFsTotalBytesLabel = computed(() => formatBytes(objectInventory.value.total_bytes));
 const exportedInventoryObjectCount = computed(() => objectInventory.value.exported_count);
-const inventoryExportPercent = computed(() =>
-  progressPercent(objectInventory.value.exported_count, objectInventory.value.total_count),
-);
+const exportedInventoryBytesLabel = computed(() => formatBytes(objectInventory.value.exported_bytes));
 const runningDisks = computed(() => disks.value.filter((disk) => disk.runtime_status === "COPYING").length);
 const readyDisks = computed(() => disks.value.filter((disk) => disk.runtime_status === "READY" || disk.runtime_status === "DONE").length);
 const removedDisks = computed(() => disks.value.filter((disk) => disk.runtime_status === "REMOVED").length);
@@ -768,9 +773,9 @@ onBeforeUnmount(() => {
         <h2>扫描与导出概览</h2>
         <dl class="overview-metrics">
           <div><dt>RustFS对象总数</dt><dd>{{ rustFsObjectTotal.toLocaleString() }}</dd></div>
-          <div><dt>已发现对象</dt><dd>{{ discoveredObjectCount.toLocaleString() }}</dd></div>
+          <div><dt>总数据量</dt><dd>{{ rustFsTotalBytesLabel }}</dd></div>
           <div><dt>已导出对象</dt><dd>{{ exportedInventoryObjectCount.toLocaleString() }}</dd></div>
-          <div><dt>导出进度</dt><dd>{{ inventoryExportPercent.toFixed(2) }}%</dd></div>
+          <div><dt>已导出数据量</dt><dd>{{ exportedInventoryBytesLabel }}</dd></div>
         </dl>
       </article>
 

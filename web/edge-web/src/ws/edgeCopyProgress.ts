@@ -112,12 +112,28 @@ export function applyCopyProgressEvent(
   event: CopyProgressEvent,
 ): EdgeDashboardSummary {
   const next = normalizeEdgeDashboardSummary(event);
+  const objectInventory = hasUsableObjectInventory(event.object_inventory)
+    ? next.object_inventory
+    : summary.object_inventory;
   return {
     ...next,
+    object_inventory: objectInventory,
     ws_connected: true,
     last_http_refresh_at: next.last_http_refresh_at || summary.last_http_refresh_at,
     message: next.message || event.message || summary.message,
   };
+}
+
+function hasUsableObjectInventory(
+  value: EdgeDashboardSummary["object_inventory"] | undefined,
+): boolean {
+  if (!value) return false;
+  return (
+    value.total_bytes > 0 ||
+    value.exported_bytes > 0 ||
+    value.total_count > 0 ||
+    value.exported_count > 0
+  );
 }
 
 export function toWebSocketUrl(path: string): string {

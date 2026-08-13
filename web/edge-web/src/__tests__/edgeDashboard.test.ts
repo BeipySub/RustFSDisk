@@ -75,7 +75,6 @@ test("normalizes summary and keeps imported disk lifecycle visible in Edge UI", 
   const summary = normalizeEdgeDashboardSummary({
     source: "edge",
     edge_code: "edge-hz-01",
-    disk_status_code: "IMPORTED",
     object_inventory: {
       total_bytes: 100,
       exported_bytes: 30,
@@ -102,7 +101,7 @@ test("normalizes summary and keeps imported disk lifecycle visible in Edge UI", 
     ],
   });
 
-  assert.equal(summary.disk_status_code, "IMPORTED");
+  assert.equal("disk_status_code" in summary, false);
   assert.equal(summary.disks[0]?.disk_status_code, "IMPORTED");
   assert.equal(diskStatusDisplay(summary.disks[0]?.disk_status_code), "已导入");
 });
@@ -697,7 +696,6 @@ test("does not resurrect a removed disk when HTTP summary has no current disks",
     event_time: "2026-08-12T10:23:01Z",
     source: "edge",
     edge_code: "edge-demo",
-    disk_status_code: "UNREGISTERED",
     export_job: exportJob("", "PENDING"),
     global_progress: {
       total_bytes: 0,
@@ -716,6 +714,146 @@ test("does not resurrect a removed disk when HTTP summary has no current disks",
   assert.equal(merged.disks.length, 0);
   assert.equal(merged.ws_connected, true);
   assert.equal(merged.message, "DISK_REMOVED");
+});
+
+test("preserves HTTP object inventory when websocket omits inventory", () => {
+  const summary = normalizeEdgeDashboardSummary({
+    source: "edge",
+    edge_code: "edge-demo",
+    edge_name: "edge-demo",
+    object_inventory: {
+      total_bytes: 3331017885,
+      exported_bytes: 1428414961,
+      total_count: 173,
+      exported_count: 59,
+    },
+    global_progress: {
+      total_bytes: 3331017885,
+      done_bytes: 1428414961,
+      remaining_bytes: 1902602924,
+      speed_bytes_per_sec: 0,
+      object_total: 173,
+      object_done: 59,
+      object_remaining: 114,
+    },
+    disks: [],
+    ws_connected: false,
+    last_http_refresh_at: "2026-08-11T05:32:02Z",
+    message: "summary",
+  });
+
+  const merged = applyCopyProgressEvent(summary, {
+    event_type: "DISK_REMOVED",
+    event_time: "2026-08-11T05:34:00Z",
+    source: "edge",
+    edge_code: "edge-demo",
+    disks: [],
+    message: "removed",
+  });
+
+  assert.deepEqual(merged.object_inventory, summary.object_inventory);
+});
+
+test("preserves HTTP object inventory when websocket sends default zero inventory", () => {
+  const summary = normalizeEdgeDashboardSummary({
+    source: "edge",
+    edge_code: "edge-demo",
+    edge_name: "edge-demo",
+    object_inventory: {
+      total_bytes: 3331017885,
+      exported_bytes: 1428414961,
+      total_count: 173,
+      exported_count: 59,
+    },
+    global_progress: {
+      total_bytes: 3331017885,
+      done_bytes: 1428414961,
+      remaining_bytes: 1902602924,
+      speed_bytes_per_sec: 0,
+      object_total: 173,
+      object_done: 59,
+      object_remaining: 114,
+    },
+    disks: [],
+    ws_connected: false,
+    last_http_refresh_at: "2026-08-11T05:32:02Z",
+    message: "summary",
+  });
+
+  const merged = applyCopyProgressEvent(summary, {
+    event_type: "DISK_REMOVED",
+    event_time: "2026-08-11T05:34:00Z",
+    source: "edge",
+    edge_code: "edge-demo",
+    object_inventory: {
+      total_bytes: 0,
+      exported_bytes: 0,
+      total_count: 0,
+      exported_count: 0,
+    },
+    disks: [],
+    message: "removed",
+  });
+
+  assert.deepEqual(merged.object_inventory, summary.object_inventory);
+});
+
+test("accepts real object inventory from websocket", () => {
+  const summary = normalizeEdgeDashboardSummary({
+    source: "edge",
+    edge_code: "edge-demo",
+    edge_name: "edge-demo",
+    object_inventory: {
+      total_bytes: 100,
+      exported_bytes: 20,
+      total_count: 5,
+      exported_count: 1,
+    },
+    global_progress: {
+      total_bytes: 100,
+      done_bytes: 20,
+      remaining_bytes: 80,
+      speed_bytes_per_sec: 0,
+      object_total: 5,
+      object_done: 1,
+      object_remaining: 4,
+    },
+    disks: [],
+    ws_connected: false,
+    last_http_refresh_at: "2026-08-11T05:32:02Z",
+    message: "summary",
+  });
+
+  const merged = applyCopyProgressEvent(summary, {
+    event_type: "SCAN_DONE",
+    event_time: "2026-08-11T05:34:00Z",
+    source: "edge",
+    edge_code: "edge-demo",
+    object_inventory: {
+      total_bytes: 240,
+      exported_bytes: 80,
+      total_count: 12,
+      exported_count: 4,
+    },
+    global_progress: {
+      total_bytes: 240,
+      done_bytes: 80,
+      remaining_bytes: 160,
+      speed_bytes_per_sec: 0,
+      object_total: 12,
+      object_done: 4,
+      object_remaining: 8,
+    },
+    disks: [],
+    message: "scan done",
+  });
+
+  assert.deepEqual(merged.object_inventory, {
+    total_bytes: 240,
+    exported_bytes: 80,
+    total_count: 12,
+    exported_count: 4,
+  });
 });
 
 test("keeps imported lifecycle when websocket updates rejected runtime", () => {

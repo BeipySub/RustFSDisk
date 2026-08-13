@@ -125,7 +125,6 @@ export interface EdgeDashboardSummary {
   edge_status?: EdgeStatus;
   object_inventory?: EdgeObjectInventory;
   export_job?: EdgeExportJobSnapshot | null;
-  disk_status_code?: EdgeVisibleDiskStatusCode;
   global?: EdgeGlobalProgress;
   global_progress: EdgeGlobalProgress;
   disks: EdgeDiskProgress[];
@@ -256,7 +255,6 @@ interface EdgeControlSummary {
   edge_status?: string;
   object_inventory?: EdgeWireObjectInventory;
   export_job?: EdgeWireExportJob | null;
-  disk_status_code?: string;
   global?: Partial<EdgeGlobalProgress>;
   global_progress?: Partial<EdgeGlobalProgress>;
   disks?: EdgeControlDiskRuntime[];
@@ -410,7 +408,6 @@ export function normalizeEdgeDashboardSummary(
     edge_status: edgeStatus(controlPayload.edge_status),
     object_inventory: objectInventory,
     export_job: exportJob,
-    disk_status_code: visibleDiskStatusCode(controlPayload.disk_status_code),
     global: globalProgress,
     global_progress: globalProgress,
     disks: (controlPayload.disks ?? []).map((disk, index) => normalizeDiskProgress(disk, index)),
