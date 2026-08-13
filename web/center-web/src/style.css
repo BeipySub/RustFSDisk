@@ -288,9 +288,7 @@ button:focus-visible {
   overflow: hidden;
 }
 
-.records-title button,
-.dashboard-actions button,
-.record-controls button {
+.dashboard-actions button {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -1463,6 +1461,13 @@ dd {
   white-space: nowrap;
 }
 
+.records-title > button {
+  grid-column: 3;
+  justify-self: end;
+  width: auto;
+  white-space: nowrap;
+}
+
 .record-summary {
   position: absolute;
   top: 136px;
@@ -1500,12 +1505,12 @@ dd {
   box-shadow: 0 0 18px rgb(0 139 255 / 18%);
 }
 
-.record-summary span {
+.record-summary .legacy-summary-label {
   grid-column: 2;
   font-size: 18px;
 }
 
-.record-summary strong {
+.record-summary .legacy-summary-value {
   grid-column: 2;
   color: var(--cyan);
   font-size: 34px;
@@ -1794,6 +1799,291 @@ dd {
   align-items: center;
   margin-top: 22px;
   color: #a9b4bf;
+}
+
+.records-title {
+  display: block;
+}
+
+.records-page-header.ant-page-header {
+  padding: 0;
+  background: transparent;
+}
+
+.records-page-header .ant-page-header-heading-title {
+  color: #fff;
+}
+
+.records-page-header .ant-page-header-heading-extra {
+  margin-inline: 0;
+}
+
+.records-page-header .ant-btn,
+.record-controls .ant-btn,
+.records-table .ant-btn {
+  color: #cdd9e5;
+  background: rgb(6 18 32 / 64%);
+  border-color: rgb(98 132 164 / 42%);
+}
+
+.records-page-header .ant-btn:hover,
+.record-controls .ant-btn:hover,
+.records-table .ant-btn:hover {
+  color: #e8f7ff;
+  border-color: rgb(70 184 255 / 64%);
+}
+
+.record-summary.ant-row {
+  display: flex;
+  grid-template-columns: none;
+  gap: 0;
+}
+
+.record-summary .ant-col,
+.record-summary .summary-card.ant-card {
+  height: 88px;
+}
+
+.record-summary .summary-card.ant-card {
+  display: block;
+  color: #dfe7ee;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+.record-summary .summary-card .ant-card-body {
+  display: grid;
+  grid-template-columns: 62px minmax(0, 1fr);
+  align-items: center;
+  height: 100%;
+  padding: 0 26px;
+}
+
+.record-summary .summary-card img {
+  grid-row: 1;
+  grid-column: 1;
+}
+
+.record-summary .ant-statistic {
+  grid-column: 2;
+  min-width: 0;
+}
+
+.record-summary .ant-statistic span {
+  grid-column: auto;
+}
+
+.record-summary .ant-statistic-title {
+  overflow: hidden;
+  color: #dfe7ee;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.record-summary .ant-statistic-content {
+  overflow: hidden;
+  color: var(--cyan);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.record-controls.ant-form {
+  display: flex;
+  grid-template-columns: none;
+  gap: 0;
+}
+
+.record-controls .ant-form-item {
+  margin: 0 20px 0 0;
+}
+
+.record-controls .ant-form-item:nth-child(1) {
+  width: 236px;
+}
+
+.record-controls .ant-form-item:nth-child(2) {
+  width: 330px;
+}
+
+.record-controls .ant-form-item:nth-child(3) {
+  width: 360px;
+}
+
+.record-controls .ant-form-item-control,
+.record-controls .ant-form-item-control-input,
+.record-controls .ant-form-item-control-input-content,
+.record-controls .ant-select,
+.record-controls .ant-input-group-wrapper,
+.record-controls .ant-input-search {
+  width: 100%;
+}
+
+.record-controls .ant-select-selector,
+.record-controls .ant-input-affix-wrapper,
+.record-controls .ant-input-group-addon,
+.record-controls .ant-input-search-button {
+  color: #d7e2eb;
+  background: rgb(2 13 24 / 78%) !important;
+  border-color: rgb(77 119 158 / 42%) !important;
+}
+
+.record-controls .ant-select-selection-item,
+.record-controls .ant-input,
+.record-controls .ant-input::placeholder,
+.record-controls .ant-select-arrow {
+  color: #d7e2eb;
+}
+
+.record-controls .ant-input {
+  height: auto;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+}
+
+.record-controls .ant-select-selection-search-input {
+  height: 100% !important;
+  padding: 0;
+  background: transparent;
+  border: 0;
+}
+
+.record-controls .ant-input-group-addon {
+  border-left: 0;
+}
+
+.records-table.ant-table-wrapper {
+  display: block;
+}
+
+.records-table .ant-spin-nested-loading,
+.records-table .ant-spin-container,
+.records-table .ant-table {
+  height: 100%;
+}
+
+.records-table .ant-spin-container {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.records-table .ant-table {
+  flex: 1 1 auto;
+  min-height: 0;
+  color: #d0d8e1;
+  background: transparent;
+}
+
+.records-table .ant-table-container {
+  background: transparent;
+}
+
+.records-table .ant-table-thead > tr > th {
+  color: #a8b3bf;
+  background: rgb(13 31 47 / 64%) !important;
+  border-bottom: 1px solid var(--line);
+}
+
+.records-table .ant-table-tbody > tr > td {
+  color: #d0d8e1;
+  background: transparent;
+  border-bottom: 1px solid rgb(110 150 188 / 18%);
+}
+
+.records-table .ant-table-tbody > tr:hover > td,
+.records-table .ant-table-tbody > tr.selected > td {
+  background: rgb(0 139 255 / 12%) !important;
+}
+
+.records-table .ant-table-cell {
+  border-color: rgb(110 150 188 / 18%);
+}
+
+.records-table .ant-table-cell-fix-right {
+  background: rgb(3 17 29 / 94%) !important;
+}
+
+.records-table .ant-table-row {
+  cursor: pointer;
+}
+
+.records-table .ant-table-cell span,
+.records-table .ant-table-cell strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.records-table .ant-btn-link {
+  color: var(--cyan-2);
+  background: transparent;
+  border-color: transparent;
+}
+
+.records-table .ant-tag {
+  margin-inline-end: 0;
+  color: #cdd9e5;
+  background: rgb(6 18 32 / 64%);
+  border-color: rgb(98 132 164 / 42%);
+}
+
+.records-table .ant-tag-blue {
+  color: #8fd5ff;
+  border-color: rgb(31 160 255 / 54%);
+}
+
+.records-table .ant-table-placeholder .ant-table-cell {
+  color: #77828e;
+}
+
+.records-table .ant-pagination {
+  flex: 0 0 auto;
+  margin: 10px 16px !important;
+}
+
+.records-table .ant-pagination,
+.records-table .ant-pagination-total-text,
+.records-table .ant-pagination-item a,
+.records-table .ant-pagination-prev button,
+.records-table .ant-pagination-next button {
+  color: #aab4bf;
+}
+
+.records-table .ant-pagination-item,
+.records-table .ant-pagination-prev button,
+.records-table .ant-pagination-next button {
+  background: transparent;
+  border-color: rgb(98 132 164 / 42%);
+}
+
+.records-table .ant-pagination-item-active {
+  border-color: var(--cyan);
+}
+
+.records-table .ant-pagination-item-active a {
+  color: #fff;
+}
+
+.record-drawer .ant-descriptions-item-label {
+  width: 142px;
+  color: #9facba;
+}
+
+.record-drawer .ant-descriptions-item-content {
+  min-width: 0;
+  overflow: hidden;
+  color: #e4edf5;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.record-drawer .ant-descriptions-row > th,
+.record-drawer .ant-descriptions-row > td {
+  padding-bottom: 12px;
 }
 
 .records-note {

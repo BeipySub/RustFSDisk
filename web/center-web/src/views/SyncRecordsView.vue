@@ -27,11 +27,43 @@ const error = ref<DashboardHttpError | null>(null);
 const detailError = ref<DashboardHttpError | null>(null);
 const edgeError = ref<DashboardHttpError | null>(null);
 
+const timeRangeOptions = [
+  { value: "30", label: "最近 30 天" },
+  { value: "7", label: "最近 7 天" },
+  { value: "all", label: "全部时间" },
+];
+
+const recordColumns = [
+  { title: "入账时间", key: "imported_at", width: 112, ellipsis: true },
+  { title: "边缘站点", key: "edge", width: 138, ellipsis: true },
+  { title: "源对象", key: "source", ellipsis: true },
+  { title: "中控归档", key: "archive", ellipsis: true },
+  { title: "大小", key: "size", width: 96, ellipsis: true },
+  { title: "导入任务", key: "import_job", width: 92, ellipsis: true },
+  { title: "分块组", key: "chunk_group", width: 92, ellipsis: true },
+  { title: "操作", key: "action", width: 92, fixed: "right" as const },
+];
+
 const pageCount = computed(() => Math.max(1, Math.ceil(total.value / pageSize)));
 const selectedRecord = computed(() => records.value.find((record) => recordKey(record) === selectedRecordKey.value) ?? records.value[0] ?? null);
 const edgeCount = computed(() => edgeOptions.value.length || new Set(records.value.map((record) => record.edge_code).filter(Boolean)).size);
 const chunkedCount = computed(() => records.value.filter((record) => record.chunk_group_id).length);
 const importedBytes = computed(() => records.value.reduce((sum, record) => sum + record.source_size_bytes, 0));
+const edgeSelectOptions = computed(() => [
+  { value: "", label: "全部边缘站点" },
+  ...edgeOptions.value.map((edge) => ({
+    value: edge.edge_code,
+    label: edge.edge_name ? `${edge.edge_name} / ${edge.edge_code}` : edge.edge_code,
+  })),
+]);
+const tablePagination = computed(() => ({
+  current: page.value,
+  pageSize,
+  total: total.value,
+  size: "small" as const,
+  showSizeChanger: false,
+  showTotal: (count: number) => `共 ${count} 条`,
+}));
 const startedFrom = computed(() => {
   if (timeRange.value === "all") return "";
   const days = Number(timeRange.value);
@@ -134,12 +166,20 @@ function goDashboard() {
   window.dispatchEvent(new PopStateEvent("popstate"));
 }
 
-function previousPage() {
-  if (page.value > 1) page.value -= 1;
+function handleTableChange(pagination: { current?: number }) {
+  page.value = pagination.current ?? 1;
 }
 
-function nextPage() {
-  if (page.value < pageCount.value) page.value += 1;
+function recordRowProps(record: CenterSyncRecord) {
+  return {
+    onClick: () => {
+      void openDetail(record);
+    },
+  };
+}
+
+function recordRowClassName(record: CenterSyncRecord) {
+  return selectedRecord.value && recordKey(selectedRecord.value) === recordKey(record) ? "selected" : "";
 }
 
 function mergeEdgeOptions(nextOptions: CenterEdgeOption[]) {
@@ -213,46 +253,62 @@ onMounted(() => {
       @refresh="loadRecords"
     />
 
-    <header class="records-title">
-      <h1>同步记录</h1>
-      <p>展示 Center object_ledger 已入账对象，按 edge_site.edge_code 分类查询；当前不展示模拟数据。</p>
-      <button type="button" @click="goDashboard">← 返回 Dashboard</button>
-    </header>
-
-    <section class="record-summary">
-      <div class="summary-card">
-        <img alt="" src="/assets/fustfs-baseline/icons/task-confirmed-database.svg" />
-        <span>账本对象</span><strong>{{ total }}</strong>
-      </div>
-      <div class="summary-card">
-        <img alt="" src="/assets/fustfs-baseline/icons/task-eta-clock.svg" />
-        <span>边缘分类</span><strong>{{ edgeCount }}</strong>
-      </div>
-      <div class="summary-card">
-        <img alt="" src="/assets/fustfs-baseline/a04-packed-shield-v1.png" />
-        <span>当前页数据量</span><strong>{{ formatBytes(importedBytes) }}</strong>
-      </div>
-      <div class="summary-card">
-        <img alt="" src="/assets/fustfs-baseline/a04-failed-lock-small-v1.png" />
-        <span>分块对象</span><strong>{{ chunkedCount }}</strong>
-      </div>
+    <section class="records-title">
+      <a-page-header class="records-page-header" title="同步记录" :ghost="false" :back-icon="false">
+        <template #extra>
+          <a-button size="middle" @click="goDashboard">← 返回 Dashboard</a-button>
+        </template>
+      </a-page-header>
     </section>
 
-    <section class="record-controls" aria-label="同步记录筛选">
-      <select v-model="timeRange">
-        <option value="30">最近 30 天</option>
-        <option value="7">最近 7 天</option>
-        <option value="all">全部时间</option>
-      </select>
-      <select v-model="selectedEdgeCode" :disabled="edgeLoading && edgeOptions.length === 0">
-        <option value="">全部边缘站点</option>
-        <option v-for="edge in edgeOptions" :key="edge.edge_code" :value="edge.edge_code">
-          {{ edge.edge_name ? `${edge.edge_name} / ${edge.edge_code}` : edge.edge_code }}
-        </option>
-      </select>
-      <input v-model.trim="query" placeholder="源 bucket/key / 导入任务 ID / ETag" type="search" @keydown.enter="submitSearch" />
-      <button type="button" @click="submitSearch">查询</button>
-    </section>
+    <a-row class="record-summary" :gutter="16">
+      <a-col :span="6">
+        <a-card class="summary-card" size="small" :bordered="false">
+          <img alt="" src="/assets/fustfs-baseline/icons/task-confirmed-database.svg" />
+          <a-statistic title="账本对象" :value="total" />
+        </a-card>
+      </a-col>
+      <a-col :span="6">
+        <a-card class="summary-card" size="small" :bordered="false">
+          <img alt="" src="/assets/fustfs-baseline/icons/task-eta-clock.svg" />
+          <a-statistic title="边缘分类" :value="edgeCount" />
+        </a-card>
+      </a-col>
+      <a-col :span="6">
+        <a-card class="summary-card" size="small" :bordered="false">
+          <img alt="" src="/assets/fustfs-baseline/a04-packed-shield-v1.png" />
+          <a-statistic title="当前页数据量" :value="formatBytes(importedBytes)" />
+        </a-card>
+      </a-col>
+      <a-col :span="6">
+        <a-card class="summary-card" size="small" :bordered="false">
+          <img alt="" src="/assets/fustfs-baseline/a04-failed-lock-small-v1.png" />
+          <a-statistic title="分块对象" :value="chunkedCount" />
+        </a-card>
+      </a-col>
+    </a-row>
+
+    <a-form class="record-controls" layout="inline" size="middle" @finish="submitSearch">
+      <a-form-item>
+        <a-select v-model:value="timeRange" :options="timeRangeOptions" size="middle" />
+      </a-form-item>
+      <a-form-item>
+        <a-select
+          v-model:value="selectedEdgeCode"
+          :disabled="edgeLoading && edgeOptions.length === 0"
+          :options="edgeSelectOptions"
+          size="middle"
+        />
+      </a-form-item>
+      <a-form-item>
+        <a-input-search
+          v-model:value.trim="query"
+          placeholder="源 bucket/key / 导入任务 ID / ETag"
+          size="middle"
+          @search="submitSearch"
+        />
+      </a-form-item>
+    </a-form>
 
     <section v-if="error || edgeError" class="records-inline-error glass-panel">
       <i>i</i>
@@ -261,46 +317,50 @@ onMounted(() => {
       </span>
     </section>
 
-    <section class="records-table glass-panel" role="table" aria-label="对象账本同步记录列表">
-      <div class="table-head" role="row">
-        <span>入账时间</span>
-        <span>边缘站点</span>
-        <span>源对象</span>
-        <span>中控归档</span>
-        <span>大小</span>
-        <span>导入任务</span>
-        <span>分块组</span>
-        <span>操作</span>
-      </div>
-      <button
-        v-for="record in records"
-        :key="recordKey(record)"
-        :class="{ selected: selectedRecord ? recordKey(selectedRecord) === recordKey(record) : false }"
-        class="record-row"
-        type="button"
-        @click="openDetail(record)"
-      >
-        <span>{{ formatTime(record.imported_at) }}</span>
-        <strong>{{ edgeLabel(record) }}</strong>
-        <span :title="objectPath(record)">{{ objectPath(record) }}</span>
-        <span :title="importPath(record)">{{ importPath(record) }}</span>
-        <span>{{ formatBytes(record.source_size_bytes) }}</span>
-        <span>{{ record.import_job_id || "未返回" }}</span>
-        <span>{{ record.chunk_group_id ? "跨盘分块" : "普通对象" }}</span>
-        <span class="detail-link">查看详情 →</span>
-      </button>
-      <p v-if="loading" class="empty-result">正在读取对象账本记录</p>
-      <p v-else-if="records.length === 0 && !error" class="empty-result">没有符合条件的 object_ledger 记录</p>
-      <footer class="records-pagination">
-        <span>共 {{ total }} 条</span>
-        <nav aria-label="同步记录分页">
-          <button :disabled="page === 1 || loading" type="button" @click="previousPage">←</button>
-          <b>{{ page }}</b>
-          <span>/ {{ pageCount }}</span>
-          <button :disabled="page === pageCount || loading" type="button" @click="nextPage">→</button>
-        </nav>
-      </footer>
-    </section>
+    <a-table
+      class="records-table glass-panel"
+      size="middle"
+      :columns="recordColumns"
+      :custom-row="recordRowProps"
+      :data-source="records"
+      :loading="loading"
+      :pagination="tablePagination"
+      :row-class-name="recordRowClassName"
+      :row-key="recordKey"
+      :scroll="{ y: 282 }"
+      @change="handleTableChange"
+    >
+      <template #emptyText>
+        <span>{{ error ? "对象账本记录接口不可用" : "没有符合条件的 object_ledger 记录" }}</span>
+      </template>
+      <template #bodyCell="{ column, record }">
+        <template v-if="column.key === 'imported_at'">
+          {{ formatTime(record.imported_at) }}
+        </template>
+        <template v-else-if="column.key === 'edge'">
+          <strong>{{ edgeLabel(record) }}</strong>
+        </template>
+        <template v-else-if="column.key === 'source'">
+          <span :title="objectPath(record)">{{ objectPath(record) }}</span>
+        </template>
+        <template v-else-if="column.key === 'archive'">
+          <span :title="importPath(record)">{{ importPath(record) }}</span>
+        </template>
+        <template v-else-if="column.key === 'size'">
+          {{ formatBytes(record.source_size_bytes) }}
+        </template>
+        <template v-else-if="column.key === 'import_job'">
+          <span :title="record.import_job_id">{{ shortHash(record.import_job_id) }}</span>
+        </template>
+        <template v-else-if="column.key === 'chunk_group'">
+          <a-tag v-if="record.chunk_group_id" color="blue">跨盘分块</a-tag>
+          <a-tag v-else>普通对象</a-tag>
+        </template>
+        <template v-else-if="column.key === 'action'">
+          <a-button type="link" size="small" @click.stop="openDetail(record)">查看详情</a-button>
+        </template>
+      </template>
+    </a-table>
 
     <aside class="record-drawer glass-panel" aria-label="对象账本记录详情">
       <header>
@@ -311,23 +371,23 @@ onMounted(() => {
       <section v-else-if="records.length === 0" class="drawer-loading">暂无对象账本记录</section>
       <section v-else-if="!selected" class="drawer-loading">正在读取对象账本详情</section>
       <template v-else>
-        <dl class="drawer-overview">
-          <dt>边缘站点</dt><dd>{{ edgeLabel(selected) }}</dd>
-          <dt>源对象</dt><dd>{{ objectPath(selected) }}</dd>
-          <dt>中控归档</dt><dd>{{ importPath(selected) }}</dd>
-          <dt>源 ETag</dt><dd>{{ selected.source_etag ?? "--" }}</dd>
-          <dt>源对象大小</dt><dd>{{ formatBytes(selected.source_size_bytes) }}</dd>
-          <dt>源修改时间</dt><dd>{{ formatTime(selected.source_last_modified) }}</dd>
-          <dt>导入时间</dt><dd>{{ formatTime(selected.imported_at) }}</dd>
-        </dl>
+        <a-descriptions class="drawer-descriptions" :column="1" size="small" :colon="false">
+          <a-descriptions-item label="边缘站点">{{ edgeLabel(selected) }}</a-descriptions-item>
+          <a-descriptions-item label="源对象">{{ objectPath(selected) }}</a-descriptions-item>
+          <a-descriptions-item label="中控归档">{{ importPath(selected) }}</a-descriptions-item>
+          <a-descriptions-item label="源 ETag">{{ selected.source_etag ?? "--" }}</a-descriptions-item>
+          <a-descriptions-item label="源对象大小">{{ formatBytes(selected.source_size_bytes) }}</a-descriptions-item>
+          <a-descriptions-item label="源修改时间">{{ formatTime(selected.source_last_modified) }}</a-descriptions-item>
+          <a-descriptions-item label="导入时间">{{ formatTime(selected.imported_at) }}</a-descriptions-item>
+        </a-descriptions>
         <h3>账本关联</h3>
-        <dl class="drawer-overview manifest-lines">
-          <dt>import_job_id</dt><dd>{{ selected.import_job_id || "--" }}</dd>
-          <dt>export_job_id</dt><dd>{{ selected.export_job_id ?? "--" }}</dd>
-          <dt>chunk_group_id</dt><dd>{{ selected.chunk_group_id ?? "--" }}</dd>
-          <dt>plaintext_sha256</dt><dd>{{ shortHash(selected.plaintext_sha256) }}</dd>
-          <dt>ciphertext_sha256</dt><dd>{{ shortHash(selected.ciphertext_sha256) }}</dd>
-        </dl>
+        <a-descriptions class="drawer-descriptions manifest-lines" :column="1" size="small" :colon="false">
+          <a-descriptions-item label="import_job_id">{{ selected.import_job_id || "--" }}</a-descriptions-item>
+          <a-descriptions-item label="export_job_id">{{ selected.export_job_id ?? "--" }}</a-descriptions-item>
+          <a-descriptions-item label="chunk_group_id">{{ selected.chunk_group_id ?? "--" }}</a-descriptions-item>
+          <a-descriptions-item label="plaintext_sha256">{{ shortHash(selected.plaintext_sha256) }}</a-descriptions-item>
+          <a-descriptions-item label="ciphertext_sha256">{{ shortHash(selected.ciphertext_sha256) }}</a-descriptions-item>
+        </a-descriptions>
         <p class="drawer-note"><i>i</i> object_ledger 是中控对象导入去重和来源追踪权威表；分类来源为 edge_site.edge_code。</p>
       </template>
     </aside>
