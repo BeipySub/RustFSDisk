@@ -6,17 +6,12 @@ use std::{
     env,
     io::{Read, Write},
     net::TcpStream,
-    path::PathBuf,
     time::Duration,
 };
 
-const DEFAULT_CONFIG_PATH: &str = "/etc/rustfs-transfer/edge.toml";
-
 fn main() -> anyhow::Result<()> {
     let args = Args::parse()?;
-    let config_path = config_path();
-    let config = EdgeConfig::load(&config_path)
-        .with_context(|| format!("load edge config from {}", config_path.display()))?;
+    let config = EdgeConfig::from_env().context("load edge config from environment")?;
     let token = config
         .rescan_token()
         .context("RUSTFS_TRANSFER__RESCAN__TOKEN or [rescan].token_env must be configured")?;
@@ -59,12 +54,6 @@ impl Args {
         }
         Ok(Self { device, trigger })
     }
-}
-
-fn config_path() -> PathBuf {
-    env::var("RUSTFS_TRANSFER__CONFIG_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_CONFIG_PATH))
 }
 
 fn post_rescan(endpoint_url: &str, token: &str, body: &[u8]) -> anyhow::Result<String> {

@@ -4,7 +4,6 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-Environment=RUSTFS_TRANSFER__CONFIG_PATH=/etc/rustfs-transfer/edge.toml
 EnvironmentFile=-/etc/rustfs-transfer/edge.env
 ExecStart=/opt/rustfs-transfer/bin/rustfs-transfer-rescan --device /dev/%I --trigger udev
 User=root

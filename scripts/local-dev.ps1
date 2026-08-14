@@ -30,7 +30,6 @@ foreach ($dir in $dirs) {
 }
 
 Copy-Item -Force (Join-Path $repo "deploy/config/center.example.toml") (Join-Path $configDir "center.toml")
-Copy-Item -Force (Join-Path $repo "deploy/config/edge.example.toml") (Join-Path $configDir "edge.toml")
 
 @'
 {
@@ -105,10 +104,13 @@ RUSTFS_TRANSFER__PATHS__TRANSPORT_MOUNT_ROOT=.local/dev/mock-disks
 '@ | Set-Content -Encoding UTF8 (Join-Path $localDir "center.env")
 
 @'
-RUSTFS_TRANSFER__CONFIG_PATH=.local/dev/config/edge.toml
+RUSTFS_TRANSFER__SERVER__BIND=0.0.0.0:8081
 RUSTFS_TRANSFER__DATABASE__URL=postgres://rustfs_transfer_edge:CHANGE_ME_PASSWORD@127.0.0.1:5432/rustfs_transfer_edge_dev
 RUSTFS_TRANSFER__EDGE__EDGE_CODE=edge-demo
 RUSTFS_TRANSFER__EDGE__EDGE_KEY=CHANGE_ME_EDGE_KEY_FROM_CENTER
+RUSTFS_TRANSFER__RUSTFS__ENDPOINT=http://127.0.0.1:9000
+RUSTFS_TRANSFER__RUSTFS__ACCESS_KEY_ID=CHANGE_ME_ACCESS_KEY
+RUSTFS_TRANSFER__RUSTFS__SECRET_ACCESS_KEY=CHANGE_ME_SECRET_KEY
 RUSTFS_TRANSFER__PATHS__DATA_DIR=.local/dev/data/edge
 RUSTFS_TRANSFER__PATHS__LOG_DIR=.local/dev/logs/edge
 RUSTFS_TRANSFER__PATHS__TRANSPORT_MOUNT_ROOT=.local/dev/mock-disks

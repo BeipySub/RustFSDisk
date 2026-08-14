@@ -18,8 +18,8 @@ foreach ($file in $serviceFiles) {
     if ($content -notmatch "ExecStart=/opt/rustfs-transfer/") {
         Add-Failure "$file ExecStart must use /opt/rustfs-transfer/"
     }
-    if ($content -notmatch "RUSTFS_TRANSFER__") {
-        Add-Failure "$file must set or load RUSTFS_TRANSFER__ environment"
+    if ($content -notmatch "RUSTFS_TRANSFER__" -and $content -notmatch "EnvironmentFile=-/etc/rustfs-transfer/") {
+        Add-Failure "$file must set or load rustfs-transfer environment"
     }
 }
 
@@ -35,11 +35,11 @@ $edgeService = Get-Content -Raw (Join-Path $repo "deploy/systemd/rustfs-transfer
 if ($edgeService -notmatch "ExecStart=/opt/rustfs-transfer/rustfs-transfer-edge") {
     Add-Failure "edge service ExecStart must use /opt/rustfs-transfer/rustfs-transfer-edge"
 }
-if ($edgeService -notmatch "RUSTFS_TRANSFER__CONFIG_PATH=/etc/rustfs-transfer/edge.toml") {
-    Add-Failure "edge service must load /etc/rustfs-transfer/edge.toml"
-}
 if ($edgeService -notmatch "EnvironmentFile=-/etc/rustfs-transfer/edge.env") {
-    Add-Failure "edge service must load edge.env for deploy-time toggles"
+    Add-Failure "edge service must load edge.env for complete runtime configuration"
+}
+if ($edgeService -match "edge\.toml|RUSTFS_TRANSFER__CONFIG_PATH") {
+    Add-Failure "edge service must not depend on edge.toml or CONFIG_PATH"
 }
 if ($edgeService -notmatch "UMask=0000") {
     Add-Failure "edge service must use UMask=0000 for shared transport-disk access"
@@ -67,35 +67,34 @@ if ($centerEnv -notmatch "RUSTFS_TRANSFER__SECURITY__CENTER_SIGNATURE_KEY=CHANGE
     Add-Failure "center.env.example must include CENTER_SIGNATURE_KEY placeholder"
 }
 
-$edgeToml = Get-Content -Raw (Join-Path $repo "deploy/config/edge.example.toml")
-if ($edgeToml -notmatch "\[edge\]") {
-    Add-Failure "edge config example must include [edge] section"
-}
-if ($edgeToml -notmatch "edge_key\s*=\s*`"CHANGE_ME_EDGE_KEY_FROM_CENTER`"") {
-    Add-Failure "edge config example must include Center generated edge_key placeholder"
-}
-if ($edgeToml -match "\[center\]|auth_key_id|edge_auth_secret|control_api_token") {
-    Add-Failure "edge config example must not include legacy Center auth or Edge control token fields"
-}
-if ($edgeToml -notmatch "\[auto_export\]") {
-    Add-Failure "edge config example must include auto_export section"
-}
-if ($edgeToml -notmatch "enabled\s*=\s*false") {
-    Add-Failure "edge auto_export.enabled must default to false"
-}
-if ($edgeToml -notmatch "start_on_ready\s*=\s*false") {
-    Add-Failure "edge auto_export.start_on_ready must default to false"
-}
-if ($edgeToml -notmatch "min_ready_disk_count\s*=\s*1") {
-    Add-Failure "edge auto_export.min_ready_disk_count must default to 1"
-}
-if ($edgeToml -notmatch "cooldown_seconds\s*=\s*60") {
-    Add-Failure "edge auto_export.cooldown_seconds must default to 60"
+if (Test-Path (Join-Path $repo "deploy/config/edge.example.toml")) {
+    Add-Failure "edge.example.toml must be removed; Edge runtime configuration is edge.env only"
 }
 
 $edgeEnv = Get-Content -Raw (Join-Path $repo "deploy/config/edge.env.example")
+if ($edgeEnv -match "RUSTFS_TRANSFER__CONFIG_PATH|edge\.toml") {
+    Add-Failure "edge.env.example must not reference edge.toml or CONFIG_PATH"
+}
+if ($edgeEnv -notmatch "RUSTFS_TRANSFER__SERVER__BIND=0.0.0.0:8081") {
+    Add-Failure "edge.env.example must include the Edge server bind address"
+}
+if ($edgeEnv -notmatch "RUSTFS_TRANSFER__DATABASE__URL=postgres://rustfs_transfer_edge:CHANGE_ME_PASSWORD@127.0.0.1:5432/rustfs_transfer_edge") {
+    Add-Failure "edge.env.example must include the database URL placeholder"
+}
+if ($edgeEnv -notmatch "RUSTFS_TRANSFER__EDGE__EDGE_CODE=edge-demo") {
+    Add-Failure "edge.env.example must include the Edge code placeholder"
+}
 if ($edgeEnv -notmatch "RUSTFS_TRANSFER__EDGE__EDGE_KEY=CHANGE_ME_EDGE_KEY_FROM_CENTER") {
     Add-Failure "edge.env.example must include the Center generated EDGE_KEY placeholder"
+}
+if ($edgeEnv -notmatch "RUSTFS_TRANSFER__RUSTFS__ENDPOINT=http://127.0.0.1:9000") {
+    Add-Failure "edge.env.example must include RustFS endpoint"
+}
+if ($edgeEnv -notmatch "RUSTFS_TRANSFER__RUSTFS__ACCESS_KEY_ID=CHANGE_ME_ACCESS_KEY") {
+    Add-Failure "edge.env.example must include RustFS access key placeholder"
+}
+if ($edgeEnv -notmatch "RUSTFS_TRANSFER__RUSTFS__SECRET_ACCESS_KEY=CHANGE_ME_SECRET_KEY") {
+    Add-Failure "edge.env.example must include RustFS secret key placeholder"
 }
 if ($edgeEnv -match "RUSTFS_TRANSFER__CENTER__|RUSTFS_TRANSFER__SERVER__CONTROL_API_TOKEN|EDGE_AUTH_SECRET|AUTH_KEY_ID") {
     Add-Failure "edge.env.example must not include legacy Center auth fields or Edge control token"
@@ -134,6 +133,9 @@ if ($rescanService -notmatch "ExecStart=/opt/rustfs-transfer/bin/rustfs-transfer
 }
 if ($rescanService -notmatch "EnvironmentFile=-/etc/rustfs-transfer/edge.env") {
     Add-Failure "disk rescan service must load edge.env for the local rescan token"
+}
+if ($rescanService -match "edge\.toml|RUSTFS_TRANSFER__CONFIG_PATH") {
+    Add-Failure "disk rescan service must not depend on edge.toml or CONFIG_PATH"
 }
 if ($rescanService -match "(?i)(export-key|import-worker|cleanup|reinitializ|mkfs|format)") {
     Add-Failure "disk rescan service must not directly run business, formatting, cleanup, or reinit work"

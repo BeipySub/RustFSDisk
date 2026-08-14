@@ -79,7 +79,8 @@ rustfs-transfer/
 │   │   └── 99-rustfs-transfer-disk.rules
 │   └── config/                   # 示例配置文件
 │       ├── center.example.toml
-│       └── edge.example.toml
+│       ├── center.env.example
+│       └── edge.env.example
 │
 └── scripts/                      # 本地开发、部署和运维脚本
 ```
@@ -93,7 +94,8 @@ rustfs-transfer/
 - 中控端和边缘端前端独立部署。
 - systemd 文件放在 `deploy/systemd/`，udev 规则放在 `deploy/udev/`。
 - udev 只触发 rescan 通知服务，不直接执行导出或导入业务逻辑。
-- 示例配置放在 `deploy/config/*.example.toml`，真实密钥、数据库密码、RustFS secret、`edge_auth_secret` 不得提交。
+- Center 结构化示例配置放在 `deploy/config/center.example.toml`；Edge 运行配置只使用 `deploy/config/edge.env.example`。
+- 真实 KEY、数据库密码、RustFS secret 和部署密钥不得提交。
 - `Cargo.lock` 需要提交，用于锁定 Rust 依赖版本。
 
 ## 部署路径约定

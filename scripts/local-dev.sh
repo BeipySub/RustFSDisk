@@ -13,7 +13,6 @@ mkdir -p "${DISK_ROOT}/sealed/rustfs-transfer"/{data,meta,manifests,logs,quarant
 mkdir -p "${CONFIG_DIR}" "${LOG_DIR}/center" "${LOG_DIR}/edge" "${DATA_DIR}/center" "${DATA_DIR}/edge"
 
 cp "${ROOT_DIR}/deploy/config/center.example.toml" "${CONFIG_DIR}/center.toml"
-cp "${ROOT_DIR}/deploy/config/edge.example.toml" "${CONFIG_DIR}/edge.toml"
 
 cat > "${DISK_ROOT}/initialized/rustfs-transfer/disk_info.json" <<'JSON'
 {
@@ -88,10 +87,13 @@ RUSTFS_TRANSFER__PATHS__TRANSPORT_MOUNT_ROOT=.local/dev/mock-disks
 ENV
 
 cat > "${LOCAL_DIR}/edge.env" <<'ENV'
-RUSTFS_TRANSFER__CONFIG_PATH=.local/dev/config/edge.toml
+RUSTFS_TRANSFER__SERVER__BIND=0.0.0.0:8081
 RUSTFS_TRANSFER__DATABASE__URL=postgres://rustfs_transfer_edge:CHANGE_ME_PASSWORD@127.0.0.1:5432/rustfs_transfer_edge_dev
 RUSTFS_TRANSFER__EDGE__EDGE_CODE=edge-demo
 RUSTFS_TRANSFER__EDGE__EDGE_KEY=CHANGE_ME_EDGE_KEY_FROM_CENTER
+RUSTFS_TRANSFER__RUSTFS__ENDPOINT=http://127.0.0.1:9000
+RUSTFS_TRANSFER__RUSTFS__ACCESS_KEY_ID=CHANGE_ME_ACCESS_KEY
+RUSTFS_TRANSFER__RUSTFS__SECRET_ACCESS_KEY=CHANGE_ME_SECRET_KEY
 RUSTFS_TRANSFER__PATHS__DATA_DIR=.local/dev/data/edge
 RUSTFS_TRANSFER__PATHS__LOG_DIR=.local/dev/logs/edge
 RUSTFS_TRANSFER__PATHS__TRANSPORT_MOUNT_ROOT=.local/dev/mock-disks
