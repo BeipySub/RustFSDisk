@@ -27,7 +27,7 @@ pub type ControlFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ControlErr
 const DEFAULT_MAX_BUDGET_SQL: &str =
     "SELECT MAX(object_budget_bytes) FROM disk_runtime WHERE status = 'READY'";
 const READY_DISKS_SQL: &str = r#"
-    SELECT disk_id, sn, mount_path, free_bytes, object_budget_bytes
+    SELECT disk_presence_id, disk_id, sn, mount_path, capacity_bytes, free_bytes, object_budget_bytes
     FROM disk_runtime
     WHERE status = 'READY'
       AND disk_id IS NOT NULL
@@ -550,9 +550,14 @@ impl ProductionEdgeControlService {
         let disks = rows
             .into_iter()
             .map(|row| ReadyDisk {
+                disk_presence_id: row
+                    .get::<Option<Uuid>, _>("disk_presence_id")
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
                 disk_id: row.get("disk_id"),
                 disk_sn: row.get("sn"),
                 mount_path: row.get("mount_path"),
+                capacity_bytes: row.get::<i64, _>("capacity_bytes").max(0) as u64,
                 free_bytes: row.get::<i64, _>("free_bytes").max(0) as u64,
                 object_budget_bytes: row.get::<i64, _>("object_budget_bytes").max(0) as u64,
             })
@@ -763,21 +768,37 @@ impl EdgeControlService for ProductionEdgeControlService {
 
     fn summary<'a>(&'a self) -> ControlFuture<'a, EdgeControlSummary> {
         Box::pin(async move {
-            let latest_export_job_id: Option<Uuid> =
-                sqlx::query_scalar("SELECT export_job_id FROM export_job ORDER BY id DESC LIMIT 1")
-                    .fetch_optional(&self.pool)
-                    .await
-                    .context("query latest export job")?
-                    .flatten();
+            let latest_export_job_id: Option<Uuid> = sqlx::query_scalar(
+                "SELECT export_job_id FROM export_job \
+                     WHERE status IN ('PENDING', 'SCANNING', 'COPYING', 'SEALING') \
+                     ORDER BY id DESC LIMIT 1",
+            )
+            .fetch_optional(&self.pool)
+            .await
+            .context("query latest active export job")?
+            .flatten();
             let latest_export_job = match latest_export_job_id {
                 Some(export_job_id) => Some(load_export_job(&self.pool, export_job_id).await?),
                 None => None,
             };
             let object_inventory = load_object_inventory(&self.pool).await?;
-            let copy_progress =
-                self.copy_progress.read().await.as_ref().map(|progress| {
-                    progress.snapshot("COPY_PROGRESS", "edge copy progress snapshot")
-                });
+            let copy_progress = if let Some(active_job) = latest_export_job.as_ref() {
+                self.copy_progress
+                    .read()
+                    .await
+                    .as_ref()
+                    .map(|progress| {
+                        progress.snapshot("COPY_PROGRESS", "edge copy progress snapshot")
+                    })
+                    .filter(|snapshot| {
+                        copy_progress_matches_export_job(
+                            snapshot.export_job.as_ref(),
+                            active_job.export_job_id,
+                        )
+                    })
+            } else {
+                None
+            };
             let mut disks = load_disk_runtime(&self.pool).await?;
             enrich_disks_from_copy_progress(&mut disks, copy_progress.as_ref());
             let global_progress = copy_progress
@@ -807,12 +828,35 @@ impl EdgeControlService for ProductionEdgeControlService {
 
     fn copy_progress_snapshot<'a>(&'a self) -> ControlFuture<'a, Option<CopyProgressEvent>> {
         Box::pin(async move {
-            Ok(self
-                .copy_progress
-                .read()
-                .await
+            let snapshot =
+                self.copy_progress.read().await.as_ref().map(|progress| {
+                    progress.snapshot("COPY_PROGRESS", "edge copy progress snapshot")
+                });
+            let Some(snapshot) = snapshot else {
+                return Ok(None);
+            };
+            let Some(export_job_id) = snapshot
+                .export_job
                 .as_ref()
-                .map(|progress| progress.snapshot("COPY_PROGRESS", "edge copy progress snapshot")))
+                .and_then(|job| Uuid::parse_str(&job.export_job_id).ok())
+            else {
+                *self.copy_progress.write().await = None;
+                return Ok(None);
+            };
+            let is_active: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM export_job \
+                 WHERE export_job_id = $1 \
+                   AND status IN ('PENDING', 'SCANNING', 'COPYING', 'SEALING'))",
+            )
+            .bind(export_job_id)
+            .fetch_one(&self.pool)
+            .await
+            .context("check copy progress export job activity")?;
+            if !is_active {
+                *self.copy_progress.write().await = None;
+                return Ok(None);
+            }
+            Ok(Some(snapshot))
         })
     }
 
@@ -823,9 +867,11 @@ impl EdgeControlService for ProductionEdgeControlService {
 
 #[derive(Debug)]
 struct ReadyDisk {
+    disk_presence_id: String,
     disk_id: Uuid,
     disk_sn: String,
     mount_path: Option<String>,
+    capacity_bytes: u64,
     free_bytes: u64,
     object_budget_bytes: u64,
 }
@@ -1344,8 +1390,10 @@ async fn assigned_copy_progress_disk(
     if let Some(progress) = guard.as_ref() {
         progress.register_disk(
             disk.disk_id.to_string(),
+            disk.disk_presence_id.clone(),
             disk.disk_sn.clone(),
             disk.mount_path.clone().unwrap_or_default(),
+            disk.capacity_bytes,
             batch
                 .iter()
                 .map(|object| object.chunk_size_bytes.max(0) as u64)
@@ -1395,6 +1443,13 @@ fn global_from_copy_progress(event: &CopyProgressEvent) -> EdgeGlobalSummary {
     }
 }
 
+fn copy_progress_matches_export_job(
+    progress_job: Option<&DashboardExportJobSnapshot>,
+    export_job_id: Uuid,
+) -> bool {
+    progress_job.is_some_and(|job| job.export_job_id == export_job_id.to_string())
+}
+
 async fn load_object_inventory(pool: &PgPool) -> Result<ObjectInventorySnapshot, ControlError> {
     let local = sqlx::query(
         r#"
@@ -1409,9 +1464,13 @@ async fn load_object_inventory(pool: &PgPool) -> Result<ObjectInventorySnapshot,
     let exported = sqlx::query(
         r#"
         SELECT COUNT(*)::bigint AS exported_count,
-               COALESCE(SUM(chunk_size_bytes), 0)::bigint AS exported_bytes
-        FROM export_object
-        WHERE status = 'EXPORTED'
+               COALESCE(SUM(size_bytes), 0)::bigint AS exported_bytes
+        FROM (
+            SELECT bucket, object_key, MAX(size_bytes) AS size_bytes
+            FROM export_object
+            WHERE status = 'EXPORTED'
+            GROUP BY bucket, object_key
+        ) AS exported_source
         "#,
     )
     .fetch_one(pool)
@@ -2076,6 +2135,11 @@ fn is_valid_export_job_status(value: &str) -> bool {
     )
 }
 
+#[cfg(test)]
+fn is_active_export_job_status(value: &str) -> bool {
+    matches!(value, "PENDING" | "SCANNING" | "COPYING" | "SEALING")
+}
+
 fn default_page() -> u32 {
     1
 }
@@ -2204,6 +2268,44 @@ mod tests {
     #[test]
     fn export_job_status_filter_accepts_sealing() {
         assert!(is_valid_export_job_status("SEALING"));
+    }
+
+    #[test]
+    fn only_non_terminal_export_jobs_are_active() {
+        for status in ["PENDING", "SCANNING", "COPYING", "SEALING"] {
+            assert!(is_active_export_job_status(status));
+        }
+        for status in ["SEALED", "FAILED", "CANCELLED"] {
+            assert!(!is_active_export_job_status(status));
+        }
+    }
+
+    #[test]
+    fn copy_progress_must_match_the_active_export_job() {
+        let expected = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let progress_job = DashboardExportJobSnapshot {
+            export_job_id: expected.to_string(),
+            export_job_status: "COPYING".to_string(),
+            start_time: None,
+            finish_time: None,
+            total_bytes: 0,
+            done_bytes: 0,
+            remaining_bytes: 0,
+            speed_bytes_per_sec: 0,
+            object_total: 0,
+            object_done: 0,
+            object_remaining: 0,
+            percent: 0.0,
+        };
+
+        assert!(copy_progress_matches_export_job(
+            Some(&progress_job),
+            expected
+        ));
+        assert!(!copy_progress_matches_export_job(
+            Some(&progress_job),
+            Uuid::new_v4()
+        ));
     }
 
     #[test]

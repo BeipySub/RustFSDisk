@@ -21,7 +21,7 @@ use crate::{
         DiskWorker, DiskWorkerConfig, DiskWorkerError, ExportObjectRepository, ExportObjectTask,
         ExportedObjectUpdate, ObjectSource, SourceObjectHead,
     },
-    progress::ProgressAggregator,
+    progress::{ObjectInventorySnapshot, ProgressAggregator},
 };
 
 type HmacSha256 = Hmac<Sha256>;
@@ -91,6 +91,7 @@ impl ExportWorkerLauncher for ProductionExportWorkerLauncher {
                 export_job_id,
             )
             .await;
+            progress.set_object_inventory(load_object_inventory(&self.pool).await?);
             let handle = Handle::current();
             let mut tasks = Vec::new();
 
@@ -185,6 +186,39 @@ async fn install_copy_progress(
     let progress = ProgressAggregator::new(edge_code, export_job_id);
     *slot.write().await = Some(progress.clone());
     progress
+}
+
+async fn load_object_inventory(pool: &PgPool) -> anyhow::Result<ObjectInventorySnapshot> {
+    let local = sqlx::query(
+        r#"
+        SELECT COUNT(*)::bigint AS total_count,
+               COALESCE(SUM(size_bytes), 0)::bigint AS total_bytes
+        FROM local_object_snapshot
+        "#,
+    )
+    .fetch_one(pool)
+    .await?;
+    let exported = sqlx::query(
+        r#"
+        SELECT COUNT(*)::bigint AS exported_count,
+               COALESCE(SUM(size_bytes), 0)::bigint AS exported_bytes
+        FROM (
+            SELECT bucket, object_key, MAX(size_bytes) AS size_bytes
+            FROM export_object
+            WHERE status = 'EXPORTED'
+            GROUP BY bucket, object_key
+        ) AS exported_source
+        "#,
+    )
+    .fetch_one(pool)
+    .await?;
+
+    Ok(ObjectInventorySnapshot {
+        total_bytes: local.get::<i64, _>("total_bytes").max(0) as u64,
+        exported_bytes: exported.get::<i64, _>("exported_bytes").max(0) as u64,
+        total_count: local.get::<i64, _>("total_count").max(0) as u64,
+        exported_count: exported.get::<i64, _>("exported_count").max(0) as u64,
+    })
 }
 
 #[derive(Debug)]
@@ -729,8 +763,23 @@ mod tests {
         let slot = std::sync::Arc::new(RwLock::new(None));
         let export_job_id = Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap();
         let worker_progress = install_copy_progress(&slot, "edge-a", export_job_id).await;
+        worker_progress.set_object_inventory(ObjectInventorySnapshot {
+            total_bytes: 500,
+            exported_bytes: 0,
+            total_count: 3,
+            exported_count: 0,
+        });
 
-        worker_progress.register_disk("disk-a", "sn-a", "/media/edge/disk-a", 100, 1, 50);
+        worker_progress.register_disk(
+            "disk-a",
+            "presence-a",
+            "sn-a",
+            "/media/edge/disk-a",
+            200,
+            100,
+            1,
+            50,
+        );
         worker_progress.start_object("disk-a", "source", "objects/a.bin", "data/a.bin", 100);
         worker_progress.add_bytes("disk-a", 40);
 
@@ -746,6 +795,10 @@ mod tests {
             export_job_id.to_string()
         );
         assert_eq!(websocket_snapshot.disks[0].done_bytes, 40);
+        assert_eq!(websocket_snapshot.disks[0].disk_presence_id, "presence-a");
+        assert_eq!(websocket_snapshot.disks[0].capacity_bytes, 200);
+        assert_eq!(websocket_snapshot.object_inventory.total_count, 3);
+        assert_eq!(websocket_snapshot.object_inventory.total_bytes, 500);
         assert_eq!(
             websocket_snapshot.disks[0].current_file.as_deref(),
             Some("a.bin")

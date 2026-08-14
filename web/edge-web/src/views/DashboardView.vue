@@ -4,7 +4,6 @@ import {
   DashboardHttpError,
   edgeDiskPrimaryStatusLabel,
   diskStatusDisplay,
-  edgeRejectedDiskStatusLabel,
   fetchEdgeDashboardSummary,
   fetchEdgeReadiness,
   isEdgeUninitializedDiskIssue,
@@ -23,23 +22,12 @@ import {
 import EdgeTelemetry from "../components/EdgeTelemetry.vue";
 import ParticleAetherField from "../components/ParticleAetherField.vue";
 
-type ParticlePalette = "semantic" | "electric" | "cyan" | "emerald" | "amber" | "violet";
-type ParticleSceneState = "loading" | "running" | "paused" | "complete" | "error";
 type ParticlePathAnchors = {
   startX: number;
   startY: number;
   endX: number;
   endY: number;
 };
-
-const particleSceneLabels: Record<ParticleSceneState, string> = {
-  loading: "汇聚装载",
-  running: "传输",
-  paused: "暂停",
-  complete: "可运输",
-  error: "异常",
-};
-const particleSceneStates: ParticleSceneState[] = ["loading", "running", "paused", "complete", "error"];
 
 function emptySummary(): EdgeDashboardSummary {
   const now = new Date().toISOString();
@@ -80,13 +68,6 @@ const isRefreshing = ref(false);
 const httpError = ref<DashboardHttpError | null>(null);
 const wsConnected = ref(false);
 const wsMessage = ref("WebSocket 尚未连接");
-const showParticleDevPanel = import.meta.env.DEV;
-const particlePanelOpen = ref(false);
-const particleSceneState = ref<ParticleSceneState>("running");
-const particleSamplePlaying = ref(false);
-const particleSpeed = ref(1);
-const particleGlow = ref(1);
-const particlePalette = ref<ParticlePalette>("semantic");
 const runtimeStageRef = ref<HTMLElement | null>(null);
 const sourceRackRef = ref<HTMLElement | null>(null);
 const nasShellRef = ref<HTMLElement | null>(null);
@@ -115,47 +96,40 @@ const selectedDisk = computed(() => disks.value.find((disk) => disk.disk_id === 
 const currentExportJob = computed(() => viewSummary.value.export_job);
 const currentExportStatus = computed(() => currentExportJob.value?.export_job_status);
 const currentExportJobId = computed(() => currentExportJob.value?.export_job_id ?? "");
+const hasCurrentExportDisk = computed(
+  () =>
+    Boolean(currentExportJobId.value) &&
+    disks.value.some(
+      (disk) =>
+        disk.export_job_id === currentExportJobId.value &&
+        disk.runtime_status !== "DONE" &&
+        disk.runtime_status !== "REMOVED",
+    ),
+);
 const showParticleStream = computed(
   () =>
-    isActiveExportJobStatus(currentExportStatus.value) &&
-    viewSummary.value.global_progress.total_bytes > 0 &&
-    viewSummary.value.global_progress.done_bytes < viewSummary.value.global_progress.total_bytes,
+    Boolean(currentExportJobId.value) &&
+    disks.value.some(
+      (disk) => disk.export_job_id === currentExportJobId.value && disk.runtime_status === "COPYING",
+    ),
 );
-const particleStreamActive = computed(() => showParticleStream.value || (showParticleDevPanel && particleSamplePlaying.value));
-const particleCanvasActive = computed(() => showParticleStream.value || (showParticleDevPanel && particleSamplePlaying.value && particleSceneState.value === "running"));
 const globalProgressPercent = computed(() =>
   progressPercent(viewSummary.value.global_progress.done_bytes, viewSummary.value.global_progress.total_bytes),
 );
 const objectInventory = computed(() => {
-  const inventory = viewSummary.value.object_inventory;
-  const exportedBytes =
-    inventory?.exported_bytes ||
-    currentExportJob.value?.done_bytes ||
-    viewSummary.value.global_progress.done_bytes ||
-    0;
-  const exportedCount =
-    inventory?.exported_count ||
-    currentExportJob.value?.object_done ||
-    viewSummary.value.global_progress.object_done ||
-    0;
-  return {
-    total_bytes: inventory?.total_bytes ?? viewSummary.value.global_progress.total_bytes,
-    exported_bytes: exportedBytes,
-    total_count: inventory?.total_count ?? viewSummary.value.global_progress.object_total,
-    exported_count: exportedCount,
-  };
+  return (
+    viewSummary.value.object_inventory ?? {
+      total_bytes: 0,
+      exported_bytes: 0,
+      total_count: 0,
+      exported_count: 0,
+    }
+  );
 });
 const rustFsObjectTotal = computed(() => objectInventory.value.total_count);
 const rustFsTotalBytesLabel = computed(() => formatBytes(objectInventory.value.total_bytes));
 const exportedInventoryObjectCount = computed(() => objectInventory.value.exported_count);
 const exportedInventoryBytesLabel = computed(() => formatBytes(objectInventory.value.exported_bytes));
-const runningDisks = computed(() => disks.value.filter((disk) => disk.runtime_status === "COPYING").length);
-const readyDisks = computed(() => disks.value.filter((disk) => disk.runtime_status === "READY" || disk.runtime_status === "DONE").length);
-const removedDisks = computed(() => disks.value.filter((disk) => disk.runtime_status === "REMOVED").length);
-const rejectedDisks = computed(() => disks.value.filter((disk) => disk.runtime_status === "REJECTED").length);
-const errorDisks = computed(() => disks.value.filter((disk) => disk.runtime_status === "ERROR").length);
-const attentionDisks = computed(() => rejectedDisks.value + errorDisks.value);
-const otherWarningDisks = computed(() => disks.value.filter((disk) => disk.last_error_code === "INSUFFICIENT_SPACE").length);
 const selectedProgressPercent = computed(() =>
   progressPercent(
     selectedDisk.value?.progress?.done_bytes ?? selectedDisk.value?.done_bytes ?? 0,
@@ -166,8 +140,8 @@ const hasSelectedCopyTask = computed(() => {
   const disk = selectedDisk.value;
   return Boolean(
     disk?.current_object ||
-      disk?.runtime_status === "COPYING" ||
-      (disk?.progress?.object_total ?? disk?.object_total ?? 0) > 0,
+    disk?.runtime_status === "COPYING" ||
+    (disk?.progress?.object_total ?? disk?.object_total ?? 0) > 0,
   );
 });
 const selectedDiskIndex = computed(() => (selectedDisk.value ? disks.value.findIndex((disk) => disk.disk_id === selectedDisk.value?.disk_id) : -1));
@@ -175,12 +149,7 @@ const selectedSlotLabel = computed(() => (selectedDiskIndex.value >= 0 ? String(
 const selectedDiskTitle = computed(() =>
   selectedDisk.value ? `选中磁盘详情（盘位 ${selectedSlotLabel.value}）` : "选中磁盘详情（未选中）",
 );
-const selectedDiskFreeLabel = computed(() => {
-  const disk = selectedDisk.value;
-  if (!disk) return "未返回";
-  const freePercent = progressPercent(disk.free_bytes, disk.total_bytes);
-  return `${formatBytes(disk.free_bytes)} (${freePercent.toFixed(2)}%)`;
-});
+
 const currentObjectProgressPercent = computed(() =>
   progressPercent(selectedDisk.value?.current_object?.done_bytes ?? 0, selectedDisk.value?.current_object?.size_bytes ?? 0),
 );
@@ -188,41 +157,23 @@ const selectedCurrentObjectName = computed(() => {
   const currentObject = selectedDisk.value?.current_object;
   return currentObject?.display_name || currentObject?.key || "暂无";
 });
-const selectedCurrentObjectSizeLabel = computed(() => {
-  const currentObject = selectedDisk.value?.current_object;
-  return currentObject ? `${formatBytes(currentObject.done_bytes)} / ${formatBytes(currentObject.size_bytes)}` : "0 B / 0 B";
-});
-const exportedObjectPercent = computed(() =>
-  progressPercent(
-    viewSummary.value.global_progress.object_done,
-    viewSummary.value.global_progress.object_total,
-  ),
-);
 const selectedDiskShortName = computed(() => {
   const disk = selectedDisk.value;
   if (!disk) return "未选中";
   const serial = disk.disk_sn ? `SN...${disk.disk_sn.slice(-4)}` : "SN 未返回";
   return `盘位 ${selectedSlotLabel.value}（${serial}）`;
 });
-const sealedJobReadyForPickup = computed(
-  () =>
-    !httpError.value &&
-    currentExportStatus.value === "SEALED" &&
-    viewSummary.value.disks.length > 0 &&
-    Boolean(currentExportJobId.value || viewSummary.value.global_progress.done_bytes > 0),
-);
 const estimatedDone = computed(() => {
   const speed = viewSummary.value.global_progress.speed_bytes_per_sec;
   if (speed <= 0) return "等待速度";
   return formatDuration(Math.ceil(viewSummary.value.global_progress.remaining_bytes / speed));
 });
 const isEmpty = computed(() => !isRefreshing.value && !httpError.value && disks.value.length === 0);
-const edgeDisplayName = computed(() => viewSummary.value.edge_name || viewSummary.value.edge_code || "Edge 本地节点");
-const hasCurrentExport = computed(
-  () =>
-    isActiveExportJobStatus(currentExportStatus.value) &&
-    Boolean(currentExportJobId.value || viewSummary.value.global_progress.total_bytes > 0),
-);
+const hasCurrentExport = computed(() => {
+  if (!isActiveExportJobStatus(currentExportStatus.value)) return false;
+  if (currentExportStatus.value === "PENDING" || currentExportStatus.value === "SCANNING") return true;
+  return hasCurrentExportDisk.value;
+});
 const exportStatusTitle = computed(() => {
   if (httpError.value) return "只读接口不可用";
   if (hasCurrentExport.value) return "当前导出进度";
@@ -310,19 +261,6 @@ function updateParticlePathAnchors() {
   };
 }
 
-function resetParticleControls() {
-  particleSceneState.value = "running";
-  particleSamplePlaying.value = false;
-  particleSpeed.value = 1;
-  particleGlow.value = 1;
-  particlePalette.value = "semantic";
-}
-
-function toggleParticleSample() {
-  particleSamplePlaying.value = !particleSamplePlaying.value;
-  if (particleSamplePlaying.value) particleSceneState.value = "loading";
-}
-
 function openSyncRecords() {
   window.history.pushState({}, "", "/sync-records");
   window.dispatchEvent(new PopStateEvent("popstate"));
@@ -356,15 +294,6 @@ function diskCardStatusLabel(disk: EdgeDiskProgress): string {
   return disk.disk_status_code ? diskStatusDisplay(disk.disk_status_code) : "未返回";
 }
 
-function diskStatusDetail(disk: EdgeDiskProgress): string {
-  if (disk.runtime_status === "REJECTED" || disk.runtime_status === "ERROR") {
-    return diskIssueRawText(disk) ? "" : "等待后端错误详情";
-  }
-  if (disk.runtime_status === "REMOVED") return "等待重新插入";
-  if (disk.runtime_status === "COPYING") return `${formatPercent(disk.done_bytes, disk.total_bytes)} 已写入`;
-  return disk.message || diskStatusDisplay(disk.disk_status_code);
-}
-
 function diskStatusTooltip(disk: EdgeDiskProgress): string {
   if (disk.disk_status_code === "SEALED") return "已封盘：可拔盘送往中控端导入，不可继续用于 Edge 导出。";
   if (disk.disk_status_code === "IMPORTED") return "已导入：请在中控端重新初始化后再用于 Edge 导出。";
@@ -375,10 +304,6 @@ function diskStatusTooltip(disk: EdgeDiskProgress): string {
 
 function diskIssueRawText(disk: EdgeDiskProgress): string {
   return disk.error_message || disk.last_error_code || disk.message || "";
-}
-
-function rejectedDiskStatusLabel(disk: EdgeDiskProgress): string {
-  return edgeRejectedDiskStatusLabel(disk);
 }
 
 function translateDiskIssue(value: string): string {
@@ -436,6 +361,10 @@ function decodeHexAscii(value: string): string | undefined {
 }
 
 function slotUsedBytes(disk: EdgeDiskProgress): number {
+  const capacityBytes = disk.capacity_bytes ?? 0;
+  if (capacityBytes > 0) {
+    return Math.max(0, capacityBytes - Math.min(disk.free_bytes, capacityBytes));
+  }
   const total = slotTotalBytes(disk);
   const doneBytes = disk.progress?.done_bytes ?? disk.done_bytes;
   if (doneBytes > 0) return Math.min(total, doneBytes);
@@ -491,12 +420,6 @@ function formatPercent(doneBytes: number, totalBytes: number): string {
   return `${progressPercent(doneBytes, totalBytes).toFixed(1)}%`;
 }
 
-function formatClock(value: string): string {
-  const date = new Date(value);
-  if (Number.isNaN(date.valueOf())) return "--:--:--";
-  return new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" }).format(date);
-}
-
 function formatDuration(totalSeconds: number): string {
   const hours = Math.floor(totalSeconds / 3600);
   const minutes = Math.floor((totalSeconds % 3600) / 60);
@@ -539,113 +462,28 @@ onBeforeUnmount(() => {
 
 <template>
   <main class="dashboard page-panel">
-    <EdgeTelemetry
-      :http-tone="httpError ? 'warning' : 'ok'"
-      :local-tone="readiness?.ok ? 'ok' : 'quiet'"
-      :ws-tone="wsConnected ? 'ok' : 'quiet'"
-      refresh-label="刷新 Dashboard"
-      :refresh-disabled="isRefreshing"
-      @refresh="refreshFromHttpSummary"
-    />
+    <EdgeTelemetry :http-tone="httpError ? 'warning' : 'ok'" :local-tone="readiness?.ok ? 'ok' : 'quiet'"
+      :ws-tone="wsConnected ? 'ok' : 'quiet'" refresh-label="刷新 Dashboard" :refresh-disabled="isRefreshing"
+      @refresh="refreshFromHttpSummary" />
 
     <section ref="runtimeStageRef" class="runtime-stage" aria-label="Edge 导出运行态">
       <button class="source-rack-link" type="button" aria-label="打开同步记录" title="同步记录" @click="openSyncRecords">
-        <img ref="sourceRackRef" alt="" class="source-rack" src="/assets/fustfs-baseline/source-rack-cutout-v3.webp" @load="updateParticlePathAnchors" />
+        <img ref="sourceRackRef" alt="" class="source-rack" src="/assets/fustfs-baseline/source-rack-cutout-v3.webp"
+          @load="updateParticlePathAnchors" />
       </button>
-      <ParticleAetherField
-        v-if="particleStreamActive"
-        :active="particleCanvasActive"
-        :end-x="particlePathAnchors.endX"
-        :end-y="particlePathAnchors.endY"
-        :glow="particleGlow"
-        :palette="particlePalette"
-        :speed="particleSpeed"
-        :start-x="particlePathAnchors.startX"
-        :start-y="particlePathAnchors.startY"
-      />
-      <aside v-if="showParticleDevPanel" :class="['particle-controls', { 'is-open': particlePanelOpen }]" aria-label="粒子动画调节">
-        <header class="particle-controls-head">
-          <button class="particle-controls-toggle" type="button" :aria-expanded="particlePanelOpen" @click="particlePanelOpen = !particlePanelOpen">
-            <span><i></i>粒子调节</span>
-            <em>{{ particlePanelOpen ? "收起" : "展开" }}</em>
-          </button>
-          <button v-if="particlePanelOpen" class="particle-controls-reset" type="button" @click="resetParticleControls">
-            恢复默认
-          </button>
-        </header>
-        <div v-if="particlePanelOpen" class="particle-controls-body">
-          <section class="particle-control-section motion-sample-section">
-            <div class="motion-sample-heading">
-              <span>
-                <strong>A 首页业务样板</strong>
-                <small>扫描 -> 汇聚装载 -> 传输 -> 校验 -> 可运输</small>
-              </span>
-              <button type="button" :class="{ 'is-playing': particleSamplePlaying }" :aria-pressed="particleSamplePlaying" @click="toggleParticleSample">
-                {{ particleSamplePlaying ? "暂停" : "播放" }}
-              </button>
-            </div>
-            <div class="motion-sample-steps" aria-label="业务动效阶段">
-              <button
-                v-for="(state, index) in particleSceneStates"
-                :key="state"
-                type="button"
-                :class="{ 'is-active': particleSceneState === state }"
-                :aria-pressed="particleSceneState === state"
-                @click="particleSceneState = state"
-              >
-                <i>{{ index + 1 }}</i>
-                <span>{{ particleSceneLabels[state] }}</span>
-              </button>
-            </div>
-          </section>
-          <section class="particle-control-section">
-            <span class="particle-control-label">状态</span>
-            <div class="particle-state-buttons">
-              <button
-                v-for="state in particleSceneStates"
-                :key="state"
-                type="button"
-                :class="{ 'is-active': particleSceneState === state }"
-                :aria-pressed="particleSceneState === state"
-                @click="particleSceneState = state"
-              >
-                {{ particleSceneLabels[state] }}
-              </button>
-            </div>
-          </section>
-          <section class="particle-control-section particle-range-control">
-            <label for="edge-particle-glow"><span>蓝色外发光</span><output>{{ Math.round(particleGlow * 100) }}%</output></label>
-            <input id="edge-particle-glow" v-model.number="particleGlow" type="range" min="0.25" max="2" step="0.05" />
-          </section>
-          <section class="particle-control-section particle-range-control">
-            <label for="edge-particle-speed"><span>传输速度</span><output>{{ particleSpeed.toFixed(2) }}x</output></label>
-            <input id="edge-particle-speed" v-model.number="particleSpeed" type="range" min="0.25" max="2.5" step="0.05" />
-          </section>
-          <section class="particle-control-section">
-            <span class="particle-control-label">颜色</span>
-            <div class="particle-palette-buttons">
-              <button type="button" :class="{ 'is-active': particlePalette === 'semantic' }" @click="particlePalette = 'semantic'"><i></i>语义</button>
-              <button type="button" :class="{ 'is-active': particlePalette === 'electric' }" @click="particlePalette = 'electric'"><i></i>电蓝</button>
-              <button type="button" :class="{ 'is-active': particlePalette === 'cyan' }" @click="particlePalette = 'cyan'"><i></i>青蓝</button>
-              <button type="button" :class="{ 'is-active': particlePalette === 'emerald' }" @click="particlePalette = 'emerald'"><i></i>翠绿</button>
-              <button type="button" :class="{ 'is-active': particlePalette === 'amber' }" @click="particlePalette = 'amber'"><i></i>琥珀</button>
-              <button type="button" :class="{ 'is-active': particlePalette === 'violet' }" @click="particlePalette = 'violet'"><i></i>紫光</button>
-            </div>
-          </section>
-        </div>
-      </aside>
+      <ParticleAetherField v-if="showParticleStream" :end-x="particlePathAnchors.endX"
+        :end-y="particlePathAnchors.endY" :start-x="particlePathAnchors.startX"
+        :start-y="particlePathAnchors.startY" />
       <div class="transport-array">
         <div ref="nasShellRef" class="nas-shell">
-          <img alt="" src="/assets/fustfs-baseline/transport-bay-inner-black-clean-alpha.png" @load="updateParticlePathAnchors" />
+          <img alt="" src="/assets/fustfs-baseline/transport-bay-inner-black-clean-alpha.png"
+            @load="updateParticlePathAnchors" />
           <div class="disk-slot-matrix" aria-label="运输盘位列表">
-            <template v-for="slot in transportSlots" :key="slot.disk ? `${slot.slotNumber}-${slot.disk.disk_id}` : `empty-${slot.slotNumber}`">
-              <button
-                v-if="slot.disk"
-                :aria-pressed="selectedDisk?.disk_id === slot.disk.disk_id"
+            <template v-for="slot in transportSlots"
+              :key="slot.disk ? `${slot.slotNumber}-${slot.disk.disk_id}` : `empty-${slot.slotNumber}`">
+              <button v-if="slot.disk" :aria-pressed="selectedDisk?.disk_id === slot.disk.disk_id"
                 :class="[`slot-${diskTone(slot.disk)}`, { selected: selectedDisk?.disk_id === slot.disk.disk_id }]"
-                type="button"
-                @click="selectDisk(slot.disk)"
-              >
+                type="button" @click="selectDisk(slot.disk)">
                 <b>{{ String(slot.slotNumber).padStart(2, "0") }}</b>
                 <strong class="slot-status" :title="diskStatusTooltip(slot.disk)">
                   {{ diskCardStatusLabel(slot.disk) }}
@@ -663,7 +501,7 @@ onBeforeUnmount(() => {
       </div>
     </section>
 
-    <section v-if="!httpError" :class="['global-progress', 'glass-panel', { idle: !hasCurrentExport }]">
+    <section :class="['global-progress', 'glass-panel', { idle: !hasCurrentExport }]">
       <div>
         <span>{{ exportStatusTitle }}</span>
         <strong v-if="hasCurrentExport">{{ globalProgressPercent.toFixed(0) }}<small>%</small></strong>
@@ -672,76 +510,100 @@ onBeforeUnmount(() => {
       </div>
       <div v-if="hasCurrentExport" class="progress-main">
         <p>
-          <span>已完成 <b>{{ formatBytes(viewSummary.global_progress.done_bytes) }}</b> / {{ formatBytes(viewSummary.global_progress.total_bytes) }}</span>
+          <span>已完成 <b>{{ formatBytes(viewSummary.global_progress.done_bytes) }}</b> / {{
+            formatBytes(viewSummary.global_progress.total_bytes) }}</span>
           <span>剩余 <b>{{ formatBytes(viewSummary.global_progress.remaining_bytes) }}</b></span>
           <span>速度 <b>{{ formatSpeed(viewSummary.global_progress.speed_bytes_per_sec) }}</b></span>
         </p>
         <div class="progress-track"><b :style="{ width: `${globalProgressPercent}%` }"></b></div>
         <dl>
-          <div><dt>文件</dt><dd>{{ rustFsObjectTotal.toLocaleString() }}</dd></div>
-          <div><dt>对象</dt><dd>{{ exportedInventoryObjectCount.toLocaleString() }}</dd></div>
-          <div><dt>批次</dt><dd>{{ currentExportJobId || "暂无" }}</dd></div>
-          <div><dt>预计完成</dt><dd>{{ estimatedDone }}</dd></div>
+          <div>
+            <dt>文件</dt>
+            <dd>{{ rustFsObjectTotal.toLocaleString() }}</dd>
+          </div>
+          <div>
+            <dt>对象</dt>
+            <dd>{{ exportedInventoryObjectCount.toLocaleString() }}</dd>
+          </div>
+          <div>
+            <dt>批次</dt>
+            <dd>{{ currentExportJobId || "暂无" }}</dd>
+          </div>
+          <div>
+            <dt>预计完成</dt>
+            <dd>{{ estimatedDone }}</dd>
+          </div>
         </dl>
       </div>
       <div v-else class="progress-main idle-copy">
         <p>{{ exportStatusNotice }}</p>
         <dl>
-          <div><dt>现场盘位</dt><dd>{{ disks.length }} 盘位</dd></div>
-          <div><dt>未注册盘</dt><dd>会展示</dd></div>
-          <div><dt>历史批次</dt><dd>同步记录</dd></div>
-          <div><dt>浏览器权限</dt><dd>只读</dd></div>
+          <div>
+            <dt>现场盘位</dt>
+            <dd>{{ disks.length }} 盘位</dd>
+          </div>
+          <div>
+            <dt>未注册盘</dt>
+            <dd>会展示</dd>
+          </div>
+          <div>
+            <dt>历史批次</dt>
+            <dd>同步记录</dd>
+          </div>
+          <div>
+            <dt>浏览器权限</dt>
+            <dd>只读</dd>
+          </div>
         </dl>
       </div>
     </section>
 
-    <section v-if="httpError" class="selected-disk-strip glass-panel error-state" aria-label="Edge Dashboard 错误态">
-      <div class="selected-disk-content">
-        <strong>Edge Dashboard 只读接口不可用</strong>
-        <dl>
-          <div><dt>错误码</dt><dd class="tone-running">{{ httpError.error_code }}</dd></div>
-          <div><dt>HTTP</dt><dd>{{ httpError.http_status ?? "未返回" }}</dd></div>
-          <div><dt>展示策略</dt><dd>不展示模拟进度、模拟盘位或模拟对象</dd></div>
-          <div><dt>WebSocket</dt><dd>{{ wsMessage }}</dd></div>
-        </dl>
-      </div>
-    </section>
 
-    <section v-else-if="sealedJobReadyForPickup" class="selected-disk-strip glass-panel" aria-label="封盘完成可拔盘">
-      <div class="selected-disk-content">
-        <strong>最近导出任务已封盘，可拔盘</strong>
-        <dl>
-          <div><dt>导出任务</dt><dd>{{ currentExportJobId || "未返回" }}</dd></div>
-          <div><dt>导出任务状态</dt><dd class="tone-running">{{ currentExportStatus ?? "未返回" }}</dd></div>
-          <div><dt>盘内状态</dt><dd class="tone-running">已封盘</dd></div>
-          <div><dt>已导出</dt><dd>{{ formatBytes(viewSummary.global_progress.done_bytes) }}</dd></div>
-        </dl>
-      </div>
-    </section>
-
-    <section v-else-if="selectedDisk && selectedDiskDetailVisible" class="selected-disk-strip glass-panel" aria-label="选中磁盘详情">
+    <section v-if="selectedDisk && selectedDiskDetailVisible" class="selected-disk-strip glass-panel"
+      aria-label="选中磁盘详情">
       <div class="selected-disk-content">
         <strong>{{ selectedDiskTitle }}</strong>
         <dl>
-          <div><dt>磁盘 ID</dt><dd>{{ selectedDisk?.disk_id ?? "未返回" }}</dd></div>
-          <div><dt>挂载路径</dt><dd>{{ selectedDisk?.mount_path ?? "未返回" }}</dd></div>
-          <div><dt>硬盘 SN</dt><dd>{{ selectedDisk ? slotSnLabel(selectedDisk) : "未返回" }}</dd></div>
-          <div><dt>系统格式</dt><dd>{{ selectedDisk?.filesystem ?? selectedDisk?.filesystem_uuid ?? "未返回" }}</dd></div>
-          <div><dt>运行状态</dt><dd class="tone-running">{{ selectedDisk ? diskStatusLabel(selectedDisk) : "未返回" }}</dd></div>
-          <div><dt>盘内状态</dt><dd class="tone-running">{{ diskLifecycleStatusLabel(selectedDisk) }}</dd></div>
-          <div v-if="hasSelectedCopyTask"><dt>拷贝进度</dt><dd>{{ selectedProgressPercent.toFixed(2) }}%</dd></div>
-          <div v-if="hasSelectedCopyTask"><dt>当前文件</dt><dd :title="selectedCurrentObjectName">{{ selectedCurrentObjectName }}</dd></div>
-          <div><dt>容量</dt><dd>{{ selectedDisk ? formatTbPair(selectedDisk) : "0.00/0.00 TB" }}</dd></div>
+          <div>
+            <dt>磁盘 ID</dt>
+            <dd>{{ selectedDisk?.disk_id ?? "未返回" }}</dd>
+          </div>
+          <div>
+            <dt>挂载路径</dt>
+            <dd>{{ selectedDisk?.mount_path ?? "未返回" }}</dd>
+          </div>
+          <div>
+            <dt>硬盘 SN</dt>
+            <dd>{{ selectedDisk ? slotSnLabel(selectedDisk) : "未返回" }}</dd>
+          </div>
+          <div>
+            <dt>系统格式</dt>
+            <dd>{{ selectedDisk?.filesystem ?? selectedDisk?.filesystem_uuid ?? "未返回" }}</dd>
+          </div>
+          <div>
+            <dt>运行状态</dt>
+            <dd class="tone-running">{{ selectedDisk ? diskStatusLabel(selectedDisk) : "未返回" }}</dd>
+          </div>
+          <div>
+            <dt>盘内状态</dt>
+            <dd class="tone-running">{{ diskLifecycleStatusLabel(selectedDisk) }}</dd>
+          </div>
+          <div v-if="hasSelectedCopyTask">
+            <dt>拷贝进度</dt>
+            <dd>{{ selectedProgressPercent.toFixed(2) }}%</dd>
+          </div>
+          <div v-if="hasSelectedCopyTask">
+            <dt>当前文件</dt>
+            <dd :title="selectedCurrentObjectName">{{ selectedCurrentObjectName }}</dd>
+          </div>
+          <div>
+            <dt>已用/总容量</dt>
+            <dd>{{ selectedDisk ? formatTbPair(selectedDisk) : "0.00/0.00 TB" }}</dd>
+          </div>
         </dl>
       </div>
-      <button
-        class="selected-disk-close"
-        type="button"
-        aria-label="关闭选中磁盘详情"
-        title="关闭"
-        @pointerdown.stop
-        @click.stop="clearSelectedDisk"
-      >
+      <button class="selected-disk-close" type="button" aria-label="关闭选中磁盘详情" title="关闭" @pointerdown.stop
+        @click.stop="clearSelectedDisk">
         ×
       </button>
     </section>
@@ -750,10 +612,22 @@ onBeforeUnmount(() => {
       <article class="overview-panel glass-panel">
         <h2>扫描与导出概览</h2>
         <dl class="overview-metrics">
-          <div><dt>RustFS对象总数</dt><dd>{{ rustFsObjectTotal.toLocaleString() }}</dd></div>
-          <div><dt>总数据量</dt><dd>{{ rustFsTotalBytesLabel }}</dd></div>
-          <div><dt>已导出对象</dt><dd>{{ exportedInventoryObjectCount.toLocaleString() }}</dd></div>
-          <div><dt>已导出数据量</dt><dd>{{ exportedInventoryBytesLabel }}</dd></div>
+          <div>
+            <dt>对象总数</dt>
+            <dd>{{ rustFsObjectTotal.toLocaleString() }}</dd>
+          </div>
+          <div>
+            <dt>总数据量</dt>
+            <dd>{{ rustFsTotalBytesLabel }}</dd>
+          </div>
+          <div>
+            <dt>已导出对象</dt>
+            <dd>{{ exportedInventoryObjectCount.toLocaleString() }}</dd>
+          </div>
+          <div>
+            <dt>已导出数据量</dt>
+            <dd>{{ exportedInventoryBytesLabel }}</dd>
+          </div>
         </dl>
       </article>
 
@@ -762,26 +636,35 @@ onBeforeUnmount(() => {
           <h2>当前对象与异常处理</h2>
           <div v-if="selectedDisk" class="object-detail-grid">
             <dl>
-              <dt>对象路径</dt><dd>{{ selectedDisk.current_object?.key ?? "暂无" }}</dd>
-              <dt>对象状态</dt><dd class="tone-running">{{ selectedDisk.current_object?.object_status ?? "等待对象" }}</dd>
-              <dt>剩余大小</dt><dd>{{ formatBytes(selectedDisk.current_object?.remaining_bytes ?? 0) }} / {{ formatBytes(selectedDisk.current_object?.size_bytes ?? 0) }}</dd>
+              <dt>对象路径</dt>
+              <dd>{{ selectedDisk.current_object?.key ?? "暂无" }}</dd>
+              <dt>对象状态</dt>
+              <dd class="tone-running">{{ selectedDisk.current_object?.object_status ?? "等待对象" }}</dd>
+              <dt>剩余大小</dt>
+              <dd>{{ formatBytes(selectedDisk.current_object?.remaining_bytes ?? 0) }} / {{
+                formatBytes(selectedDisk.current_object?.size_bytes ?? 0) }}</dd>
             </dl>
             <dl>
-              <dt>传输速度</dt><dd>{{ formatSpeed(selectedDisk.speed_bytes_per_sec ?? 0) }}</dd>
-              <dt>文件系统</dt><dd>{{ selectedDiskShortName }}</dd>
-              <dt>对象标识</dt><dd>{{ selectedDisk.current_object?.key ?? "未返回" }}</dd>
+              <dt>传输速度</dt>
+              <dd>{{ formatSpeed(selectedDisk.speed_bytes_per_sec ?? 0) }}</dd>
+              <dt>对象标识</dt>
+              <dd>{{ selectedDisk.current_object?.key ?? "未返回" }}</dd>
             </dl>
             <dl>
-              <dt>加密状态</dt><dd>{{ selectedDisk.current_object ? "已加密" : "未返回" }}</dd>
-              <dt>写入阶段</dt><dd>{{ selectedDisk.runtime_status }}</dd>
-              <dt>校验状态</dt><dd>{{ diskLifecycleStatusLabel(selectedDisk) }}</dd>
+              <dt>加密状态</dt>
+              <dd>{{ selectedDisk.current_object ? "已加密" : "未返回" }}</dd>
+              <dt>写入阶段</dt>
+              <dd>{{ selectedDisk.runtime_status }}</dd>
+              <dt>校验状态</dt>
+              <dd>{{ diskLifecycleStatusLabel(selectedDisk) }}</dd>
             </dl>
           </div>
           <p v-else class="object-empty">
             未选中运输盘。未注册或异常盘只有在 Edge 后端检测并返回后才会显示。
           </p>
           <div class="object-progress-row">
-            <div class="progress-track object-progress"><b :style="{ width: `${currentObjectProgressPercent}%` }"></b></div>
+            <div class="progress-track object-progress"><b :style="{ width: `${currentObjectProgressPercent}%` }"></b>
+            </div>
             <span>{{ currentObjectProgressPercent.toFixed(2) }}%</span>
           </div>
         </div>

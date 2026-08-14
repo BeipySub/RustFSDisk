@@ -989,8 +989,10 @@ mod tests {
                 );
                 progress.register_disk(
                     "11111111-1111-1111-1111-111111111111",
+                    "presence-a",
                     "SN-A",
                     "/mnt/rustfs-transfer/disk-a",
+                    100,
                     99,
                     2,
                     80,
@@ -1460,8 +1462,10 @@ mod tests {
         );
         progress.register_disk(
             "11111111-1111-1111-1111-111111111111",
+            "presence-a",
             "SN-A",
             "/mnt/rustfs-transfer/disk-a",
+            100,
             99,
             1,
             80,

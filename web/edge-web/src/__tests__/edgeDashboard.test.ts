@@ -5,7 +5,6 @@ import {
   buildExportJobsUrl,
   edgeDiskPrimaryStatusLabel,
   diskStatusDisplay,
-  edgeRejectedDiskStatusLabel,
   isActiveExportJobStatus,
   localEdgePath,
   normalizeEdgeDashboardSummary,
@@ -101,18 +100,6 @@ test("normalizes summary and keeps imported disk lifecycle visible in Edge UI", 
   assert.equal(diskStatusDisplay(summary.disks[0]?.disk_status_code), "已导入");
 });
 
-test("labels sealed rejected disk as sealed instead of uninitialized", () => {
-  assert.equal(
-    edgeRejectedDiskStatusLabel({
-      disk_status_code: "SEALED",
-      last_error_code: "MANIFEST_INVALID",
-      error_message: "MANIFEST_INVALID: disk status_code SEALED is not eligible for offline edge export; expected INITIALIZED",
-      message: "",
-    }),
-    "已封盘",
-  );
-});
-
 test("uses imported lifecycle as primary label even when runtime is rejected", () => {
   assert.equal(
     edgeDiskPrimaryStatusLabel({
@@ -149,30 +136,6 @@ test("does not use runtime status as disk lifecycle primary label", () => {
       message: "",
     }),
     "未返回",
-  );
-});
-
-test("labels imported rejected disk as imported instead of uninitialized", () => {
-  assert.equal(
-    edgeRejectedDiskStatusLabel({
-      disk_status_code: "IMPORTED",
-      last_error_code: "MANIFEST_INVALID",
-      error_message: "MANIFEST_INVALID: disk status_code IMPORTED is not eligible for offline edge export; expected INITIALIZED",
-      message: "",
-    }),
-    "已导入",
-  );
-});
-
-test("labels missing disk info as uninitialized", () => {
-  assert.equal(
-    edgeRejectedDiskStatusLabel({
-      disk_status_code: undefined,
-      last_error_code: "MISSING_DISK_INFO",
-      error_message: "missing disk_info.json transport protocol file",
-      message: "",
-    }),
-    "未初始化",
   );
 });
 
@@ -782,6 +745,97 @@ test("does not resurrect a removed disk when HTTP summary has no current disks",
   assert.equal(merged.message, "DISK_UNPLUGGED");
 });
 
+test("upgrades a temporary detected card with copy progress without losing physical capacity", () => {
+  const summary = normalizeEdgeDashboardSummary({
+    source: "edge",
+    edge_code: "edge-demo",
+    disks: [{
+      disk_presence_id: "probe-presence",
+      disk_id: "",
+      disk_sn: "SN-A",
+      hardware_serial: "SN-A",
+      mount_path: "/media/edge/disk-a",
+      runtime_status: "CHECKING",
+      capacity_bytes: 1000,
+    }],
+  });
+
+  const merged = applyCopyProgressEvent(summary, {
+    protocol_version: "edge-ws-v2",
+    event_id: "copy-a",
+    event_type: "COPY_PROGRESS",
+    event_time: "2026-08-14T03:00:00Z",
+    source: "edge",
+    edge_code: "edge-demo",
+    disks: [{
+      disk_presence_id: "runtime-presence",
+      disk_id: "disk-a",
+      disk_sn: "SN-A",
+      stable_hardware_id: "SN-A",
+      mount_path: "/media/edge/disk-a",
+      runtime_status: "COPYING",
+      capacity_bytes: 0,
+      total_bytes: 100,
+      done_bytes: 20,
+      remaining_bytes: 80,
+      free_bytes: 900,
+      speed_bytes_per_sec: 10,
+      object_total: 1,
+      object_done: 0,
+      object_remaining: 1,
+      current_object: null,
+      message: "copying",
+    }],
+  });
+
+  assert.equal(merged.disks.length, 1);
+  assert.equal(merged.disks[0]?.disk_id, "disk-a");
+  assert.equal(merged.disks[0]?.capacity_bytes, 1000);
+  assert.equal(merged.disks[0]?.runtime_status, "COPYING");
+});
+
+test("removes only the unplugged disk and hides its sealed task summary", () => {
+  const summary = normalizeEdgeDashboardSummary({
+    source: "edge",
+    edge_code: "edge-demo",
+    edge_name: "edge-demo",
+    object_inventory: { total_bytes: 10, exported_bytes: 10, total_count: 1, exported_count: 1 },
+    export_job: exportJob("job-sealed", "SEALED", {
+      total_bytes: 10,
+      done_bytes: 10,
+      object_total: 1,
+      object_done: 1,
+    }),
+    global: { total_bytes: 10, done_bytes: 10, remaining_bytes: 0, speed_bytes_per_sec: 0, object_total: 1, object_done: 1, object_remaining: 0 },
+    global_progress: { total_bytes: 10, done_bytes: 10, remaining_bytes: 0, speed_bytes_per_sec: 0, object_total: 1, object_done: 1, object_remaining: 0 },
+    disks: [
+      { disk_presence_id: "presence-a", disk_id: "disk-a", disk_sn: "SN-A", runtime_status: "SEALED" },
+      { disk_presence_id: "presence-b", disk_id: "disk-b", disk_sn: "SN-B", runtime_status: "READY" },
+    ],
+    ws_connected: true,
+    last_http_refresh_at: "2026-08-14T02:42:00Z",
+    message: "sealed",
+  });
+
+  const merged = applyCopyProgressEvent(summary, {
+    protocol_version: "edge-ws-v2",
+    event_id: "event-unplugged-a",
+    event_type: "DISK_UNPLUGGED",
+    event_time: "2026-08-14T02:43:00Z",
+    source: "edge",
+    edge_code: "edge-demo",
+    global: { total_bytes: 0, done_bytes: 0, remaining_bytes: 0, speed_bytes_per_sec: 0, object_total: 0, object_done: 0, object_remaining: 0 },
+    global_progress: { total_bytes: 0, done_bytes: 0, remaining_bytes: 0, speed_bytes_per_sec: 0, object_total: 0, object_done: 0, object_remaining: 0 },
+    disks: [{ disk_presence_id: "presence-a", disk_id: "disk-a", disk_sn: "SN-A", runtime_status: "REMOVED" }],
+    message: "removed",
+  });
+
+  assert.equal(merged.disks.length, 1);
+  assert.equal(merged.disks[0]?.disk_presence_id, "presence-b");
+  assert.equal(merged.export_job, undefined);
+  assert.equal(merged.global.done_bytes, 0);
+});
+
 test("preserves HTTP object inventory when websocket omits inventory", () => {
   const summary = normalizeEdgeDashboardSummary({
     source: "edge",
@@ -1093,7 +1147,7 @@ test("keeps sealed lifecycle when websocket updates rejected runtime", () => {
   assert.equal(edgeDiskPrimaryStatusLabel(merged.disks[0]!), "已封盘");
 });
 
-test("marks a disk removed when websocket sends an unplug event for that disk", () => {
+test("removes a disk card when websocket sends an unplug event for that disk", () => {
   const summary = normalizeEdgeDashboardSummary({
     source: "edge",
     edge_code: "edge-demo",
@@ -1152,7 +1206,5 @@ test("marks a disk removed when websocket sends an unplug event for that disk", 
     message: "removed",
   });
 
-  assert.equal(merged.disks.length, 1);
-  assert.equal(merged.disks[0]?.runtime_status, "REMOVED");
-  assert.equal(merged.disks[0]?.last_error_code, "DISK_REMOVED");
+  assert.equal(merged.disks.length, 0);
 });

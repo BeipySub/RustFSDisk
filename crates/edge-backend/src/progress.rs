@@ -168,6 +168,7 @@ pub struct ProgressAggregator {
 struct ProgressState {
     edge_code: String,
     export_job_id: String,
+    object_inventory: ObjectInventorySnapshot,
     event_type: String,
     disk_status_code: String,
     export_job_status: String,
@@ -178,9 +179,11 @@ struct ProgressState {
 #[derive(Debug, Clone)]
 struct DiskProgress {
     disk_id: String,
+    disk_presence_id: String,
     disk_sn: String,
     mount_path: String,
     runtime_status: String,
+    capacity_bytes: u64,
     total_bytes: u64,
     done_bytes: u64,
     free_bytes: u64,
@@ -196,6 +199,7 @@ impl ProgressAggregator {
             inner: Arc::new(Mutex::new(ProgressState {
                 edge_code: edge_code.into(),
                 export_job_id: export_job_id.into(),
+                object_inventory: ObjectInventorySnapshot::default(),
                 event_type: "COPY_STARTED".to_string(),
                 disk_status_code: "EDGE_COPYING".to_string(),
                 export_job_status: "COPYING".to_string(),
@@ -208,21 +212,46 @@ impl ProgressAggregator {
     pub fn register_disk(
         &self,
         disk_id: impl Into<String>,
+        disk_presence_id: impl Into<String>,
         disk_sn: impl Into<String>,
         mount_path: impl Into<String>,
+        capacity_bytes: u64,
         total_bytes: u64,
         object_total: u64,
         free_bytes: u64,
     ) {
         let disk_id = disk_id.into();
+        let disk_presence_id = disk_presence_id.into();
+        let disk_sn = disk_sn.into();
+        let mount_path = mount_path.into();
         let mut state = self.inner.lock().expect("progress mutex poisoned");
+        if let Some(existing) = state.disks.get_mut(&disk_id) {
+            if existing.disk_presence_id.is_empty() {
+                existing.disk_presence_id = disk_presence_id;
+            }
+            if existing.disk_sn.is_empty() {
+                existing.disk_sn = disk_sn;
+            }
+            if existing.mount_path.is_empty() {
+                existing.mount_path = mount_path;
+            }
+            if existing.capacity_bytes == 0 {
+                existing.capacity_bytes = capacity_bytes;
+            }
+            existing.total_bytes = total_bytes;
+            existing.object_total = object_total;
+            existing.free_bytes = free_bytes;
+            return;
+        }
         state.disks.insert(
             disk_id.clone(),
             DiskProgress {
                 disk_id,
-                disk_sn: disk_sn.into(),
-                mount_path: mount_path.into(),
+                disk_presence_id,
+                disk_sn,
+                mount_path,
                 runtime_status: "COPYING".to_string(),
+                capacity_bytes,
                 total_bytes,
                 done_bytes: 0,
                 free_bytes,
@@ -369,7 +398,7 @@ impl ProgressAggregator {
                     .map(|object| object.done_bytes)
                     .unwrap_or(0);
                 DiskProgressSnapshot {
-                    disk_presence_id: String::new(),
+                    disk_presence_id: disk.disk_presence_id.clone(),
                     disk_id: disk.disk_id.clone(),
                     disk_sn: disk.disk_sn.clone(),
                     hardware_serial: disk.disk_sn.clone(),
@@ -380,7 +409,7 @@ impl ProgressAggregator {
                     filesystem: None,
                     fs_uuid: None,
                     filesystem_uuid: None,
-                    capacity_bytes: 0,
+                    capacity_bytes: disk.capacity_bytes,
                     runtime_status: disk.runtime_status.clone(),
                     disk_status_code: state.disk_status_code.clone(),
                     task_pool_eligible: false,
@@ -445,7 +474,7 @@ impl ProgressAggregator {
             stage: Some(copy_stage(&state.event_type).to_string()),
             edge_name: state.edge_code.clone(),
             scan: None,
-            object_inventory: ObjectInventorySnapshot::default(),
+            object_inventory: state.object_inventory.clone(),
             export_job: Some(export_job),
             global: global_progress.clone(),
             global_progress,
@@ -455,6 +484,13 @@ impl ProgressAggregator {
             last_http_refresh_at: Utc::now(),
             message: message.into(),
         }
+    }
+
+    pub fn set_object_inventory(&self, object_inventory: ObjectInventorySnapshot) {
+        self.inner
+            .lock()
+            .expect("progress mutex poisoned")
+            .object_inventory = object_inventory;
     }
 }
 

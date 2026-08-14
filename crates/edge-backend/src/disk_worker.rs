@@ -253,8 +253,10 @@ where
         let total_bytes = objects.iter().map(|object| object.chunk_size_bytes).sum();
         self.progress.register_disk(
             self.config.disk_id.to_string(),
+            "",
             self.config.disk_sn.clone(),
             self.config.mount_path.display().to_string(),
+            0,
             total_bytes,
             objects.len() as u64,
             self.config.free_bytes,

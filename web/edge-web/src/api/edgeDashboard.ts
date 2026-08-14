@@ -87,6 +87,7 @@ export interface EdgeDiskProgress {
   capacity_bytes?: number;
   object_budget_bytes?: number;
   task_pool_eligible?: boolean;
+  export_job_id?: string;
   progress?: EdgeDiskProgressSnapshot;
   total_bytes: number;
   done_bytes: number;
@@ -233,6 +234,7 @@ interface EdgeControlDiskRuntime {
   disk_status_code?: string | null;
   runtime_status?: string | null;
   task_pool_eligible?: boolean;
+  export_job_id?: string | null;
   progress?: Partial<EdgeDiskProgressSnapshot> | null;
   capacity_bytes?: number;
   free_bytes?: number;
@@ -454,6 +456,7 @@ export function normalizeDiskProgress(
     capacity_bytes: capacityBytes,
     object_budget_bytes: budgetBytes,
     task_pool_eligible: disk.task_pool_eligible,
+    export_job_id: nullableString(disk.export_job_id),
     progress,
     total_bytes: progress.total_bytes || budgetBytes || capacityBytes,
     done_bytes: progress.done_bytes,
@@ -487,20 +490,6 @@ export function diskStatusDisplay(value: EdgeVisibleDiskStatusCode | undefined):
   if (value === "IMPORTED") return "已导入";
   if (value === "ERROR") return "异常";
   return "未返回";
-}
-
-export function edgeRejectedDiskStatusLabel(
-  disk: Pick<EdgeDiskProgress, "disk_status_code" | "last_error_code" | "error_message" | "message">,
-): string {
-  if (disk.disk_status_code === "SEALED") return "已封盘";
-  if (disk.disk_status_code === "IMPORTED") return "已导入";
-  if (disk.disk_status_code === "CENTER_IMPORTING") return "中控导入中";
-  if (disk.disk_status_code === "UNREGISTERED") return "未注册";
-  const reason = disk.error_message || disk.last_error_code || disk.message || "";
-  if (isEdgeUninitializedDiskIssue(reason)) return "未初始化";
-  if (isEdgeUnregisteredDiskIssue(reason)) return "未注册";
-  if (isEdgeUnsupportedDiskIssue(reason)) return "不可导出";
-  return "拒绝";
 }
 
 export function edgeDiskPrimaryStatusLabel(

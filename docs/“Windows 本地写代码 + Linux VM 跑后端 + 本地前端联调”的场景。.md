@@ -22,6 +22,50 @@
 | Edge Mutagen 同步会话 | `rustfs-edge-dev` |
 | Center Mutagen 同步会话 | `rustfs-center-dev` |
 
+
+当前配置已经是“本机端口代理到 VM”的方式，Vite 不需要再改。
+
+### 本机端口代理到 VM”的方式
+Vite 默认目标：
+
+```ts
+// Edge: web/edge-web/vite.config.ts
+http://127.0.0.1:8081
+
+// Center: web/center-web/vite.config.ts
+http://127.0.0.1:8080
+```
+
+关键是本机要各有一条 SSH 隧道。分别开两个 PowerShell 窗口运行：
+
+```powershell
+ssh -N -L 127.0.0.1:8081:127.0.0.1:8081 rustfs-edge
+```
+
+```powershell
+ssh -N -L 127.0.0.1:8080:127.0.0.1:8080 rustfs-center
+```
+
+然后启动前端：
+
+```powershell
+cd F:\work\RustFSDisk\web\edge-web
+npm run dev
+```
+
+```powershell
+cd F:\work\RustFSDisk\web\center-web
+npm run dev
+```
+
+浏览器访问：
+
+- Edge：`http://localhost:5174`
+- Center：`http://localhost:5173`
+
+你现在代理已验证成功，不用重复开 SSH 隧道；若重复执行并提示端口被占用，说明原隧道仍在运行。
+
+
 ## 整体链路
 
 ```text
@@ -198,7 +242,9 @@ ssh rustfs-edge
 
 ```bash
 cd ~/RustFSDisk-dev
-
+set -a
+. /etc/rustfs-transfer/edge.env
+set +a
 export RUSTFS_TRANSFER__CONFIG_PATH=/etc/rustfs-transfer/edge.toml
 export RUSTFS_TRANSFER__PATHS__DATA_DIR=/var/lib/rustfs-transfer/edge
 export RUSTFS_TRANSFER__PATHS__LOG_DIR=/var/log/rustfs-transfer/edge

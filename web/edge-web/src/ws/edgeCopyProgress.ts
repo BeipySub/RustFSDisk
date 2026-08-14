@@ -150,7 +150,12 @@ export function applyCopyProgressEvent(
     message: event.message || summary.message,
   });
 
-  const nextDisks = mergeDisksByDiskId(summary.disks, normalizedEvent.disks);
+  const diskUnplugged = event.event_type === "DISK_UNPLUGGED";
+  const nextDisks = diskUnplugged
+    ? removeDisksByIdentity(summary.disks, normalizedEvent.disks)
+    : mergeDisksByDiskId(summary.disks, normalizedEvent.disks);
+  const clearTerminalExport =
+    diskUnplugged && isTerminalExportJob(summary.export_job?.export_job_status);
   const objectInventory = hasUsableObjectInventory(event.object_inventory)
     ? normalizedEvent.object_inventory
     : summary.object_inventory;
@@ -161,12 +166,17 @@ export function applyCopyProgressEvent(
     edge_name: event.edge_name || summary.edge_name,
     object_inventory: objectInventory,
     export_job:
-      event.event_type === "COPY_PROGRESS" && event.export_job !== undefined
+      clearTerminalExport
+        ? undefined
+        : event.event_type === "COPY_PROGRESS" && event.export_job !== undefined
         ? normalizedEvent.export_job
         : summary.export_job,
-    global: event.event_type === "COPY_PROGRESS" ? normalizedEvent.global : summary.global,
+    global:
+      clearTerminalExport || event.event_type === "COPY_PROGRESS"
+        ? normalizedEvent.global
+        : summary.global,
     global_progress:
-      event.event_type === "COPY_PROGRESS"
+      clearTerminalExport || event.event_type === "COPY_PROGRESS"
         ? normalizedEvent.global_progress
         : summary.global_progress,
     disks: nextDisks,
@@ -174,6 +184,17 @@ export function applyCopyProgressEvent(
     last_http_refresh_at: summary.last_http_refresh_at,
     message: event.message || summary.message,
   };
+}
+
+function removeDisksByIdentity(
+  current: EdgeDiskProgress[],
+  removed: EdgeDiskProgress[],
+): EdgeDiskProgress[] {
+  return current.filter((disk) => !removed.some((candidate) => sameDisk(disk, candidate)));
+}
+
+function isTerminalExportJob(exportJobStatus: string | undefined): boolean {
+  return ["SEALED", "FAILED", "CANCELLED"].includes(exportJobStatus ?? "");
 }
 
 function mergeDisksByDiskId(
@@ -184,7 +205,7 @@ function mergeDisksByDiskId(
   for (const next of incoming) {
     const index = disks.findIndex((disk) => sameDisk(disk, next));
     if (index >= 0) {
-      disks[index] = { ...disks[index], ...next };
+      disks[index] = mergeDiskProgress(disks[index], next);
     } else {
       disks.push(next);
     }
@@ -192,17 +213,39 @@ function mergeDisksByDiskId(
   return disks;
 }
 
+function mergeDiskProgress(current: EdgeDiskProgress, next: EdgeDiskProgress): EdgeDiskProgress {
+  return {
+    ...current,
+    ...next,
+    disk_presence_id: next.disk_presence_id || current.disk_presence_id,
+    hardware_serial: next.hardware_serial || current.hardware_serial,
+    stable_hardware_id: next.stable_hardware_id || current.stable_hardware_id,
+    mount_path: next.mount_path || current.mount_path,
+    device_path: next.device_path || current.device_path,
+    filesystem: next.filesystem || current.filesystem,
+    filesystem_type: next.filesystem_type || current.filesystem_type,
+    filesystem_uuid: next.filesystem_uuid || current.filesystem_uuid,
+    fs_uuid: next.fs_uuid || current.fs_uuid,
+    capacity_bytes: next.capacity_bytes || current.capacity_bytes,
+    object_budget_bytes: next.object_budget_bytes || current.object_budget_bytes,
+  };
+}
+
 function sameDisk(left: EdgeDiskProgress, right: EdgeDiskProgress): boolean {
-  if (left.disk_presence_id && right.disk_presence_id) {
-    return left.disk_presence_id === right.disk_presence_id;
-  }
   const leftHasRealDiskId = left.disk_id && !left.disk_id.startsWith("unidentified-disk-");
   const rightHasRealDiskId = right.disk_id && !right.disk_id.startsWith("unidentified-disk-");
   if (leftHasRealDiskId && rightHasRealDiskId) return left.disk_id === right.disk_id;
+  if (left.disk_presence_id && right.disk_presence_id) {
+    if (left.disk_presence_id === right.disk_presence_id) return true;
+  }
   if (left.stable_hardware_id && right.stable_hardware_id) {
     return left.stable_hardware_id === right.stable_hardware_id;
   }
-  return Boolean(left.mount_path && right.mount_path && left.mount_path === right.mount_path);
+  const sameMountPath = Boolean(left.mount_path && right.mount_path && left.mount_path === right.mount_path);
+  if (!sameMountPath) return false;
+  const leftHardwareId = left.stable_hardware_id || left.hardware_serial || left.disk_sn;
+  const rightHardwareId = right.stable_hardware_id || right.hardware_serial || right.disk_sn;
+  return Boolean(leftHardwareId && rightHardwareId && leftHardwareId === rightHardwareId);
 }
 
 function hasUsableObjectInventory(value: EdgeObjectInventory | undefined): boolean {
