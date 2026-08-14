@@ -160,6 +160,21 @@
 | TASK-S1-P0-EDGE-OFFLINE-PACK-001 | Edge 离线打包：删除运行期 Center 校验和 export-key，复用 edge_auth_secret 派生封盘 disk_data_key | P0 解阻塞 | Edge / Center / Deploy / QA | [x] | Day 4 需求调整 | TASK-S1-SECURITY-HOTFIX-007, TASK-S1-EDGE-005, TASK-S1-CENTER-004 |
 | TASK-S1-EDGE-REALTIME-QA-001 | Edge 前后端实时可视化端到端联调验收 | P0 解阻塞 | Integration / QA | [x] | Day 3 下午 | TASK-S1-P0-EDGE-OFFLINE-PACK-001, TASK-S1-EDGE-AUTO-001, TASK-S1-EDGE-WS-BOOT-001, TASK-S1-WEB-EDGE-TIMELINE-001, TASK-S1-EDGE-AUTO-DEPLOY-001 |
 | TASK-S1-INTEGRATION-001 | 主闭环联调、验收、风险登记和交付检查 | P2 交付增强 | Integration | [~] | Day 2 下午 | Day 2 主闭环任务 |
+| TASK-S2-PACK-DATAPLANE-001 | v2 运输盘 pack 数据面整体升级 | P0 解阻塞 | Common / Edge / Center / DB | [x] | Day 5 | TASK-S1-INTEGRATION-001 |
+
+---
+
+# 开发任务卡片：TASK-S2-PACK-DATAPLANE-001
+
+### 任务基本信息
+
+- **任务 ID**：TASK-S2-PACK-DATAPLANE-001
+- **任务名称**：v2 运输盘 pack 数据面整体升级
+- **所属 Track / 模块**：Common、Edge、Center、DB
+- **任务状态**：[x] 已完成
+- **负责人 / Role**：Codex
+- **范围**：替换对象独立密文文件/metadata sidecar 为顺序 pack 与记录清单；不改变任务状态、对象调度、HTTP 控制和 WebSocket。
+- **验收**：Edge 写出 v2 pack 和摘要清单；Center 校验并导入 v2 pack；篡改记录必须失败；双端测试通过。
 
 ---
 

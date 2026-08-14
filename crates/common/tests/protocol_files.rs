@@ -166,7 +166,7 @@ fn sample_disk_info() -> DiskInfo {
 
 fn sample_manifest() -> ExportManifest {
     ExportManifest {
-        manifest_version: "1.0.0".to_string(),
+        manifest_version: "2.0.0".to_string(),
         seal_id: "seal-1".to_string(),
         export_job_id: "export-job-1".to_string(),
         disk_id: "disk-1".to_string(),
@@ -192,6 +192,8 @@ fn sample_manifest() -> ExportManifest {
             chunk_size_bytes: 10,
             chunk_sha256: "cipher-sha".to_string(),
             relative_meta_path: "meta/object-1.json".to_string(),
+            storage_layout: String::new(),
+            pack_records: Vec::new(),
             size_bytes: 10,
             etag: "etag".to_string(),
             last_modified: "2026-08-09T00:00:00Z".to_string(),

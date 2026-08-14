@@ -362,7 +362,7 @@ fn validate_sealed_payload_self_consistent(
     }
     let manifest: SealedExportManifest = serde_json::from_slice(&manifest_bytes)
         .context("parse sealed export manifest for discard gate")?;
-    if manifest.manifest_version != "1.0.0"
+    if manifest.manifest_version != "2.0.0"
         || manifest.disk_id != disk_info.disk.disk_id
         || manifest.seal_id.to_string() != edge.seal_id
         || manifest.export_job_id.to_string() != edge.export_job_id
@@ -384,17 +384,16 @@ fn validate_sealed_payload_self_consistent(
             "sealed discard manifest counters must match disk_info"
         ));
     }
+    let mut checked_data_paths = std::collections::HashSet::new();
     for object in &manifest.objects {
         checked_protocol_path(&protocol_root, &object.relative_data_path)?
             .try_exists()
             .with_context(|| format!("check data path {}", object.relative_data_path))?
             .then_some(())
             .ok_or_else(|| anyhow!("sealed discard manifest data path is missing"))?;
-        checked_protocol_path(&protocol_root, &object.relative_meta_path)?
-            .try_exists()
-            .with_context(|| format!("check meta path {}", object.relative_meta_path))?
-            .then_some(())
-            .ok_or_else(|| anyhow!("sealed discard manifest meta path is missing"))?;
+        if !checked_data_paths.insert(object.relative_data_path.clone()) {
+            continue;
+        }
     }
     Ok(())
 }
@@ -431,7 +430,8 @@ struct SealedManifestObject {
     #[serde(default)]
     chunk_size_bytes: u64,
     size_bytes: u64,
-    relative_meta_path: String,
+    #[serde(rename = "relative_meta_path")]
+    _relative_meta_path: String,
 }
 
 impl SealedManifestObject {
@@ -1789,7 +1789,7 @@ mod tests {
     fn write_manifest(temp: &TempDisk, disk_id: Uuid, seal_id: Uuid, sidecar_override: &str) {
         fs::create_dir_all(temp.root().join("manifests")).unwrap();
         let manifest = serde_json::json!({
-            "manifest_version": "1.0.0",
+            "manifest_version": "2.0.0",
             "disk_id": disk_id.to_string(),
             "seal_id": seal_id.to_string(),
             "export_job_id": Uuid::new_v4().to_string(),
@@ -1830,7 +1830,7 @@ mod tests {
         fs::write(temp.root().join("meta/object.json"), b"{}").unwrap();
 
         let manifest = serde_json::json!({
-            "manifest_version": "1.0.0",
+            "manifest_version": "2.0.0",
             "disk_id": disk_id,
             "seal_id": seal_id,
             "export_job_id": export_job_id,
@@ -1907,7 +1907,7 @@ mod tests {
         let mut disk_info = serde_json::json!({
             "protocol": {
                 "name": "rustfs-offline-transfer",
-                "version": "1.0.0"
+                "version": "2.0.0"
             },
             "disk": {
                 "disk_id": disk_id,
@@ -1984,7 +1984,7 @@ mod tests {
     fn template() -> DiskInfoTemplate {
         let security = security();
         DiskInfoTemplate {
-            protocol_version: "1.0".to_string(),
+            protocol_version: "2.0.0".to_string(),
             center_id: Uuid::new_v4(),
             center_name: Some("center".to_string()),
             center_key_id: security.center_key_id(),
@@ -1997,7 +1997,7 @@ mod tests {
         let mut disk_info = DiskInfo {
             protocol: ProtocolInfo {
                 name: crate::disk_info_document::PROTOCOL_NAME.to_string(),
-                version: "1.0".to_string(),
+                version: "2.0.0".to_string(),
             },
             disk: DiskIdentity {
                 disk_id,

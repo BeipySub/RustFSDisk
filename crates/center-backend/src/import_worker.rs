@@ -1,6 +1,8 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    fmt, fs,
+    fmt,
+    fs::{self, File},
+    io::{Read, Seek, SeekFrom},
     path::{Component, Path, PathBuf},
 };
 
@@ -10,6 +12,7 @@ use aes_gcm::{
 };
 use base64::{engine::general_purpose, Engine as _};
 use chrono::{DateTime, Utc};
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -19,6 +22,9 @@ use crate::center_security::{
     SIGNATURE_ALG_HMAC_SHA256,
 };
 use rustfs_transfer_common::crypto::{object_aad, ObjectAad};
+
+const STORAGE_LAYOUT_PACK_V2: &str = "PACK_RECORDS_V2";
+const MANIFEST_AUTH_TAG_PATH: &str = "manifests/export_manifest.hmac";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportErrorCode {
@@ -170,6 +176,29 @@ pub trait ImportRepository {
 pub trait ArchiveStorage {
     fn ensure_bucket(&mut self, bucket: &str) -> ImportResult<()>;
     fn upload_object(&mut self, bucket: &str, key: &str, data: &[u8]) -> ImportResult<()>;
+    fn begin_multipart(&mut self, bucket: &str, key: &str) -> ImportResult<String>;
+    fn upload_part(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number: i32,
+        data: &[u8],
+    ) -> ImportResult<String>;
+    fn complete_multipart(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        parts: &[MultipartPart],
+    ) -> ImportResult<()>;
+    fn abort_multipart(&mut self, bucket: &str, key: &str, upload_id: &str);
+}
+
+#[derive(Debug, Clone)]
+pub struct MultipartPart {
+    pub part_number: i32,
+    pub e_tag: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
@@ -335,6 +364,7 @@ where
                 format!("failed to derive offline disk data key: {err}"),
             )
         })?;
+        verify_manifest_auth_tag(protocol_root, &manifest_bytes, &disk_data_key)?;
         let claim = self.repo.begin_import(ImportJobStart {
             disk_id,
             seal_id: checked.seal_id,
@@ -430,8 +460,9 @@ where
                 ));
             }
 
-            let plaintext = self.decrypt_object(protocol_root, disk_info, object, disk_data_key)?;
             if object.chunked {
+                let plaintext =
+                    self.decrypt_object(protocol_root, disk_info, object, disk_data_key)?;
                 self.register_chunk(object, checked, import_job_id, plaintext)?;
                 if self.try_merge_chunk_group(object, checked, import_job_id, &import_bucket)? {
                     imported_count += 1;
@@ -444,8 +475,13 @@ where
             }
 
             let import_key = archive_key(&object.bucket, &object.key);
-            self.storage
-                .upload_object(&import_bucket, &import_key, &plaintext)?;
+            self.import_pack_object(
+                protocol_root,
+                object,
+                disk_data_key,
+                &import_bucket,
+                &import_key,
+            )?;
             self.repo.insert_ledger(LedgerRecord {
                 identity,
                 plaintext_sha256: object.plaintext_sha256.clone(),
@@ -466,6 +502,66 @@ where
         Ok((imported_count, imported_bytes))
     }
 
+    fn import_pack_object(
+        &mut self,
+        protocol_root: &Path,
+        object: &ManifestObject,
+        disk_data_key: &[u8; 32],
+        import_bucket: &str,
+        import_key: &str,
+    ) -> ImportResult<()> {
+        let path = safe_protocol_path(
+            protocol_root,
+            &object.relative_data_path,
+            Some("data/packs/"),
+        )?;
+        let mut pack = File::open(&path).map_err(|err| {
+            ImportError::new(
+                ImportErrorCode::ManifestInvalid,
+                format!("failed to open pack file: {err}"),
+            )
+        })?;
+        let cipher = Aes256Gcm::new_from_slice(disk_data_key)
+            .map_err(|_| ImportError::new(ImportErrorCode::DecryptFailed, "invalid AES key"))?;
+        let upload_id = self.storage.begin_multipart(import_bucket, import_key)?;
+        let result = (|| {
+            let mut ciphertext_hasher = Sha256::new();
+            let mut plaintext_hasher = Sha256::new();
+            let mut parts = Vec::with_capacity(object.pack_records.len());
+            for (index, record) in object.pack_records.iter().enumerate() {
+                let (ciphertext, plaintext) = decrypt_pack_record(&mut pack, record, &cipher)?;
+                ciphertext_hasher.update(&ciphertext);
+                plaintext_hasher.update(&plaintext);
+                let part_number = i32::try_from(index + 1).map_err(|_| {
+                    ImportError::new(ImportErrorCode::ManifestInvalid, "too many multipart parts")
+                })?;
+                let e_tag = self.storage.upload_part(
+                    import_bucket,
+                    import_key,
+                    &upload_id,
+                    part_number,
+                    &plaintext,
+                )?;
+                parts.push(MultipartPart { part_number, e_tag });
+            }
+            if hex::encode(ciphertext_hasher.finalize()) != object.ciphertext_sha256
+                || hex::encode(plaintext_hasher.finalize()) != object.plaintext_sha256
+            {
+                return Err(ImportError::new(
+                    ImportErrorCode::ChecksumMismatch,
+                    "pack object digest mismatch",
+                ));
+            }
+            self.storage
+                .complete_multipart(import_bucket, import_key, &upload_id, &parts)
+        })();
+        if result.is_err() {
+            self.storage
+                .abort_multipart(import_bucket, import_key, &upload_id);
+        }
+        result
+    }
+
     fn decrypt_object(
         &self,
         protocol_root: &Path,
@@ -478,6 +574,9 @@ where
                 ImportErrorCode::ManifestInvalid,
                 "object data_key_id does not match disk_info security.data_key_id",
             ));
+        }
+        if object.storage_layout == STORAGE_LAYOUT_PACK_V2 {
+            return decrypt_pack_object(protocol_root, object, disk_data_key);
         }
         let ciphertext_path =
             safe_protocol_path(protocol_root, &object.relative_data_path, Some("data/"))?;
@@ -738,12 +837,29 @@ struct ManifestObject {
     chunk_size_bytes: u64,
     #[serde(default)]
     chunk_sha256: String,
-    relative_meta_path: String,
+    #[serde(rename = "relative_meta_path")]
+    _relative_meta_path: String,
+    #[serde(default)]
+    storage_layout: String,
+    #[serde(default)]
+    pack_records: Vec<PackRecord>,
     size_bytes: u64,
     etag: String,
     last_modified: String,
     plaintext_sha256: String,
     object_status: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PackRecord {
+    pack_offset_bytes: u64,
+    ciphertext_size_bytes: u64,
+    plaintext_offset_bytes: u64,
+    plaintext_size_bytes: u64,
+    nonce: String,
+    tag: String,
+    aad: String,
+    ciphertext_sha256: String,
 }
 
 impl ManifestObject {
@@ -823,8 +939,7 @@ fn read_disk_info(protocol_root: &Path) -> ImportResult<DiskInfo> {
 }
 
 fn validate_disk_info(disk_info: &DiskInfo, center_signature_key: &[u8]) -> ImportResult<()> {
-    if disk_info.protocol.name != "rustfs-offline-transfer"
-        || !disk_info.protocol.version.starts_with("1.")
+    if disk_info.protocol.name != "rustfs-offline-transfer" || disk_info.protocol.version != "2.0.0"
     {
         return Err(ImportError::new(
             ImportErrorCode::ManifestInvalid,
@@ -864,7 +979,7 @@ fn validate_manifest(
     manifest: &ExportManifest,
     manifest_sha256: &str,
 ) -> ImportResult<CheckedManifest> {
-    if manifest.manifest_version != "1.0.0" {
+    if manifest.manifest_version != "2.0.0" {
         return Err(ImportError::new(
             ImportErrorCode::ManifestInvalid,
             "unsupported manifest version",
@@ -944,21 +1059,27 @@ fn validate_objects(manifest: &ExportManifest) -> ImportResult<()> {
                 "manifest object has invalid fields",
             ));
         }
-        if !object.relative_data_path.starts_with("data/")
-            || !object.relative_meta_path.starts_with("meta/")
-        {
+        if !object.relative_data_path.starts_with("data/") {
             return Err(ImportError::new(
                 ImportErrorCode::ManifestInvalid,
-                "object paths must be under data/ and meta/",
+                "object data path must be under data/",
             ));
         }
-        if !nonces.insert((object.data_key_id, object.nonce.clone())) {
+        if object.storage_layout != STORAGE_LAYOUT_PACK_V2 {
             return Err(ImportError::new(
-                ImportErrorCode::NonceReused,
-                "manifest contains duplicate data_key_id + nonce",
+                ImportErrorCode::ManifestInvalid,
+                "manifest object does not use the v2 pack layout",
             ));
         }
-        validate_object_aad(manifest, object)?;
+        validate_pack_records(manifest, object)?;
+        for record in &object.pack_records {
+            if !nonces.insert((object.data_key_id, record.nonce.clone())) {
+                return Err(ImportError::new(
+                    ImportErrorCode::NonceReused,
+                    "manifest contains duplicate data_key_id + pack record nonce",
+                ));
+            }
+        }
         if object.chunked {
             validate_chunk_object(object)?;
             chunks
@@ -982,12 +1103,192 @@ fn validate_objects(manifest: &ExportManifest) -> ImportResult<()> {
     Ok(())
 }
 
-fn validate_object_aad(manifest: &ExportManifest, object: &ManifestObject) -> ImportResult<()> {
+fn validate_pack_records(manifest: &ExportManifest, object: &ManifestObject) -> ImportResult<()> {
+    if !object.relative_data_path.starts_with("data/packs/") || object.pack_records.is_empty() {
+        return Err(ImportError::new(
+            ImportErrorCode::ManifestInvalid,
+            "pack object is missing a pack path or records",
+        ));
+    }
+    let mut expected_plaintext_offset = 0_u64;
+    let mut expected_pack_offset = None;
+    let mut ciphertext_size = 0_u64;
+    for (record_index, record) in object.pack_records.iter().enumerate() {
+        if record.plaintext_size_bytes == 0
+            || record.ciphertext_size_bytes == 0
+            || record.plaintext_offset_bytes != expected_plaintext_offset
+            || record.ciphertext_sha256.len() != 64
+            || decode_b64_or_hex("nonce", &record.nonce)?.len() != 12
+            || decode_b64_or_hex("tag", &record.tag)?.len() != 16
+        {
+            return Err(ImportError::new(
+                ImportErrorCode::ManifestInvalid,
+                "pack record fields are invalid or discontinuous",
+            ));
+        }
+        if let Some(previous_end) = expected_pack_offset {
+            if record.pack_offset_bytes != previous_end {
+                return Err(ImportError::new(
+                    ImportErrorCode::ManifestInvalid,
+                    "pack records are not contiguous",
+                ));
+            }
+        }
+        let expected_aad = expected_pack_record_aad(manifest, object, record_index as u64);
+        if record.aad != expected_aad {
+            return Err(ImportError::new(
+                ImportErrorCode::ManifestInvalid,
+                "pack record aad does not match bound fields",
+            ));
+        }
+        expected_pack_offset = Some(record.pack_offset_bytes + record.ciphertext_size_bytes);
+        expected_plaintext_offset += record.plaintext_size_bytes;
+        ciphertext_size += record.ciphertext_size_bytes;
+    }
+    if expected_plaintext_offset != object.progress_bytes()
+        || ciphertext_size != object.ciphertext_size_bytes
+    {
+        return Err(ImportError::new(
+            ImportErrorCode::ManifestInvalid,
+            "pack record sizes do not match object sizes",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_manifest_auth_tag(
+    protocol_root: &Path,
+    manifest_bytes: &[u8],
+    disk_data_key: &[u8; 32],
+) -> ImportResult<()> {
+    let path = safe_protocol_path(protocol_root, MANIFEST_AUTH_TAG_PATH, Some("manifests/"))?;
+    let encoded = fs::read_to_string(&path).map_err(|err| {
+        ImportError::new(
+            ImportErrorCode::ManifestInvalid,
+            format!("failed to read manifest authentication tag: {err}"),
+        )
+    })?;
+    let tag = general_purpose::STANDARD
+        .decode(encoded.trim())
+        .map_err(|_| {
+            ImportError::new(
+                ImportErrorCode::ManifestInvalid,
+                "manifest authentication tag is not base64",
+            )
+        })?;
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(disk_data_key)
+        .map_err(|_| ImportError::new(ImportErrorCode::DecryptFailed, "invalid disk data key"))?;
+    mac.update(manifest_bytes);
+    mac.verify_slice(&tag).map_err(|_| {
+        ImportError::new(
+            ImportErrorCode::SignatureInvalid,
+            "manifest authentication tag verification failed",
+        )
+    })
+}
+
+fn decrypt_pack_object(
+    protocol_root: &Path,
+    object: &ManifestObject,
+    disk_data_key: &[u8; 32],
+) -> ImportResult<Vec<u8>> {
+    let path = safe_protocol_path(
+        protocol_root,
+        &object.relative_data_path,
+        Some("data/packs/"),
+    )?;
+    let mut pack = File::open(&path).map_err(|err| {
+        ImportError::new(
+            ImportErrorCode::ManifestInvalid,
+            format!("failed to open pack file: {err}"),
+        )
+    })?;
+    let cipher = Aes256Gcm::new_from_slice(disk_data_key)
+        .map_err(|_| ImportError::new(ImportErrorCode::DecryptFailed, "invalid AES key"))?;
+    let mut plaintext = Vec::with_capacity(object.progress_bytes() as usize);
+    let mut ciphertext_hasher = Sha256::new();
+    for record in &object.pack_records {
+        let (ciphertext, record_plaintext) = decrypt_pack_record(&mut pack, record, &cipher)?;
+        ciphertext_hasher.update(&ciphertext);
+        plaintext.extend_from_slice(&record_plaintext);
+    }
+    if hex::encode(ciphertext_hasher.finalize()) != object.ciphertext_sha256 {
+        return Err(ImportError::new(
+            ImportErrorCode::ChecksumMismatch,
+            "pack object ciphertext sha256 mismatch",
+        ));
+    }
+    if !object.chunked && sha256_hex(&plaintext) != object.plaintext_sha256 {
+        return Err(ImportError::new(
+            ImportErrorCode::ChecksumMismatch,
+            "pack object plaintext sha256 mismatch",
+        ));
+    }
+    Ok(plaintext)
+}
+
+fn decrypt_pack_record(
+    pack: &mut File,
+    record: &PackRecord,
+    cipher: &Aes256Gcm,
+) -> ImportResult<(Vec<u8>, Vec<u8>)> {
+    pack.seek(SeekFrom::Start(record.pack_offset_bytes))
+        .map_err(|err| {
+            ImportError::new(
+                ImportErrorCode::ManifestInvalid,
+                format!("seek pack record: {err}"),
+            )
+        })?;
+    let mut ciphertext = vec![0_u8; record.ciphertext_size_bytes as usize];
+    pack.read_exact(&mut ciphertext).map_err(|err| {
+        ImportError::new(
+            ImportErrorCode::ManifestInvalid,
+            format!("read pack record: {err}"),
+        )
+    })?;
+    if sha256_hex(&ciphertext) != record.ciphertext_sha256 {
+        return Err(ImportError::new(
+            ImportErrorCode::ChecksumMismatch,
+            "pack record ciphertext sha256 mismatch",
+        ));
+    }
+    let nonce = decode_b64_or_hex("nonce", &record.nonce)?;
+    let tag = decode_b64_or_hex("tag", &record.tag)?;
+    let mut payload = ciphertext.clone();
+    payload.extend_from_slice(&tag);
+    let plaintext = cipher
+        .decrypt(
+            Nonce::from_slice(&nonce),
+            aes_gcm::aead::Payload {
+                msg: payload.as_ref(),
+                aad: record.aad.as_bytes(),
+            },
+        )
+        .map_err(|_| {
+            ImportError::new(
+                ImportErrorCode::DecryptFailed,
+                "pack record AES-GCM authentication failed",
+            )
+        })?;
+    if plaintext.len() as u64 != record.plaintext_size_bytes {
+        return Err(ImportError::new(
+            ImportErrorCode::ChecksumMismatch,
+            "pack record plaintext size mismatch",
+        ));
+    }
+    Ok((ciphertext, plaintext))
+}
+
+fn expected_pack_record_aad(
+    manifest: &ExportManifest,
+    object: &ManifestObject,
+    record_index: u64,
+) -> String {
     let disk_id = manifest.disk_id.to_string();
     let seal_id = manifest.seal_id.to_string();
     let export_job_id = manifest.export_job_id.to_string();
     let chunk_group_id = object.chunk_group_id.map(|id| id.to_string());
-    let expected = object_aad(ObjectAad {
+    let base = String::from_utf8(object_aad(ObjectAad {
         disk_id: &disk_id,
         seal_id: &seal_id,
         export_job_id: &export_job_id,
@@ -997,14 +1298,12 @@ fn validate_object_aad(manifest: &ExportManifest, object: &ManifestObject) -> Im
         chunk_index: object.chunk_index,
         chunk_total: object.chunk_total,
         chunk_offset_bytes: object.chunk_offset_bytes,
-    });
-    if object.aad.as_bytes() != expected.as_slice() {
-        return Err(ImportError::new(
-            ImportErrorCode::ManifestInvalid,
-            "manifest object aad does not match bound fields",
-        ));
-    }
-    Ok(())
+    }))
+    .expect("object AAD is formatted as UTF-8");
+    format!(
+        "{base};pack_record_index={record_index};record_plaintext_offset_bytes={}",
+        object.pack_records[record_index as usize].plaintext_offset_bytes
+    )
 }
 
 fn validate_chunk_object(object: &ManifestObject) -> ImportResult<()> {
@@ -1557,6 +1856,7 @@ impl ImportRepository for MemoryRepository {
 #[derive(Debug, Default)]
 pub struct MemoryArchiveStorage {
     objects: BTreeMap<(String, String), Vec<u8>>,
+    uploads: BTreeMap<String, Vec<(i32, Vec<u8>)>>,
 }
 
 impl MemoryArchiveStorage {
@@ -1574,6 +1874,51 @@ impl ArchiveStorage for MemoryArchiveStorage {
         self.objects
             .insert((bucket.to_string(), key.to_string()), data.to_vec());
         Ok(())
+    }
+
+    fn begin_multipart(&mut self, _bucket: &str, _key: &str) -> ImportResult<String> {
+        let upload_id = Uuid::new_v4().to_string();
+        self.uploads.insert(upload_id.clone(), Vec::new());
+        Ok(upload_id)
+    }
+
+    fn upload_part(
+        &mut self,
+        _bucket: &str,
+        _key: &str,
+        upload_id: &str,
+        part_number: i32,
+        data: &[u8],
+    ) -> ImportResult<String> {
+        let Some(parts) = self.uploads.get_mut(upload_id) else {
+            return Err(ImportError::new(
+                ImportErrorCode::ManifestInvalid,
+                "multipart upload missing",
+            ));
+        };
+        parts.push((part_number, data.to_vec()));
+        Ok(format!("memory-part-{part_number}-{}", sha256_hex(data)))
+    }
+
+    fn complete_multipart(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        _parts: &[MultipartPart],
+    ) -> ImportResult<()> {
+        let mut parts = self.uploads.remove(upload_id).ok_or_else(|| {
+            ImportError::new(ImportErrorCode::ManifestInvalid, "multipart upload missing")
+        })?;
+        parts.sort_by_key(|(part_number, _)| *part_number);
+        let data = parts.into_iter().flat_map(|(_, data)| data).collect();
+        self.objects
+            .insert((bucket.to_string(), key.to_string()), data);
+        Ok(())
+    }
+
+    fn abort_multipart(&mut self, _bucket: &str, _key: &str, upload_id: &str) {
+        self.uploads.remove(upload_id);
     }
 }
 

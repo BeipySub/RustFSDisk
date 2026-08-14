@@ -16,7 +16,7 @@ use uuid::Uuid;
 pub const PROTOCOL_ROOT: &str = "rustfs-transfer";
 pub const DISK_INFO_FILE: &str = "disk_info.json";
 pub const SUPPORTED_FILESYSTEM: &str = "ext4";
-pub const SUPPORTED_PROTOCOL_VERSION: &str = "1.0";
+pub const SUPPORTED_PROTOCOL_VERSION: &str = "2.0.0";
 const GIB: u64 = 1024 * 1024 * 1024;
 const ESTIMATED_PROTOCOL_OVERHEAD_BYTES: u64 = 64 * 1024 * 1024;
 const REPLACE_CURRENT_RUNTIME_SQL: &str = r#"
@@ -1641,7 +1641,7 @@ mod tests {
     fn write_disk_info_with_disk_id(mount: &Path, status_code: &str, disk_id: &str) {
         let payload = format!(
             r#"{{
-  "protocol": {{ "version": "1.0" }},
+  "protocol": {{ "version": "2.0.0" }},
   "disk": {{ "disk_id": "{disk_id}" }},
   "status": {{ "code": "{status_code}" }},
   "security": {{
@@ -1656,7 +1656,7 @@ mod tests {
     fn write_disk_info_without_center_signature(mount: &Path, status_code: &str) {
         let payload = format!(
             r#"{{
-  "protocol": {{ "version": "1.0" }},
+  "protocol": {{ "version": "2.0.0" }},
   "disk": {{ "disk_id": "11111111-1111-1111-1111-111111111111" }},
   "status": {{ "code": "{status_code}" }},
   "security": {{ "data_key_id": "22222222-2222-2222-2222-222222222222" }}

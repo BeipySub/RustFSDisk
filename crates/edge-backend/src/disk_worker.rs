@@ -8,8 +8,7 @@ use aes_gcm::{Aes256Gcm, Key, Nonce};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use chrono::{DateTime, Utc};
-use rand::rngs::OsRng;
-use rand::RngCore;
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -22,8 +21,10 @@ use rustfs_transfer_common::crypto::{object_aad, ObjectAad};
 const PROTOCOL_ROOT: &str = "rustfs-transfer";
 const MANIFEST_PATH: &str = "manifests/export_manifest.json";
 const MANIFEST_SHA256_PATH: &str = "manifests/export_manifest.sha256";
+const MANIFEST_AUTH_TAG_PATH: &str = "manifests/export_manifest.hmac";
 const ENCRYPTION_ALG: &str = "AES-256-GCM";
-const COPY_BUFFER_BYTES: usize = 1024 * 1024;
+const COPY_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+const STORAGE_LAYOUT_PACK_V2: &str = "PACK_RECORDS_V2";
 
 #[derive(Debug, Error)]
 pub enum DiskWorkerError {
@@ -147,6 +148,8 @@ pub struct ExportedObjectUpdate {
     pub key: String,
     pub relative_data_path: String,
     pub relative_meta_path: String,
+    pub storage_layout: String,
+    pub pack_records: Vec<PackRecord>,
     pub plaintext_sha256: String,
     pub ciphertext_sha256: String,
     pub ciphertext_size_bytes: u64,
@@ -170,6 +173,18 @@ pub struct ExportedObjectUpdate {
     pub metadata: BTreeMap<String, String>,
     pub exported_at: DateTime<Utc>,
     pub object_status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PackRecord {
+    pub pack_offset_bytes: u64,
+    pub ciphertext_size_bytes: u64,
+    pub plaintext_offset_bytes: u64,
+    pub plaintext_size_bytes: u64,
+    pub nonce: String,
+    pub tag: String,
+    pub aad: String,
+    pub ciphertext_sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,6 +219,8 @@ pub struct ManifestObject {
     pub chunk_size_bytes: u64,
     pub chunk_sha256: String,
     pub relative_meta_path: String,
+    pub storage_layout: String,
+    pub pack_records: Vec<PackRecord>,
     pub size_bytes: u64,
     pub etag: String,
     pub last_modified: DateTime<Utc>,
@@ -242,7 +259,8 @@ where
 
     pub fn run(&self) -> Result<ExportManifest> {
         self.ensure_protocol_dirs()?;
-        self.cleanup_or_quarantine_partials()?;
+        let current_pack_partial = self.recover_current_pack()?;
+        self.cleanup_or_quarantine_partials(current_pack_partial.as_deref())?;
         self.repository
             .mark_disk_runtime(self.config.disk_id, "COPYING", None)?;
         self.mark_disk_info_edge_copying()?;
@@ -286,7 +304,7 @@ where
     }
 
     fn export_one_object(&self, object: &ExportObjectTask) -> Result<()> {
-        let relative_data_path = data_path(&self.config.export_job_id, object.id);
+        let relative_data_path = pack_path(&self.config.export_job_id, self.config.disk_id);
         let partial_path = format!("{relative_data_path}.partial");
         validate_relative_path(&relative_data_path, "data/")?;
         validate_relative_path(&partial_path, "data/")?;
@@ -311,11 +329,26 @@ where
             object.chunk_offset_bytes,
             object.chunk_size_bytes,
         )?;
-        let mut plaintext =
-            Vec::with_capacity(object.chunk_size_bytes.min(COPY_BUFFER_BYTES as u64) as usize);
         let mut plaintext_hasher = Sha256::new();
+        let mut ciphertext_hasher = Sha256::new();
         let mut remaining = object.chunk_size_bytes;
         let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
+        let partial_file = self.root().join(&partial_path);
+        if let Some(parent) = partial_file.parent() {
+            fs::create_dir_all(parent).map_err(classify_io_error)?;
+        }
+        let mut pack = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(&partial_file)
+            .map_err(classify_io_error)?;
+        let mut pack_offset_bytes = pack.metadata().map_err(classify_io_error)?.len();
+        let mut plaintext_offset_bytes = 0_u64;
+        let mut pack_records = Vec::new();
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&self.config.disk_data_key));
+        let base_aad = build_aad(&self.config, object);
+        let mut record_index = 0_u64;
         while remaining > 0 {
             let max_read = remaining.min(buffer.len() as u64) as usize;
             let read = reader
@@ -327,13 +360,42 @@ where
                     object.chunk_size_bytes
                 )));
             }
-            plaintext.extend_from_slice(&buffer[..read]);
             plaintext_hasher.update(&buffer[..read]);
+            let mut ciphertext = buffer[..read].to_vec();
+            let nonce_bytes = pack_record_nonce(object.id, record_index)?;
+            let aad = pack_record_aad(&base_aad, record_index, plaintext_offset_bytes);
+            let tag = cipher
+                .encrypt_in_place_detached(
+                    Nonce::from_slice(&nonce_bytes),
+                    aad.as_bytes(),
+                    &mut ciphertext,
+                )
+                .map_err(|_| {
+                    DiskWorkerError::Crypto("AES-256-GCM encryption failed".to_string())
+                })?;
+            pack.write_all(&ciphertext).map_err(classify_io_error)?;
+            ciphertext_hasher.update(&ciphertext);
+            pack_records.push(PackRecord {
+                pack_offset_bytes,
+                ciphertext_size_bytes: ciphertext.len() as u64,
+                plaintext_offset_bytes,
+                plaintext_size_bytes: read as u64,
+                nonce: BASE64.encode(nonce_bytes),
+                tag: BASE64.encode(tag),
+                aad,
+                ciphertext_sha256: sha256_hex(&ciphertext),
+            });
+            pack_offset_bytes += ciphertext.len() as u64;
+            plaintext_offset_bytes += read as u64;
+            record_index += 1;
             remaining -= read as u64;
             self.progress
                 .add_bytes(&self.config.disk_id.to_string(), read as u64);
         }
         let plaintext_sha256 = hex::encode(plaintext_hasher.finalize());
+        let ciphertext_sha256 = hex::encode(ciphertext_hasher.finalize());
+        pack.sync_data().map_err(classify_io_error)?;
+        drop(pack);
 
         let after = self
             .source
@@ -345,56 +407,28 @@ where
             )));
         }
 
-        let mut nonce_bytes = [0_u8; 12];
-        OsRng.fill_bytes(&mut nonce_bytes);
-        let nonce = BASE64.encode(nonce_bytes);
-        let aad = build_aad(&self.config, object);
-        let mut ciphertext = plaintext;
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&self.config.disk_data_key));
-        let tag = cipher
-            .encrypt_in_place_detached(
-                Nonce::from_slice(&nonce_bytes),
-                aad.as_bytes(),
-                &mut ciphertext,
-            )
-            .map_err(|_| DiskWorkerError::Crypto("AES-256-GCM encryption failed".to_string()))?;
-        let tag = BASE64.encode(tag);
-        let ciphertext_sha256 = sha256_hex(&ciphertext);
-
-        atomic_write_bytes(&self.root().join(&partial_path), &ciphertext)?;
-        let final_path = self.root().join(&relative_data_path);
-        fs::rename(self.root().join(&partial_path), &final_path).map_err(classify_io_error)?;
-        fsync_file(&final_path)?;
-        fsync_parent(&final_path)?;
-
-        let relative_meta_path = meta_path(&self.config.export_job_id, object.id);
-        validate_relative_path(&relative_meta_path, "meta/")?;
-        let metadata_json = json!({
-            "bucket": object.bucket,
-            "key": object.object_key,
-            "etag": object.etag,
-            "size_bytes": object.size_bytes,
-            "last_modified": object.last_modified,
-            "content_type": after.content_type,
-            "metadata": after.metadata,
-        });
-        atomic_write_json(&self.root().join(&relative_meta_path), &metadata_json)?;
+        let first_record = pack_records.first().ok_or_else(|| {
+            DiskWorkerError::ManifestInvalid("object produced no pack records".to_string())
+        })?;
 
         let exported = ExportedObjectUpdate {
             object_id: object.id,
             bucket: object.bucket.clone(),
             key: object.object_key.clone(),
             relative_data_path,
-            relative_meta_path,
+            relative_meta_path: String::new(),
             plaintext_sha256,
             ciphertext_sha256: ciphertext_sha256.clone(),
-            ciphertext_size_bytes: ciphertext.len() as u64,
+            ciphertext_size_bytes: pack_records
+                .iter()
+                .map(|record| record.ciphertext_size_bytes)
+                .sum(),
             encrypted: true,
             encryption_alg: ENCRYPTION_ALG.to_string(),
             data_key_id: self.config.data_key_id,
-            nonce,
-            tag,
-            aad,
+            nonce: first_record.nonce.clone(),
+            tag: first_record.tag.clone(),
+            aad: first_record.aad.clone(),
             chunked: object.chunked,
             chunk_group_id: object.chunk_group_id,
             chunk_index: object.chunk_index,
@@ -409,6 +443,8 @@ where
             metadata: after.metadata,
             exported_at: Utc::now(),
             object_status: "EXPORTED".to_string(),
+            storage_layout: STORAGE_LAYOUT_PACK_V2.to_string(),
+            pack_records,
         };
         self.repository.mark_exported(object.id, &exported)?;
         self.progress
@@ -417,7 +453,8 @@ where
     }
 
     fn seal(&self) -> Result<ExportManifest> {
-        self.cleanup_or_quarantine_partials()?;
+        self.finalize_pack()?;
+        self.cleanup_or_quarantine_partials(None)?;
         let exported = self
             .repository
             .load_exported_objects(self.config.export_job_id, self.config.disk_id)?;
@@ -427,12 +464,16 @@ where
             .map(ManifestObject::from)
             .collect();
         for object in &objects {
-            validate_relative_path(&object.relative_data_path, "data/")?;
-            validate_relative_path(&object.relative_meta_path, "meta/")?;
+            validate_relative_path(&object.relative_data_path, "data/packs/")?;
+            if object.storage_layout != STORAGE_LAYOUT_PACK_V2 || object.pack_records.is_empty() {
+                return Err(DiskWorkerError::ManifestInvalid(
+                    "exported object is missing pack records".to_string(),
+                ));
+            }
         }
 
         let manifest = ExportManifest {
-            manifest_version: "1.0.0".to_string(),
+            manifest_version: "2.0.0".to_string(),
             seal_id: self.config.seal_id,
             export_job_id: self.config.export_job_id,
             disk_id: self.config.disk_id,
@@ -446,6 +487,10 @@ where
         atomic_write_bytes(
             &self.root().join(MANIFEST_SHA256_PATH),
             manifest_sha256.as_bytes(),
+        )?;
+        atomic_write_bytes(
+            &self.root().join(MANIFEST_AUTH_TAG_PATH),
+            manifest_auth_tag(&self.config.disk_data_key, &manifest_bytes).as_bytes(),
         )?;
         self.mark_disk_info_sealed(
             manifest.objects.len() as u64,
@@ -570,7 +615,45 @@ where
         atomic_write_json(&self.root().join("disk_info.json"), disk_info)
     }
 
-    fn cleanup_or_quarantine_partials(&self) -> Result<()> {
+    fn recover_current_pack(&self) -> Result<Option<PathBuf>> {
+        let relative = pack_path(&self.config.export_job_id, self.config.disk_id);
+        let partial = self.root().join(format!("{relative}.partial"));
+        if !partial.exists() {
+            return Ok(None);
+        }
+        let exported = self
+            .repository
+            .load_exported_objects(self.config.export_job_id, self.config.disk_id)?;
+        let mut expected_end = 0_u64;
+        for object in exported
+            .iter()
+            .filter(|object| object.relative_data_path == relative)
+        {
+            for record in &object.pack_records {
+                if record.pack_offset_bytes != expected_end {
+                    return Err(DiskWorkerError::PartialCleanFailed(
+                        "persisted pack records are not contiguous".to_string(),
+                    ));
+                }
+                expected_end = expected_end.saturating_add(record.ciphertext_size_bytes);
+            }
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&partial)
+            .map_err(classify_io_error)?;
+        if file.metadata().map_err(classify_io_error)?.len() < expected_end {
+            return Err(DiskWorkerError::PartialCleanFailed(
+                "partial pack is shorter than persisted exported records".to_string(),
+            ));
+        }
+        file.set_len(expected_end).map_err(classify_io_error)?;
+        file.sync_data().map_err(classify_io_error)?;
+        Ok(Some(partial))
+    }
+
+    fn cleanup_or_quarantine_partials(&self, preserved: Option<&Path>) -> Result<()> {
         let partials = find_partial_files(&self.root())?;
         if partials.is_empty() {
             return Ok(());
@@ -579,6 +662,9 @@ where
         let quarantine_dir = self.root().join("quarantine").join("partial");
         fs::create_dir_all(&quarantine_dir)?;
         for partial in partials {
+            if preserved.is_some_and(|path| path == partial) {
+                continue;
+            }
             if fs::remove_file(&partial).is_ok() {
                 continue;
             }
@@ -600,7 +686,7 @@ where
     fn ensure_protocol_dirs(&self) -> Result<()> {
         for relative in [
             "data",
-            "meta",
+            "data/packs",
             "manifests",
             "logs",
             "quarantine",
@@ -609,6 +695,19 @@ where
             let path = self.root().join(relative);
             fs::create_dir_all(&path)?;
         }
+        Ok(())
+    }
+
+    fn finalize_pack(&self) -> Result<()> {
+        let relative = pack_path(&self.config.export_job_id, self.config.disk_id);
+        let partial = self.root().join(format!("{relative}.partial"));
+        if !partial.exists() {
+            return Ok(());
+        }
+        let final_path = self.root().join(relative);
+        fs::rename(&partial, &final_path).map_err(classify_io_error)?;
+        fsync_file(&final_path)?;
+        fsync_parent(&final_path)?;
         Ok(())
     }
 
@@ -639,6 +738,8 @@ impl From<ExportedObjectUpdate> for ManifestObject {
             chunk_size_bytes: value.chunk_size_bytes,
             chunk_sha256: value.chunk_sha256,
             relative_meta_path: value.relative_meta_path,
+            storage_layout: value.storage_layout,
+            pack_records: value.pack_records,
             size_bytes: value.size_bytes,
             etag: value.etag,
             last_modified: value.last_modified,
@@ -691,12 +792,32 @@ fn build_aad(config: &DiskWorkerConfig, object: &ExportObjectTask) -> String {
     .expect("object AAD is formatted as UTF-8")
 }
 
-fn data_path(export_job_id: &Uuid, object_id: i64) -> String {
-    format!("data/{export_job_id}/{object_id}.bin")
+fn pack_path(export_job_id: &Uuid, disk_id: Uuid) -> String {
+    format!("data/packs/pack-{export_job_id}-{disk_id}.dat")
 }
 
-fn meta_path(export_job_id: &Uuid, object_id: i64) -> String {
-    format!("meta/{export_job_id}/{object_id}.json")
+fn pack_record_aad(base_aad: &str, record_index: u64, plaintext_offset_bytes: u64) -> String {
+    format!("{base_aad};pack_record_index={record_index};record_plaintext_offset_bytes={plaintext_offset_bytes}")
+}
+
+fn pack_record_nonce(object_id: i64, record_index: u64) -> Result<[u8; 12]> {
+    let object_id = u64::try_from(object_id).map_err(|_| {
+        DiskWorkerError::ManifestInvalid("export object id must be non-negative".to_string())
+    })?;
+    let record_index = u32::try_from(record_index).map_err(|_| {
+        DiskWorkerError::ManifestInvalid("pack record count exceeds nonce capacity".to_string())
+    })?;
+    let mut nonce = [0_u8; 12];
+    nonce[..8].copy_from_slice(&object_id.to_be_bytes());
+    nonce[8..].copy_from_slice(&record_index.to_be_bytes());
+    Ok(nonce)
+}
+
+fn manifest_auth_tag(disk_data_key: &[u8; 32], manifest_bytes: &[u8]) -> String {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(disk_data_key)
+        .expect("a 32-byte disk data key is a valid HMAC key");
+    mac.update(manifest_bytes);
+    BASE64.encode(mac.finalize().into_bytes())
 }
 
 fn validate_relative_path(path: &str, required_prefix: &str) -> Result<()> {

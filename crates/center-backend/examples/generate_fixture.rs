@@ -133,6 +133,8 @@ fn write_sealed_disk(mount_path: &PathBuf) -> anyhow::Result<()> {
         chunk_size_bytes: plaintext.len() as u64,
         chunk_sha256: sha256_lower_hex(&encrypted.ciphertext),
         relative_meta_path: relative_meta_path.to_string(),
+        storage_layout: String::new(),
+        pack_records: Vec::new(),
         size_bytes: plaintext.len() as u64,
         etag: "fixture-etag-1".to_string(),
         last_modified: "2026-08-09T00:00:00Z".to_string(),

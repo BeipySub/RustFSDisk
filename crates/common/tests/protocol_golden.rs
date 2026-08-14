@@ -76,7 +76,7 @@ fn disk_info_golden_json_allows_nested_status_object_only() {
     assert_round_trip(
         &disk_info,
         json!({
-            "protocol": {"name": "rustfs-offline-transfer", "version": "1.0.0"},
+            "protocol": {"name": "rustfs-offline-transfer", "version": "2.0.0"},
             "disk": {
                 "sn": "SN-001",
                 "disk_id": "disk-001",
@@ -152,6 +152,8 @@ fn export_manifest_golden_json_has_prefixed_object_status() {
             chunk_size_bytes: 40,
             chunk_sha256: "cipher-sha".to_owned(),
             relative_meta_path: "meta/source-bucket/dir/file.txt.json".to_owned(),
+            storage_layout: String::new(),
+            pack_records: Vec::new(),
             size_bytes: 40,
             etag: "\"etag\"".to_owned(),
             last_modified: "2026-08-09T08:05:00Z".to_owned(),
@@ -164,7 +166,7 @@ fn export_manifest_golden_json_has_prefixed_object_status() {
     };
 
     let expected = json!({
-        "manifest_version": "1.0.0",
+        "manifest_version": "2.0.0",
         "seal_id": "seal-001",
         "export_job_id": "export-job-001",
         "disk_id": "disk-001",

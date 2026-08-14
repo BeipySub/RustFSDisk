@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     future::Future,
-    io::{Cursor, Read},
+    io::Read,
     path::{Path, PathBuf},
     pin::Pin,
 };
@@ -13,6 +13,7 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use sqlx::{PgPool, Row};
 use tokio::{runtime::Handle, sync::RwLock, task};
+use tokio_util::io::SyncIoBridge;
 use uuid::Uuid;
 
 use crate::{
@@ -363,14 +364,10 @@ impl ObjectSource for S3ObjectSource {
                 .send()
                 .await
                 .map_err(|err| DiskWorkerError::Io(std::io::Error::other(err.to_string())))?;
-            let bytes = output
-                .body
-                .collect()
-                .await
-                .map_err(|err| DiskWorkerError::Io(std::io::Error::other(err.to_string())))?
-                .into_bytes()
-                .to_vec();
-            Ok(Box::new(Cursor::new(bytes)) as Box<dyn Read>)
+            Ok(Box::new(SyncIoBridge::new_with_handle(
+                output.body.into_async_read(),
+                self.handle.clone(),
+            )) as Box<dyn Read>)
         })
     }
 }
@@ -472,6 +469,8 @@ impl ExportObjectRepository for PgExportObjectRepository {
                     chunk_sha256 = $10,
                     relative_data_path = $11,
                     relative_meta_path = $12,
+                    storage_layout = $13,
+                    pack_records_json = $14,
                     partial_path = NULL,
                     error_code = NULL,
                     error_message = NULL
@@ -490,6 +489,11 @@ impl ExportObjectRepository for PgExportObjectRepository {
             .bind(&exported.chunk_sha256)
             .bind(&exported.relative_data_path)
             .bind(&exported.relative_meta_path)
+            .bind(&exported.storage_layout)
+            .bind(
+                serde_json::to_value(&exported.pack_records)
+                    .map_err(|err| DiskWorkerError::Json(err))?,
+            )
             .execute(&self.pool)
             .await
             .map_err(sqlx_err)?;
@@ -531,7 +535,7 @@ impl ExportObjectRepository for PgExportObjectRepository {
         self.handle.block_on(async {
             let rows = sqlx::query(
                 r#"
-                SELECT id, bucket, object_key, relative_data_path, relative_meta_path,
+                SELECT id, bucket, object_key, relative_data_path, relative_meta_path, storage_layout, pack_records_json,
                        plaintext_sha256, ciphertext_sha256, ciphertext_size_bytes, encrypted,
                        encryption_alg, data_key_id, nonce, tag, aad, chunked, chunk_group_id,
                        chunk_index, chunk_total, chunk_offset_bytes, chunk_size_bytes, chunk_sha256,
@@ -555,6 +559,8 @@ impl ExportObjectRepository for PgExportObjectRepository {
                         key: row.get("object_key"),
                         relative_data_path: row.get("relative_data_path"),
                         relative_meta_path: row.get("relative_meta_path"),
+                        storage_layout: row.get("storage_layout"),
+                        pack_records: serde_json::from_value(row.get("pack_records_json")).map_err(DiskWorkerError::Json)?,
                         plaintext_sha256: row.get("plaintext_sha256"),
                         ciphertext_sha256: row.get("ciphertext_sha256"),
                         ciphertext_size_bytes: row.get::<i64, _>("ciphertext_size_bytes").max(0)

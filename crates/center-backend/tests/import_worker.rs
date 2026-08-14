@@ -5,6 +5,7 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
 };
 use base64::{engine::general_purpose, Engine as _};
+use hmac::{Hmac, Mac};
 use rustfs_transfer_center::center_security::{
     derive_offline_disk_data_key, sign_disk_info_with_key, verify_disk_info_with_key,
     ENCRYPTION_ALG_AES_256_GCM, SIGNATURE_ALG_HMAC_SHA256,
@@ -171,6 +172,44 @@ fn rejects_same_seal_with_different_manifest_sha256() {
 }
 
 #[test]
+fn rejects_manifest_rewritten_without_disk_data_key_before_import_claim() {
+    let fixture = SealedDiskFixture::new_plain("alpha.txt", b"hello archive".to_vec());
+    let manifest_path = fixture.root.join("manifests/export_manifest.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["objects"][0]["etag"] = json!("attacker-etag");
+    let bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+    let sha = sha256_hex(&bytes);
+    fs::write(&manifest_path, &bytes).unwrap();
+    fs::write(fixture.root.join("manifests/export_manifest.sha256"), &sha).unwrap();
+
+    let disk_info_path = fixture.root.join("disk_info.json");
+    let mut disk_info: Value = serde_json::from_slice(&fs::read(&disk_info_path).unwrap()).unwrap();
+    disk_info["manifest"]["manifest_sha256"] = json!(sha);
+    disk_info["security"]["center_signature"] =
+        json!(sign_disk_info_with_key(&disk_info, &fixture.signature_key).unwrap());
+    fs::write(
+        disk_info_path,
+        serde_json::to_vec_pretty(&disk_info).unwrap(),
+    )
+    .unwrap();
+
+    let mut repo = fixture.repository();
+    let mut storage = MemoryArchiveStorage::default();
+    let mut progress = ProgressAggregator::default();
+    let err = ImportWorker::new(
+        &mut repo,
+        &mut storage,
+        &mut progress,
+        fixture.signature_key.clone(),
+    )
+    .import_sealed_disk(&fixture.root)
+    .expect_err("rewritten manifest is rejected");
+
+    assert_eq!(err.code, ImportErrorCode::SignatureInvalid);
+    assert!(repo.jobs().is_empty());
+}
+
+#[test]
 fn does_not_write_ledger_for_missing_cross_disk_chunk() {
     let fixture = SealedDiskFixture::new_chunk("large.bin", b"first half".to_vec(), 0, 2);
     let mut repo = fixture.repository();
@@ -218,7 +257,7 @@ fn invalid_manifest_path_returns_standard_error_code() {
 fn aad_mismatch_returns_standard_error_code_before_decrypt() {
     let fixture = SealedDiskFixture::new_plain("alpha.txt", b"hello archive".to_vec());
     fixture.rewrite_manifest(|manifest| {
-        manifest["objects"][0]["aad"] = json!("disk_id=other");
+        manifest["objects"][0]["pack_records"][0]["aad"] = json!("disk_id=other");
     });
     let mut repo = fixture.repository();
     let mut storage = MemoryArchiveStorage::default();
@@ -241,7 +280,7 @@ fn aad_mismatch_returns_standard_error_code_before_decrypt() {
 fn ciphertext_checksum_mismatch_returns_standard_error_code() {
     let fixture = SealedDiskFixture::new_plain("alpha.txt", b"hello archive".to_vec());
     fs::write(
-        fixture.root.join("data/alpha.txt.enc"),
+        fixture.root.join("data/packs/pack-fixture.dat"),
         b"tampered ciphertext",
     )
     .unwrap();
@@ -266,7 +305,8 @@ fn ciphertext_checksum_mismatch_returns_standard_error_code() {
 fn decrypt_failure_marks_job_failed_and_keeps_disk_unimported() {
     let fixture = SealedDiskFixture::new_plain("alpha.txt", b"hello archive".to_vec());
     fixture.rewrite_manifest(|manifest| {
-        manifest["objects"][0]["tag"] = json!(general_purpose::STANDARD.encode([0_u8; 16]));
+        manifest["objects"][0]["pack_records"][0]["tag"] =
+            json!(general_purpose::STANDARD.encode([0_u8; 16]));
     });
     let mut repo = fixture.repository();
     let mut storage = MemoryArchiveStorage::default();
@@ -312,7 +352,7 @@ fn offline_disk_data_key_matches_edge_derivation_vector() {
 }
 
 #[test]
-fn wrong_edge_authorization_secret_fails_decrypt() {
+fn wrong_edge_authorization_secret_fails_manifest_authentication() {
     let fixture = SealedDiskFixture::new_plain("alpha.txt", b"hello archive".to_vec());
     let mut repo = fixture.repository();
     repo.put_edge("edge-a", "wrong-edge-secret", "ACTIVE");
@@ -326,9 +366,9 @@ fn wrong_edge_authorization_secret_fails_decrypt() {
         fixture.signature_key.clone(),
     )
     .import_sealed_disk(&fixture.root)
-    .expect_err("wrong edge auth secret cannot decrypt offline disk");
+    .expect_err("wrong edge auth secret cannot authenticate offline disk");
 
-    assert_eq!(err.code, ImportErrorCode::DecryptFailed);
+    assert_eq!(err.code, ImportErrorCode::SignatureInvalid);
     assert!(repo.ledger().is_empty());
     assert!(storage.objects().is_empty());
 }
@@ -467,8 +507,7 @@ impl SealedDiskFixture {
     ) -> Self {
         let root = std::env::temp_dir().join(format!("rustfs-transfer-test-{}", Uuid::new_v4()));
         fs::create_dir_all(root.join("manifests")).unwrap();
-        fs::create_dir_all(root.join("data")).unwrap();
-        fs::create_dir_all(root.join("meta")).unwrap();
+        fs::create_dir_all(root.join("data/packs")).unwrap();
 
         let disk_id = Uuid::new_v4();
         let seal_id = Uuid::new_v4();
@@ -508,10 +547,12 @@ impl SealedDiskFixture {
             chunk_total,
             chunk_offset_bytes: chunk_index as u64 * plaintext.len() as u64,
         });
-        let (ciphertext, tag) = encrypt(&key_bytes, &nonce_bytes, &aad, &plaintext);
-        let object_path = format!("data/{key}.enc");
-        fs::write(root.join(&object_path), &ciphertext).unwrap();
-        fs::write(root.join(format!("meta/{key}.json")), b"{}").unwrap();
+        let base_aad = String::from_utf8(aad).unwrap();
+        let record_aad = format!("{base_aad};pack_record_index=0;record_plaintext_offset_bytes=0");
+        let (ciphertext, tag) =
+            encrypt(&key_bytes, &nonce_bytes, record_aad.as_bytes(), &plaintext);
+        let object_path = "data/packs/pack-fixture.dat";
+        fs::write(root.join(object_path), &ciphertext).unwrap();
 
         let plain_hash = if chunked {
             sha256_hex(b"first halfsecond half")
@@ -532,8 +573,8 @@ impl SealedDiskFixture {
             "encryption_alg": ENCRYPTION_ALG_AES_256_GCM,
             "data_key_id": data_key_id,
             "nonce": general_purpose::STANDARD.encode(nonce_bytes),
-            "tag": general_purpose::STANDARD.encode(tag),
-            "aad": String::from_utf8(aad).unwrap(),
+            "tag": general_purpose::STANDARD.encode(&tag),
+            "aad": record_aad,
             "ciphertext_size_bytes": ciphertext.len() as u64,
             "ciphertext_sha256": sha256_hex(&ciphertext),
             "chunked": chunked,
@@ -543,7 +584,18 @@ impl SealedDiskFixture {
             "chunk_offset_bytes": chunk_index as u64 * chunk_size_bytes,
             "chunk_size_bytes": chunk_size_bytes,
             "chunk_sha256": sha256_hex(&ciphertext),
-            "relative_meta_path": format!("meta/{key}.json"),
+            "relative_meta_path": "",
+            "storage_layout": "PACK_RECORDS_V2",
+            "pack_records": [{
+                "pack_offset_bytes": 0,
+                "ciphertext_size_bytes": ciphertext.len() as u64,
+                "plaintext_offset_bytes": 0,
+                "plaintext_size_bytes": plaintext.len() as u64,
+                "nonce": general_purpose::STANDARD.encode(nonce_bytes),
+                "tag": general_purpose::STANDARD.encode(&tag),
+                "aad": record_aad,
+                "ciphertext_sha256": sha256_hex(&ciphertext)
+            }],
             "size_bytes": size_bytes,
             "etag": "etag-1",
             "last_modified": "2026-08-09T00:00:00Z",
@@ -554,7 +606,7 @@ impl SealedDiskFixture {
             "object_status": "EXPORTED"
         });
         let manifest = json!({
-            "manifest_version": "1.0.0",
+            "manifest_version": "2.0.0",
             "seal_id": seal_id,
             "export_job_id": export_job_id,
             "disk_id": disk_id,
@@ -566,11 +618,16 @@ impl SealedDiskFixture {
         let manifest_sha = sha256_hex(&manifest_bytes);
         fs::write(root.join("manifests/export_manifest.json"), &manifest_bytes).unwrap();
         fs::write(root.join("manifests/export_manifest.sha256"), &manifest_sha).unwrap();
+        fs::write(
+            root.join("manifests/export_manifest.hmac"),
+            manifest_auth_tag(&key_bytes, &manifest_bytes),
+        )
+        .unwrap();
 
         let disk_info = json!({
             "protocol": {
                 "name": "rustfs-offline-transfer",
-                "version": "1.0.0"
+                "version": "2.0.0"
             },
             "disk": {
                 "disk_id": disk_id,
@@ -651,10 +708,15 @@ impl SealedDiskFixture {
         edit(&mut manifest);
         let bytes = serde_json::to_vec_pretty(&manifest).unwrap();
         let manifest_sha = sha256_hex(&bytes);
-        fs::write(&manifest_path, bytes).unwrap();
+        fs::write(&manifest_path, &bytes).unwrap();
         fs::write(
             self.root.join("manifests/export_manifest.sha256"),
             &manifest_sha,
+        )
+        .unwrap();
+        fs::write(
+            self.root.join("manifests/export_manifest.hmac"),
+            manifest_auth_tag(&self.key, &bytes),
         )
         .unwrap();
         if update_disk_info_sha {
@@ -692,6 +754,12 @@ fn nonce_for(index: u32) -> [u8; 12] {
     let mut nonce = [1_u8; 12];
     nonce[11] = index as u8 + 1;
     nonce
+}
+
+fn manifest_auth_tag(key: &[u8], manifest_bytes: &[u8]) -> String {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).unwrap();
+    mac.update(manifest_bytes);
+    general_purpose::STANDARD.encode(mac.finalize().into_bytes())
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

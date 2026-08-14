@@ -216,7 +216,7 @@ fn disk_info_for_center_signature() -> serde_json::Value {
     json!({
         "protocol": {
             "name": "rustfs-offline-transfer",
-            "version": "1.0.0"
+            "version": "2.0.0"
         },
         "disk": {
             "disk_id": "disk-001",

@@ -9,6 +9,7 @@ use aes_gcm::{Aes256Gcm, Key, Nonce, Tag};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use chrono::Utc;
+use hmac::{Hmac, Mac};
 use rustfs_transfer_edge::disk_worker::{
     DiskWorker, DiskWorkerConfig, ExportObjectRepository, ExportObjectTask, ExportedObjectUpdate,
     ObjectSource, Result, SourceObjectHead,
@@ -241,15 +242,24 @@ fn worker_encrypts_writes_manifest_and_seals_disk() {
         repo.failed.borrow()
     );
     assert_eq!(manifest.objects[0].object_status, "EXPORTED");
+    assert_eq!(manifest.manifest_version, "2.0.0");
     assert_eq!(
         manifest.objects[0].relative_data_path,
-        format!("data/{export_job_id}/7.bin")
+        format!("data/packs/pack-{export_job_id}-{disk_id}.dat")
     );
 
     let manifest_bytes = fs::read(protocol_root.join("manifests/export_manifest.json")).unwrap();
     let manifest_sha =
         fs::read_to_string(protocol_root.join("manifests/export_manifest.sha256")).unwrap();
     assert_eq!(manifest_sha, hex::encode(Sha256::digest(&manifest_bytes)));
+    let manifest_auth_tag =
+        fs::read_to_string(protocol_root.join("manifests/export_manifest.hmac"))
+            .expect("manifest authentication tag");
+    let mut manifest_mac = <Hmac<Sha256> as Mac>::new_from_slice(&key).unwrap();
+    manifest_mac.update(&manifest_bytes);
+    manifest_mac
+        .verify_slice(&BASE64.decode(manifest_auth_tag).unwrap())
+        .expect("manifest authentication tag verifies");
 
     let disk_info: serde_json::Value =
         serde_json::from_slice(&fs::read(protocol_root.join("disk_info.json")).unwrap()).unwrap();
@@ -258,20 +268,23 @@ fn worker_encrypts_writes_manifest_and_seals_disk() {
     assert_eq!(disk_info["manifest"]["manifest_sha256"], manifest_sha);
 
     let object = &manifest.objects[0];
-    assert_eq!(
-        object.aad,
-        format!(
-            "disk_id={disk_id};seal_id={seal_id};export_job_id={export_job_id};bucket=bucket-a;key=folder/object.txt;chunk_group_id=;chunk_index=0;chunk_total=1;chunk_offset_bytes=0"
-        )
-    );
-    let mut ciphertext = fs::read(protocol_root.join(&object.relative_data_path)).unwrap();
-    let nonce = BASE64.decode(&object.nonce).unwrap();
-    let tag = BASE64.decode(&object.tag).unwrap();
+    assert_eq!(object.storage_layout, "PACK_RECORDS_V2");
+    assert_eq!(object.pack_records.len(), 1);
+    let record = &object.pack_records[0];
+    assert!(record.aad.starts_with(&format!(
+        "disk_id={disk_id};seal_id={seal_id};export_job_id={export_job_id};bucket=bucket-a;key=folder/object.txt;"
+    )));
+    let pack = fs::read(protocol_root.join(&object.relative_data_path)).unwrap();
+    let start = record.pack_offset_bytes as usize;
+    let end = start + record.ciphertext_size_bytes as usize;
+    let mut ciphertext = pack[start..end].to_vec();
+    let nonce = BASE64.decode(&record.nonce).unwrap();
+    let tag = BASE64.decode(&record.tag).unwrap();
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
     cipher
         .decrypt_in_place_detached(
             Nonce::from_slice(&nonce),
-            object.aad.as_bytes(),
+            record.aad.as_bytes(),
             &mut ciphertext,
             Tag::from_slice(&tag),
         )

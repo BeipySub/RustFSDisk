@@ -42,7 +42,7 @@ use disk_info_document::{
     write_initialized_disk_info, DiskInfoStatus, InitializedDiskInfoDocument,
 };
 
-pub const PROTOCOL_VERSION: &str = "1.0";
+pub const PROTOCOL_VERSION: &str = "2.0.0";
 const ENCRYPTION_ALG: &str = ENCRYPTION_ALG_AES_256_GCM;
 const KEY_WRAP_ALG: &str = KEY_WRAP_ALG_LOCAL_MASTER_KEY;
 

@@ -5,7 +5,11 @@ use std::{
 };
 
 use anyhow::{anyhow, Context};
-use aws_sdk_s3::{primitives::ByteStream, Client};
+use aws_sdk_s3::{
+    primitives::ByteStream,
+    types::{CompletedMultipartUpload, CompletedPart},
+    Client,
+};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use sqlx::{PgPool, Row};
 use tokio::{runtime::Handle, task};
@@ -16,7 +20,8 @@ use crate::{
     import_worker::{
         ArchiveStorage, ChunkPartRecord, ImportClaim, ImportCompletion, ImportError,
         ImportErrorCode, ImportJobStart, ImportOutcome, ImportProgressSnapshot, ImportRepository,
-        ImportWorker, ImportedDataKeyBinding, LedgerIdentity, LedgerRecord, ProgressAggregator,
+        ImportWorker, ImportedDataKeyBinding, LedgerIdentity, LedgerRecord, MultipartPart,
+        ProgressAggregator,
     },
 };
 
@@ -659,6 +664,105 @@ impl ArchiveStorage for S3ArchiveStorage {
                 })?;
             Ok(())
         })
+    }
+
+    fn begin_multipart(&mut self, bucket: &str, key: &str) -> Result<String, ImportError> {
+        self.handle.block_on(async {
+            self.client
+                .create_multipart_upload()
+                .bucket(bucket)
+                .key(key)
+                .send()
+                .await
+                .map_err(s3_import_error)?
+                .upload_id()
+                .map(str::to_string)
+                .ok_or_else(|| ImportError {
+                    code: ImportErrorCode::ManifestInvalid,
+                    message: "S3 create multipart upload returned no upload_id".to_string(),
+                })
+        })
+    }
+
+    fn upload_part(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number: i32,
+        data: &[u8],
+    ) -> Result<String, ImportError> {
+        self.handle.block_on(async {
+            self.client
+                .upload_part()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .part_number(part_number)
+                .body(ByteStream::from(data.to_vec()))
+                .send()
+                .await
+                .map_err(s3_import_error)?
+                .e_tag()
+                .map(str::to_string)
+                .ok_or_else(|| ImportError {
+                    code: ImportErrorCode::ManifestInvalid,
+                    message: "S3 upload part returned no ETag".to_string(),
+                })
+        })
+    }
+
+    fn complete_multipart(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        parts: &[MultipartPart],
+    ) -> Result<(), ImportError> {
+        let completed_parts = parts
+            .iter()
+            .map(|part| {
+                CompletedPart::builder()
+                    .part_number(part.part_number)
+                    .e_tag(&part.e_tag)
+                    .build()
+            })
+            .collect::<Vec<_>>();
+        self.handle.block_on(async {
+            self.client
+                .complete_multipart_upload()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .multipart_upload(
+                    CompletedMultipartUpload::builder()
+                        .set_parts(Some(completed_parts))
+                        .build(),
+                )
+                .send()
+                .await
+                .map_err(s3_import_error)?;
+            Ok(())
+        })
+    }
+
+    fn abort_multipart(&mut self, bucket: &str, key: &str, upload_id: &str) {
+        let _ = self.handle.block_on(async {
+            self.client
+                .abort_multipart_upload()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .send()
+                .await
+        });
+    }
+}
+
+fn s3_import_error(error: impl std::fmt::Display) -> ImportError {
+    ImportError {
+        code: ImportErrorCode::ManifestInvalid,
+        message: format!("archive S3 operation failed: {error}"),
     }
 }
 

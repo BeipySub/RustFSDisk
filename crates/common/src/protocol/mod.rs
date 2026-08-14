@@ -16,13 +16,14 @@ use crate::error::{TransferError, TransferErrorCode, TransferResult};
 use std::fs::File;
 
 pub const PROTOCOL_NAME: &str = "rustfs-offline-transfer";
-pub const PROTOCOL_VERSION: &str = "1.0.0";
-pub const MANIFEST_VERSION: &str = "1.0.0";
+pub const PROTOCOL_VERSION: &str = "2.0.0";
+pub const MANIFEST_VERSION: &str = "2.0.0";
 pub const TRANSFER_ROOT: &str = "/rustfs-transfer/";
 pub const PROTOCOL_ROOT_DIR: &str = "rustfs-transfer";
 pub const DISK_INFO_PATH: &str = "disk_info.json";
 pub const EXPORT_MANIFEST_PATH: &str = "manifests/export_manifest.json";
 pub const EXPORT_MANIFEST_SHA256_PATH: &str = "manifests/export_manifest.sha256";
+pub const EXPORT_MANIFEST_AUTH_TAG_PATH: &str = "manifests/export_manifest.hmac";
 pub const MANIFEST_PATH: &str = EXPORT_MANIFEST_PATH;
 pub const MANIFEST_SHA256_PATH: &str = EXPORT_MANIFEST_SHA256_PATH;
 pub const DATA_DIR: &str = "data";
@@ -297,6 +298,10 @@ pub struct ManifestObject {
     pub chunk_size_bytes: u64,
     pub chunk_sha256: String,
     pub relative_meta_path: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub storage_layout: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pack_records: Vec<PackRecord>,
     pub size_bytes: u64,
     pub etag: String,
     pub last_modified: String,
@@ -305,6 +310,18 @@ pub struct ManifestObject {
     pub plaintext_sha256: String,
     pub exported_at: String,
     pub object_status: ObjectStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackRecord {
+    pub pack_offset_bytes: u64,
+    pub ciphertext_size_bytes: u64,
+    pub plaintext_offset_bytes: u64,
+    pub plaintext_size_bytes: u64,
+    pub nonce: String,
+    pub tag: String,
+    pub aad: String,
+    pub ciphertext_sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
