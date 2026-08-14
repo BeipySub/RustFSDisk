@@ -1,6 +1,8 @@
 use std::{
     collections::{HashMap, HashSet},
+    fs::OpenOptions,
     future::Future,
+    io::Write,
     path::{Path, PathBuf},
     pin::Pin,
     process::Command,
@@ -71,6 +73,7 @@ pub enum DiskErrorCode {
     RecoveryRequired,
     PartialFileFound,
     DiskRemoved,
+    DiskWritePermissionDenied,
 }
 
 impl DiskErrorCode {
@@ -84,6 +87,7 @@ impl DiskErrorCode {
             Self::RecoveryRequired => "RECOVERY_REQUIRED",
             Self::PartialFileFound => "PARTIAL_FILE_FOUND",
             Self::DiskRemoved => "DISK_REMOVED",
+            Self::DiskWritePermissionDenied => "DISK_WRITE_PERMISSION_DENIED",
         }
     }
 }
@@ -836,6 +840,18 @@ where
             return Ok(record);
         }
 
+        if status_code == DiskStatusCode::Initialized {
+            if let Err(message) = verify_protocol_root_writable(&protocol_root) {
+                reject(
+                    &mut record,
+                    RuntimeStatus::Rejected,
+                    DiskErrorCode::DiskWritePermissionDenied,
+                    message,
+                );
+                return Ok(record);
+            }
+        }
+
         record.disk_enabled = Some(true);
         match status_code {
             DiskStatusCode::Initialized => {
@@ -952,6 +968,49 @@ fn scan_partial_residue(protocol_root: &Path) -> Result<PartialResidue, DiskDete
         }
     })?;
     Ok(residue)
+}
+
+fn verify_protocol_root_writable(protocol_root: &Path) -> Result<(), String> {
+    let probe_path = protocol_root.join(format!(".edge-write-probe-{}", Uuid::new_v4()));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe_path)
+            .map_err(|err| {
+                format!(
+                    "edge process cannot create write probe under {}: {err}",
+                    protocol_root.display()
+                )
+            })?;
+        file.write_all(b"rustfs-transfer-edge-write-probe")
+            .map_err(|err| {
+                format!(
+                    "edge process cannot write probe file {}: {err}",
+                    probe_path.display()
+                )
+            })?;
+        file.sync_all().map_err(|err| {
+            format!(
+                "edge process cannot fsync probe file {}: {err}",
+                probe_path.display()
+            )
+        })?;
+        Ok(())
+    })();
+
+    match std::fs::remove_file(&probe_path) {
+        Ok(()) => {}
+        Err(err) if probe_path.exists() => {
+            return Err(format!(
+                "edge process cannot remove write probe file {}: {err}",
+                probe_path.display()
+            ));
+        }
+        Err(_) => {}
+    }
+
+    result
 }
 
 fn scan_partial_residue_inner(path: &Path, residue: &mut PartialResidue) -> std::io::Result<()> {
@@ -1138,6 +1197,8 @@ fn discover_transport_mounts(mount_roots: &[PathBuf]) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::{
         fs,
         sync::{Arc, Mutex},
@@ -1420,6 +1481,51 @@ mod tests {
             Some("11111111-1111-1111-1111-111111111111")
         );
         assert_eq!(persisted.runtime_status, "READY");
+        fs::remove_dir_all(mount).ok();
+    }
+
+    #[tokio::test]
+    async fn ready_write_probe_does_not_leave_probe_files() {
+        let mount = temp_mount("ready-write-probe-cleanup");
+        write_disk_info(&mount, "INITIALIZED");
+        let detector = detector(vec![disk(&mount, "ext4")], MockLedger::default());
+
+        let records = detector.scan_existing_transport_disks().await.unwrap();
+
+        assert_eq!(records[0].runtime_status, "READY");
+        let protocol_root = mount.join(PROTOCOL_ROOT);
+        let probe_left = fs::read_dir(&protocol_root)
+            .unwrap()
+            .flatten()
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(".edge-write-probe-"))
+            });
+        assert!(!probe_left);
+        fs::remove_dir_all(mount).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_initialized_disk_when_protocol_root_is_not_writable() {
+        let mount = temp_mount("ready-write-probe-denied");
+        write_disk_info(&mount, "INITIALIZED");
+        let protocol_root = mount.join(PROTOCOL_ROOT);
+        let original_permissions = fs::metadata(&protocol_root).unwrap().permissions();
+        fs::set_permissions(&protocol_root, fs::Permissions::from_mode(0o555)).unwrap();
+        let detector = detector(vec![disk(&mount, "ext4")], MockLedger::default());
+
+        let records = detector.scan_existing_transport_disks().await.unwrap();
+
+        fs::set_permissions(&protocol_root, original_permissions).unwrap();
+        assert_eq!(records[0].runtime_status, "REJECTED");
+        assert_eq!(
+            records[0].last_error_code.as_deref(),
+            Some("DISK_WRITE_PERMISSION_DENIED")
+        );
+        assert!(!records[0].task_pool_eligible);
         fs::remove_dir_all(mount).ok();
     }
 
