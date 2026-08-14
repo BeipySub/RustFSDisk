@@ -365,13 +365,13 @@ impl ImportRepository for PgImportRepository {
             .unwrap_or(false)
     }
 
-    fn active_edge_auth_secret(&self, edge_code: &str) -> Option<String> {
+    fn active_edge_key(&self, edge_code: &str) -> Option<String> {
         let row = self
             .handle
             .block_on(async {
                 sqlx::query(
                     r#"
-                    SELECT auth_key_id, auth_secret_ciphertext
+                    SELECT edge_key_ciphertext
                     FROM edge_site
                     WHERE edge_code = $1
                       AND status = 'ACTIVE'
@@ -383,11 +383,8 @@ impl ImportRepository for PgImportRepository {
             })
             .ok()
             .flatten()?;
-        let auth_key_id: String = row.get("auth_key_id");
-        let ciphertext: String = row.get("auth_secret_ciphertext");
-        self.security
-            .unwrap_edge_auth_secret(edge_code, &auth_key_id, &ciphertext)
-            .ok()
+        let ciphertext: String = row.get("edge_key_ciphertext");
+        self.security.unwrap_edge_key(edge_code, &ciphertext).ok()
     }
 
     fn validate_data_key_for_import(

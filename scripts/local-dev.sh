@@ -90,10 +90,8 @@ ENV
 cat > "${LOCAL_DIR}/edge.env" <<'ENV'
 RUSTFS_TRANSFER__CONFIG_PATH=.local/dev/config/edge.toml
 RUSTFS_TRANSFER__DATABASE__URL=postgres://rustfs_transfer_edge:CHANGE_ME_PASSWORD@127.0.0.1:5432/rustfs_transfer_edge_dev
-# Compatibility value for local legacy paths only; offline export must not
-# depend on Center reachability.
-RUSTFS_TRANSFER__CENTER__BASE_URL=http://127.0.0.1:8080
-RUSTFS_TRANSFER__CENTER__EDGE_CODE=edge-demo
+RUSTFS_TRANSFER__EDGE__EDGE_CODE=edge-demo
+RUSTFS_TRANSFER__EDGE__EDGE_KEY=CHANGE_ME_EDGE_KEY_FROM_CENTER
 RUSTFS_TRANSFER__PATHS__DATA_DIR=.local/dev/data/edge
 RUSTFS_TRANSFER__PATHS__LOG_DIR=.local/dev/logs/edge
 RUSTFS_TRANSFER__PATHS__TRANSPORT_MOUNT_ROOT=.local/dev/mock-disks

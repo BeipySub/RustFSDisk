@@ -17,7 +17,7 @@ async fn main() -> anyhow::Result<()> {
     let config = EdgeConfig::load(&config_path)
         .with_context(|| format!("load edge config from {}", config_path.display()))?;
     let bind = config.server.bind;
-    let edge_code = config.center.edge_code.clone();
+    let edge_code = config.edge.edge_code.clone();
     let state = AppState::from_config(config).await?;
     state.request_startup_disk_scan().await;
     let listener = TcpListener::bind(bind)

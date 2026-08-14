@@ -622,7 +622,7 @@ impl EdgeControlService for ProductionEdgeControlService {
             create_export_plan_from_stable_snapshots(
                 &self.pool,
                 export_job_id,
-                &self.config.center.edge_code,
+                &self.config.edge.edge_code,
                 max_budget,
             )
             .await
@@ -673,7 +673,7 @@ impl EdgeControlService for ProductionEdgeControlService {
                     &mut assigned,
                     &disk,
                     &batch,
-                    &self.config.center.edge_code,
+                    &self.config.edge.edge_code,
                     export_job_id,
                     self.copy_progress.clone(),
                 )
@@ -811,8 +811,8 @@ impl EdgeControlService for ProductionEdgeControlService {
 
             Ok(EdgeControlSummary {
                 source: "edge",
-                edge_code: self.config.center.edge_code.clone(),
-                edge_name: self.config.center.edge_code.clone(),
+                edge_code: self.config.edge.edge_code.clone(),
+                edge_name: self.config.edge.edge_code.clone(),
                 object_inventory,
                 export_job,
                 global: global_progress.clone(),

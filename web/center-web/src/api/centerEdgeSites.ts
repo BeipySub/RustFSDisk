@@ -5,17 +5,16 @@ export type EdgeStatus = "ACTIVE" | "DISABLED" | "ERROR";
 export interface ManagedEdgeSite {
   edge_code: string;
   edge_name: string;
-  auth_key_id: string;
+  edge_key: string;
   edge_status: EdgeStatus;
   object_count?: number;
   create_time?: string;
+  key_updated_time?: string;
 }
 
 export interface CreateEdgeSiteInput {
   edge_code: string;
   edge_name: string;
-  auth_key_id: string;
-  edge_auth_secret: string;
   edge_status: EdgeStatus;
 }
 
@@ -56,6 +55,14 @@ export async function updateManagedEdgeSite(
   );
 }
 
+export async function resetManagedEdgeKey(edgeCode: string): Promise<ManagedEdgeSite> {
+  return normalizeManagedEdgeSite(
+    await requestJson<ManagedEdgeSite>(`${edgeSitesPath()}/${encodeURIComponent(edgeCode)}/reset-key`, {
+      method: "POST",
+    }),
+  );
+}
+
 export async function deleteManagedEdgeSite(edgeCode: string): Promise<void> {
   await requestJson<unknown>(`${edgeSitesPath()}/${encodeURIComponent(edgeCode)}`, {
     method: "DELETE",
@@ -66,10 +73,11 @@ function normalizeManagedEdgeSite(payload: Partial<ManagedEdgeSite>): ManagedEdg
   return {
     edge_code: payload.edge_code ?? "",
     edge_name: payload.edge_name ?? "",
-    auth_key_id: payload.auth_key_id ?? "",
+    edge_key: payload.edge_key ?? "",
     edge_status: normalizeEdgeStatus(payload.edge_status),
     object_count: numberValue(payload.object_count),
     create_time: payload.create_time,
+    key_updated_time: payload.key_updated_time,
   };
 }
 

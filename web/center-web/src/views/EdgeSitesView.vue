@@ -4,38 +4,36 @@ import {
   createManagedEdgeSite,
   deleteManagedEdgeSite,
   fetchManagedEdgeSites,
+  resetManagedEdgeKey,
   updateManagedEdgeSite,
   type EdgeStatus,
   type ManagedEdgeSite,
 } from "../api/centerEdgeSites";
-
-const SECRET_BYTES = 32;
 
 const edges = ref<ManagedEdgeSite[]>([]);
 const page = ref(1);
 const pageSize = 8;
 const isLoading = ref(false);
 const isSaving = ref(false);
-const message = ref("正在加载边缘端权限");
+const message = ref("正在加载边缘站点");
 const errorMessage = ref("");
 const editing = reactive<Record<string, { edge_name: string; edge_status: EdgeStatus }>>({});
 const form = reactive({
   edge_code: "",
   edge_name: "",
-  auth_key_id: "",
-  edge_auth_secret: "",
   edge_status: "ACTIVE" as EdgeStatus,
 });
 
 const edgeColumns = [
-  { title: "边缘端编码", key: "edge_code", dataIndex: "edge_code", width: 160 },
-  { title: "边缘端名称", key: "edge_name", width: 220 },
-  { title: "密钥编号", key: "auth_key_id", dataIndex: "auth_key_id", width: 260 },
+  { title: "站点编码", key: "edge_code", dataIndex: "edge_code", width: 160 },
+  { title: "站点名称", key: "edge_name", width: 220 },
+  { title: "EDGE KEY", key: "edge_key", dataIndex: "edge_key", width: 320 },
   { title: "接入状态", key: "edge_status", width: 128 },
   { title: "对象数", key: "object_count", dataIndex: "object_count", width: 88, align: "right" as const },
   { title: "创建时间", key: "create_time", dataIndex: "create_time", width: 190 },
-  { title: "操作", key: "action", width: 150, fixed: "right" as const },
+  { title: "操作", key: "action", width: 210, fixed: "right" as const },
 ];
+
 const tablePagination = computed(() => ({
   current: page.value,
   pageSize,
@@ -46,7 +44,6 @@ const tablePagination = computed(() => ({
 }));
 
 onMounted(() => {
-  generateEdgeCredentials();
   void refreshEdges();
 });
 
@@ -56,9 +53,9 @@ async function refreshEdges() {
   try {
     edges.value = await fetchManagedEdgeSites();
     resetEditing();
-    message.value = "边缘端列表已刷新";
+    message.value = "边缘站点列表已刷新";
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : "边缘端列表加载失败";
+    errorMessage.value = error instanceof Error ? error.message : "边缘站点列表加载失败";
   } finally {
     isLoading.value = false;
   }
@@ -66,7 +63,6 @@ async function refreshEdges() {
 
 async function createEdge() {
   if (!validateCreateForm()) return;
-  if (!form.auth_key_id || !form.edge_auth_secret) generateEdgeCredentials();
   isSaving.value = true;
   errorMessage.value = "";
   try {
@@ -74,15 +70,12 @@ async function createEdge() {
     Object.assign(form, {
       edge_code: "",
       edge_name: "",
-      auth_key_id: "",
-      edge_auth_secret: "",
       edge_status: "ACTIVE" as EdgeStatus,
     });
-    generateEdgeCredentials();
     await refreshEdges();
-    message.value = "边缘端已添加";
+    message.value = "边缘站点已添加，KEY 已由 Center 生成";
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : "添加边缘端失败";
+    errorMessage.value = error instanceof Error ? error.message : "添加边缘站点失败";
   } finally {
     isSaving.value = false;
   }
@@ -98,7 +91,7 @@ async function saveEdge(edge: ManagedEdgeSite) {
     await refreshEdges();
     message.value = `${edge.edge_code} 已更新`;
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : "更新边缘端失败";
+    errorMessage.value = error instanceof Error ? error.message : "更新边缘站点失败";
   } finally {
     isSaving.value = false;
   }
@@ -112,7 +105,21 @@ async function removeEdge(edge: ManagedEdgeSite) {
     await refreshEdges();
     message.value = `${edge.edge_code} 已删除`;
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : "删除边缘端失败";
+    errorMessage.value = error instanceof Error ? error.message : "删除边缘站点失败";
+  } finally {
+    isSaving.value = false;
+  }
+}
+
+async function resetEdgeKey(edge: ManagedEdgeSite) {
+  isSaving.value = true;
+  errorMessage.value = "";
+  try {
+    await resetManagedEdgeKey(edge.edge_code);
+    await refreshEdges();
+    message.value = `${edge.edge_code} 的 KEY 已重置`;
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : "重置 KEY 失败";
   } finally {
     isSaving.value = false;
   }
@@ -133,15 +140,15 @@ function resetEditing() {
 function validateCreateForm() {
   const edgeCode = form.edge_code.trim();
   if (!edgeCode) {
-    errorMessage.value = "需要填写边缘端编码";
+    errorMessage.value = "需要填写边缘站点编码";
     return false;
   }
   if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(edgeCode)) {
-    errorMessage.value = "边缘端编码只能使用小写字母、数字和单个连字符，且不能以连字符开头或结尾";
+    errorMessage.value = "站点编码只能使用小写字母、数字和单个连字符";
     return false;
   }
   if (!form.edge_name.trim()) {
-    errorMessage.value = "需要填写边缘端名称";
+    errorMessage.value = "需要填写边缘站点名称";
     return false;
   }
   return true;
@@ -151,32 +158,10 @@ function handleTableChange(pagination: { current?: number }) {
   page.value = pagination.current ?? 1;
 }
 
-function generateEdgeCredentials() {
-  const prefix = normalizeKeyPrefix(form.edge_code) || "edge";
-  form.auth_key_id = `${prefix}-auth-${randomUrlSafeToken(8).toLowerCase()}`;
-  form.edge_auth_secret = randomBase64Secret(SECRET_BYTES);
-}
-
-function normalizeKeyPrefix(value: string): string {
-  return value
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9-]+/g, "-")
-    .replace(/-+/g, "-")
-    .replace(/^-|-$/g, "")
-    .slice(0, 40);
-}
-
-function randomUrlSafeToken(byteLength: number): string {
-  const bytes = new Uint8Array(byteLength);
-  window.crypto.getRandomValues(bytes);
-  return btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
-}
-
-function randomBase64Secret(byteLength: number): string {
-  const bytes = new Uint8Array(byteLength);
-  window.crypto.getRandomValues(bytes);
-  return btoa(String.fromCharCode(...bytes));
+async function copyEdgeKey(edge: ManagedEdgeSite) {
+  if (!edge.edge_key) return;
+  await navigator.clipboard.writeText(edge.edge_key);
+  message.value = `${edge.edge_code} 的 KEY 已复制`;
 }
 
 function formatFullTime(value?: string): string {
@@ -202,25 +187,17 @@ function formatFullTime(value?: string): string {
         <div class="panel-heading">
           <div>
             <p class="section-kicker">新建</p>
-            <h2>添加边缘端</h2>
+            <h2>添加边缘站点</h2>
           </div>
         </div>
 
         <label>
-          <span>边缘端编码</span>
-          <input v-model="form.edge_code" placeholder="edge-a" autocomplete="off" @blur="generateEdgeCredentials" />
+          <span>站点编码</span>
+          <input v-model="form.edge_code" placeholder="edge-a" autocomplete="off" />
         </label>
         <label>
-          <span>边缘端名称</span>
+          <span>站点名称</span>
           <input v-model="form.edge_name" placeholder="边缘站点 A" autocomplete="off" />
-        </label>
-        <label>
-          <span>鉴权密钥编号</span>
-          <input v-model="form.auth_key_id" readonly autocomplete="off" />
-        </label>
-        <label>
-          <span>边缘端鉴权密钥</span>
-          <input v-model="form.edge_auth_secret" readonly autocomplete="off" />
         </label>
         <label>
           <span>接入状态</span>
@@ -230,25 +207,24 @@ function formatFullTime(value?: string): string {
             <option value="ERROR">异常</option>
           </select>
         </label>
-        <button class="secondary-button" type="button" :disabled="isSaving"
-          @click="generateEdgeCredentials">重新生成密钥</button>
-        <button class="primary-action primary" type="submit" :disabled="isSaving">添加</button>
+        <button class="primary-action primary" type="submit" :disabled="isSaving">添加并生成 KEY</button>
       </form>
 
       <section class="edge-site-list panel">
         <div class="panel-heading">
           <div>
             <p class="section-kicker">站点权限</p>
-            <h2>边缘端列表</h2>
+            <h2>边缘站点列表</h2>
           </div>
+          <p class="edge-site-message">{{ message }}</p>
         </div>
 
         <p v-if="errorMessage" class="edge-site-error">{{ errorMessage }}</p>
 
         <a-table class="edge-site-table" size="small" :columns="edgeColumns" :data-source="edges" :loading="isLoading"
-          :pagination="tablePagination" row-key="edge_code" :scroll="{ x: 1200, y: 430 }" @change="handleTableChange">
+          :pagination="tablePagination" row-key="edge_code" :scroll="{ x: 1240, y: 430 }" @change="handleTableChange">
           <template #emptyText>
-            <span>暂无边缘端站点</span>
+            <span>暂无边缘站点</span>
           </template>
           <template #bodyCell="{ column, record }">
             <template v-if="column.key === 'edge_code'">
@@ -256,6 +232,12 @@ function formatFullTime(value?: string): string {
             </template>
             <template v-else-if="column.key === 'edge_name'">
               <a-input v-model:value="editing[record.edge_code].edge_name" size="small" />
+            </template>
+            <template v-else-if="column.key === 'edge_key'">
+              <div class="edge-key-cell">
+                <code>{{ record.edge_key }}</code>
+                <a-button type="link" size="small" @click="copyEdgeKey(record)">复制</a-button>
+              </div>
             </template>
             <template v-else-if="column.key === 'edge_status'">
               <a-select v-model:value="editing[record.edge_code].edge_status" size="small">
@@ -273,7 +255,11 @@ function formatFullTime(value?: string): string {
             <template v-else-if="column.key === 'action'">
               <a-space size="small">
                 <a-button type="link" size="small" :disabled="isSaving" @click="saveEdge(record)">保存</a-button>
-                <a-popconfirm :title="`确认删除边缘端 ${record.edge_code}？`" ok-text="确认删除" cancel-text="取消" placement="left"
+                <a-popconfirm :title="`重置 ${record.edge_code} 的 KEY？Edge 配置也要同步更新。`" ok-text="确认重置" cancel-text="取消" placement="left"
+                  @confirm="resetEdgeKey(record)">
+                  <a-button type="link" size="small" :disabled="isSaving">重置 KEY</a-button>
+                </a-popconfirm>
+                <a-popconfirm :title="`确认删除边缘站点 ${record.edge_code}？`" ok-text="确认删除" cancel-text="取消" placement="left"
                   @confirm="removeEdge(record)">
                   <a-button danger type="link" size="small" :disabled="isSaving">删除</a-button>
                 </a-popconfirm>
@@ -285,3 +271,24 @@ function formatFullTime(value?: string): string {
     </section>
   </main>
 </template>
+
+<style scoped>
+.edge-key-cell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.edge-key-cell code {
+  max-width: 230px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (max-width: 900px) {
+  .edge-sites-layout {
+    grid-template-columns: 1fr;
+  }
+}
+</style>

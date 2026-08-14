@@ -41,6 +41,7 @@ pub use config::{CenterConfig, CenterIdentityConfig};
 use disk_info_document::{
     write_initialized_disk_info, DiskInfoStatus, InitializedDiskInfoDocument,
 };
+use rustfs_transfer_common::crypto::{encode_base64, generate_aes256_key};
 
 pub const PROTOCOL_VERSION: &str = "1.0";
 const ENCRYPTION_ALG: &str = ENCRYPTION_ALG_AES_256_GCM;
@@ -99,6 +100,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/center/edge-sites",
             get(edge_sites_handler).post(create_edge_site_handler),
+        )
+        .route(
+            "/api/center/edge-sites/{edge_code}/reset-key",
+            post(reset_edge_key_handler),
         )
         .route(
             "/api/center/edge-sites/{edge_code}",
@@ -246,8 +251,7 @@ pub struct DiskRecord {
 pub struct EdgeRecord {
     pub edge_code: String,
     pub edge_name: String,
-    pub auth_key_id: String,
-    pub auth_secret: String,
+    pub edge_key: String,
     pub edge_status: String,
 }
 
@@ -255,18 +259,17 @@ pub struct EdgeRecord {
 pub struct ManagedEdgeSite {
     pub edge_code: String,
     pub edge_name: String,
-    pub auth_key_id: String,
+    pub edge_key: String,
     pub edge_status: String,
     pub object_count: Option<u64>,
     pub create_time: Option<DateTime<Utc>>,
+    pub key_updated_time: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreateEdgeSiteRequest {
     pub edge_code: String,
     pub edge_name: String,
-    pub auth_key_id: String,
-    pub edge_auth_secret: String,
     pub edge_status: Option<String>,
 }
 
@@ -762,7 +765,7 @@ impl CenterService {
         self.store
             .edge_for_auth(edge_code)
             .await?
-            .map(|edge| self.edge_record_with_plaintext_secret(edge))
+            .map(|edge| self.edge_record_with_plaintext_key(edge))
             .transpose()
     }
 
@@ -799,17 +802,28 @@ impl CenterService {
     }
 
     pub async fn managed_edge_sites(&self) -> Result<Vec<ManagedEdgeSite>> {
-        self.store.managed_edge_sites().await
+        self.store
+            .managed_edge_sites()
+            .await?
+            .into_iter()
+            .map(|mut site| {
+                site.edge_key = self
+                    .security
+                    .unwrap_edge_key(&site.edge_code, &site.edge_key)?;
+                Ok(site)
+            })
+            .collect()
     }
 
     pub async fn create_edge_site(&self, req: CreateEdgeSiteRequest) -> Result<ManagedEdgeSite> {
         let mut edge = NewEdgeSite::try_from(req)?;
-        edge.edge_auth_secret = self.security.wrap_edge_auth_secret(
-            &edge.edge_code,
-            &edge.auth_key_id,
-            &edge.edge_auth_secret,
-        )?;
-        self.store.create_edge_site(edge).await
+        let plain_edge_key = edge.edge_key.clone();
+        edge.edge_key = self
+            .security
+            .wrap_edge_key(&edge.edge_code, &edge.edge_key)?;
+        let mut created = self.store.create_edge_site(edge).await?;
+        created.edge_key = plain_edge_key;
+        Ok(created)
     }
 
     pub async fn update_edge_site(
@@ -825,18 +839,28 @@ impl CenterService {
             .await
     }
 
+    pub async fn reset_edge_key(&self, edge_code: String) -> Result<ManagedEdgeSite> {
+        let edge_code = normalize_edge_code(&edge_code)?;
+        let plain_edge_key = generate_edge_key();
+        let wrapped_edge_key = self.security.wrap_edge_key(&edge_code, &plain_edge_key)?;
+        let mut site = self
+            .store
+            .reset_edge_key(edge_code, wrapped_edge_key)
+            .await?;
+        site.edge_key = plain_edge_key;
+        Ok(site)
+    }
+
     pub async fn delete_edge_site(&self, edge_code: String) -> Result<DeleteEdgeSiteResponse> {
         let edge_code = normalize_edge_code(&edge_code)?;
         let deleted = self.store.delete_edge_site(&edge_code).await?;
         Ok(DeleteEdgeSiteResponse { edge_code, deleted })
     }
 
-    fn edge_record_with_plaintext_secret(&self, mut edge: EdgeRecord) -> Result<EdgeRecord> {
-        edge.auth_secret = self.security.unwrap_edge_auth_secret(
-            &edge.edge_code,
-            &edge.auth_key_id,
-            &edge.auth_secret,
-        )?;
+    fn edge_record_with_plaintext_key(&self, mut edge: EdgeRecord) -> Result<EdgeRecord> {
+        edge.edge_key = self
+            .security
+            .unwrap_edge_key(&edge.edge_code, &edge.edge_key)?;
         Ok(edge)
     }
 }
@@ -845,8 +869,7 @@ impl CenterService {
 struct NewEdgeSite {
     edge_code: String,
     edge_name: String,
-    auth_key_id: String,
-    edge_auth_secret: String,
+    edge_key: String,
     edge_status: String,
 }
 
@@ -857,11 +880,14 @@ impl TryFrom<CreateEdgeSiteRequest> for NewEdgeSite {
         Ok(Self {
             edge_code: normalize_edge_code(&value.edge_code)?,
             edge_name: normalize_required("edge_name", value.edge_name, 255)?,
-            auth_key_id: normalize_required("auth_key_id", value.auth_key_id, 255)?,
-            edge_auth_secret: normalize_required("edge_auth_secret", value.edge_auth_secret, 4096)?,
+            edge_key: generate_edge_key(),
             edge_status: normalize_edge_status(value.edge_status.as_deref().unwrap_or("ACTIVE"))?,
         })
     }
+}
+
+fn generate_edge_key() -> String {
+    encode_base64(&generate_aes256_key())
 }
 
 impl CenterIdentity {
@@ -1105,20 +1131,12 @@ impl CenterStore {
                 if guard.edges.contains_key(&edge.edge_code) {
                     anyhow::bail!("edge_code already exists");
                 }
-                if guard
-                    .edges
-                    .values()
-                    .any(|existing| existing.auth_key_id == edge.auth_key_id)
-                {
-                    anyhow::bail!("auth_key_id already exists");
-                }
                 guard.edges.insert(
                     edge.edge_code.clone(),
                     EdgeRecord {
                         edge_code: edge.edge_code.clone(),
                         edge_name: edge.edge_name.clone(),
-                        auth_key_id: edge.auth_key_id.clone(),
-                        auth_secret: edge.edge_auth_secret,
+                        edge_key: edge.edge_key,
                         edge_status: edge.edge_status.clone(),
                     },
                 );
@@ -1144,6 +1162,22 @@ impl CenterStore {
                     .ok_or_else(|| anyhow!("edge_site not found"))?;
                 edge.edge_name = edge_name;
                 edge.edge_status = edge_status;
+                Ok(memory_managed_edge_site(&guard, &edge_code)
+                    .expect("updated edge should be visible"))
+            }
+        }
+    }
+
+    async fn reset_edge_key(&self, edge_code: String, edge_key: String) -> Result<ManagedEdgeSite> {
+        match self {
+            Self::Pg(pg) => pg.reset_edge_key(edge_code, edge_key).await,
+            Self::Memory(mem) => {
+                let mut guard = mem.write().await;
+                let edge = guard
+                    .edges
+                    .get_mut(&edge_code)
+                    .ok_or_else(|| anyhow!("edge_site not found"))?;
+                edge.edge_key = edge_key;
                 Ok(memory_managed_edge_site(&guard, &edge_code)
                     .expect("updated edge should be visible"))
             }
@@ -1269,7 +1303,7 @@ impl PgCenterStore {
 
     async fn active_edge(&self, edge_code: &str) -> Result<Option<EdgeRecord>> {
         let row = sqlx::query(
-            "SELECT edge_code, edge_name, auth_key_id, auth_secret_ciphertext, status FROM edge_site WHERE edge_code = $1 AND status = 'ACTIVE'",
+            "SELECT edge_code, edge_name, edge_key_ciphertext, status FROM edge_site WHERE edge_code = $1 AND status = 'ACTIVE'",
         )
         .bind(edge_code)
         .fetch_optional(&self.pool)
@@ -1280,7 +1314,7 @@ impl PgCenterStore {
 
     async fn edge_for_auth(&self, edge_code: &str) -> Result<Option<EdgeRecord>> {
         let row = sqlx::query(
-            "SELECT edge_code, edge_name, auth_key_id, auth_secret_ciphertext, status FROM edge_site WHERE edge_code = $1",
+            "SELECT edge_code, edge_name, edge_key_ciphertext, status FROM edge_site WHERE edge_code = $1",
         )
         .bind(edge_code)
         .fetch_optional(&self.pool)
@@ -1439,13 +1473,14 @@ impl PgCenterStore {
             r#"
             SELECT es.edge_code,
                    es.edge_name,
-                   es.auth_key_id,
+                   es.edge_key_ciphertext,
                    es.status AS edge_status,
                    es.create_time,
+                   es.key_updated_time,
                    COUNT(ol.id) AS object_count
             FROM edge_site AS es
             LEFT JOIN object_ledger AS ol ON ol.edge_code = es.edge_code
-            GROUP BY es.edge_code, es.edge_name, es.auth_key_id, es.status, es.create_time
+            GROUP BY es.edge_code, es.edge_name, es.edge_key_ciphertext, es.status, es.create_time, es.key_updated_time
             ORDER BY es.edge_code ASC
             "#,
         )
@@ -1457,25 +1492,25 @@ impl PgCenterStore {
     async fn create_edge_site(&self, edge: NewEdgeSite) -> Result<ManagedEdgeSite> {
         let row = sqlx::query(
             r#"
-            INSERT INTO edge_site (edge_code, edge_name, auth_key_id, auth_secret_ciphertext, status)
-            VALUES ($1, $2, $3, $4, $5)
-            RETURNING edge_code, edge_name, auth_key_id, status AS edge_status, create_time
+            INSERT INTO edge_site (edge_code, edge_name, edge_key_ciphertext, status)
+            VALUES ($1, $2, $3, $4)
+            RETURNING edge_code, edge_name, edge_key_ciphertext, status AS edge_status, create_time, key_updated_time
             "#,
         )
         .bind(&edge.edge_code)
         .bind(&edge.edge_name)
-        .bind(&edge.auth_key_id)
-        .bind(&edge.edge_auth_secret)
+        .bind(&edge.edge_key)
         .bind(&edge.edge_status)
         .fetch_one(&self.pool)
         .await?;
         Ok(ManagedEdgeSite {
             edge_code: row.get("edge_code"),
             edge_name: row.get("edge_name"),
-            auth_key_id: row.get("auth_key_id"),
+            edge_key: row.get("edge_key_ciphertext"),
             edge_status: row.get("edge_status"),
             object_count: Some(0),
             create_time: Some(utc_from_naive(row.get("create_time"))),
+            key_updated_time: Some(utc_from_naive(row.get("key_updated_time"))),
         })
     }
 
@@ -1491,7 +1526,7 @@ impl PgCenterStore {
             SET edge_name = $2,
                 status = $3
             WHERE edge_code = $1
-            RETURNING edge_code, edge_name, auth_key_id, status AS edge_status, create_time
+            RETURNING edge_code, edge_name, edge_key_ciphertext, status AS edge_status, create_time, key_updated_time
             "#,
         )
         .bind(&edge_code)
@@ -1503,10 +1538,37 @@ impl PgCenterStore {
         Ok(ManagedEdgeSite {
             edge_code: row.get("edge_code"),
             edge_name: row.get("edge_name"),
-            auth_key_id: row.get("auth_key_id"),
+            edge_key: row.get("edge_key_ciphertext"),
             edge_status: row.get("edge_status"),
             object_count: None,
             create_time: Some(utc_from_naive(row.get("create_time"))),
+            key_updated_time: Some(utc_from_naive(row.get("key_updated_time"))),
+        })
+    }
+
+    async fn reset_edge_key(&self, edge_code: String, edge_key: String) -> Result<ManagedEdgeSite> {
+        let row = sqlx::query(
+            r#"
+            UPDATE edge_site
+            SET edge_key_ciphertext = $2,
+                key_updated_time = NOW() AT TIME ZONE 'UTC'
+            WHERE edge_code = $1
+            RETURNING edge_code, edge_name, edge_key_ciphertext, status AS edge_status, create_time, key_updated_time
+            "#,
+        )
+        .bind(&edge_code)
+        .bind(&edge_key)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| anyhow!("edge_site not found"))?;
+        Ok(ManagedEdgeSite {
+            edge_code: row.get("edge_code"),
+            edge_name: row.get("edge_name"),
+            edge_key: row.get("edge_key_ciphertext"),
+            edge_status: row.get("edge_status"),
+            object_count: None,
+            create_time: Some(utc_from_naive(row.get("create_time"))),
+            key_updated_time: Some(utc_from_naive(row.get("key_updated_time"))),
         })
     }
 
@@ -1652,8 +1714,7 @@ fn edge_record_from_row(row: sqlx::postgres::PgRow) -> EdgeRecord {
     EdgeRecord {
         edge_code: row.get("edge_code"),
         edge_name: row.get("edge_name"),
-        auth_key_id: row.get("auth_key_id"),
-        auth_secret: row.get("auth_secret_ciphertext"),
+        edge_key: row.get("edge_key_ciphertext"),
         edge_status: row.get("status"),
     }
 }
@@ -1734,10 +1795,11 @@ fn managed_edge_site_from_row(row: sqlx::postgres::PgRow) -> ManagedEdgeSite {
     ManagedEdgeSite {
         edge_code: row.get("edge_code"),
         edge_name: row.get("edge_name"),
-        auth_key_id: row.get("auth_key_id"),
+        edge_key: row.get("edge_key_ciphertext"),
         edge_status: row.get("edge_status"),
         object_count: Some(row.get::<i64, _>("object_count").max(0) as u64),
         create_time: Some(utc_from_naive(row.get("create_time"))),
+        key_updated_time: Some(utc_from_naive(row.get("key_updated_time"))),
     }
 }
 
@@ -1849,7 +1911,7 @@ fn memory_managed_edge_site(store: &MemoryCenterStore, edge_code: &str) -> Optio
     Some(ManagedEdgeSite {
         edge_code: edge.edge_code.clone(),
         edge_name: edge.edge_name.clone(),
-        auth_key_id: edge.auth_key_id.clone(),
+        edge_key: edge.edge_key.clone(),
         edge_status: edge.edge_status.clone(),
         object_count: Some(
             store
@@ -1859,6 +1921,7 @@ fn memory_managed_edge_site(store: &MemoryCenterStore, edge_code: &str) -> Optio
                 .count() as u64,
         ),
         create_time: None,
+        key_updated_time: None,
     })
 }
 
@@ -2404,6 +2467,18 @@ async fn update_edge_site_handler(
         .map_err(Into::into)
 }
 
+async fn reset_edge_key_handler(
+    State(state): State<AppState>,
+    AxumPath(edge_code): AxumPath<String>,
+) -> Result<Json<ManagedEdgeSite>, ApiError> {
+    state
+        .service
+        .reset_edge_key(edge_code)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
 async fn delete_edge_site_handler(
     State(state): State<AppState>,
     AxumPath(edge_code): AxumPath<String>,
@@ -2701,8 +2776,7 @@ mod tests {
             EdgeRecord {
                 edge_code: "edge-a".to_string(),
                 edge_name: "Edge A".to_string(),
-                auth_key_id: "auth-key-a".to_string(),
-                auth_secret: "edge-auth-secret".to_string(),
+                edge_key: "edge-key-a".to_string(),
                 edge_status: "ACTIVE".to_string(),
             },
         );
@@ -2711,8 +2785,7 @@ mod tests {
             EdgeRecord {
                 edge_code: "edge-b".to_string(),
                 edge_name: "Edge B".to_string(),
-                auth_key_id: "auth-key-b".to_string(),
-                auth_secret: "edge-auth-secret-b".to_string(),
+                edge_key: "edge-key-b".to_string(),
                 edge_status: "DISABLED".to_string(),
             },
         );
@@ -3033,8 +3106,7 @@ mod tests {
             EdgeRecord {
                 edge_code: "edge-a".to_string(),
                 edge_name: "Edge A".to_string(),
-                auth_key_id: "edge-a-key".to_string(),
-                auth_secret: "edge-a-secret".to_string(),
+                edge_key: "edge-a-key".to_string(),
                 edge_status: "ACTIVE".to_string(),
             },
         );
@@ -3386,11 +3458,12 @@ mod tests {
         let body = json_body(response).await;
         assert_eq!(body["items"][0]["edge_code"], "edge-a");
         assert_eq!(body["items"][0]["edge_status"], "ACTIVE");
-        assert_eq!(body["items"][0]["auth_key_id"], "auth-key-a");
+        assert_eq!(body["items"][0]["edge_key"], "edge-key-a");
         assert_eq!(body["items"][0]["object_count"], 1);
         assert!(body["items"][0].get("status").is_none());
-        assert!(body["items"][0].get("auth_secret_ciphertext").is_none());
+        assert!(body["items"][0].get("edge_key_ciphertext").is_none());
         assert!(body["items"][0].get("edge_auth_secret").is_none());
+        assert!(body["items"][0].get("auth_key_id").is_none());
         assert_eq!(body["edges"][1]["edge_code"], "edge-b");
     }
 
@@ -3410,9 +3483,7 @@ mod tests {
                     .body(Body::from(
                         serde_json::json!({
                             "edge_code": "edge-c",
-                            "edge_name": "Edge C",
-                            "auth_key_id": "auth-key-c",
-                            "edge_auth_secret": "edge-auth-secret-c"
+                            "edge_name": "Edge C"
                         })
                         .to_string(),
                     ))
@@ -3425,9 +3496,11 @@ mod tests {
         let body = json_body(response).await;
         assert_eq!(body["edge_code"], "edge-c");
         assert_eq!(body["edge_status"], "ACTIVE");
+        assert!(body["edge_key"].as_str().unwrap_or("").len() > 20);
         assert!(body.get("status").is_none());
-        assert!(body.get("auth_secret_ciphertext").is_none());
+        assert!(body.get("edge_key_ciphertext").is_none());
         assert!(body.get("edge_auth_secret").is_none());
+        assert!(body.get("auth_key_id").is_none());
     }
 
     #[tokio::test]
@@ -3448,8 +3521,6 @@ mod tests {
                         serde_json::json!({
                             "edge_code": "edge-c",
                             "edge_name": "Edge C",
-                            "auth_key_id": "auth-key-c",
-                            "edge_auth_secret": "edge-auth-secret-c",
                             "edge_status": "ACTIVE"
                         })
                         .to_string(),
@@ -3463,10 +3534,11 @@ mod tests {
         let body = json_body(response).await;
         assert_eq!(body["edge_code"], "edge-c");
         assert_eq!(body["edge_status"], "ACTIVE");
-        assert_eq!(body["auth_key_id"], "auth-key-c");
+        assert!(body["edge_key"].as_str().unwrap_or("").len() > 20);
         assert!(body.get("status").is_none());
-        assert!(body.get("auth_secret_ciphertext").is_none());
+        assert!(body.get("edge_key_ciphertext").is_none());
         assert!(body.get("edge_auth_secret").is_none());
+        assert!(body.get("auth_key_id").is_none());
 
         let response = app
             .clone()

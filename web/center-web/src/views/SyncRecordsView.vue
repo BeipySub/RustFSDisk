@@ -161,11 +161,6 @@ function submitSearch() {
   void loadRecords();
 }
 
-function goDashboard() {
-  window.history.pushState({}, "", "/dashboard");
-  window.dispatchEvent(new PopStateEvent("popstate"));
-}
-
 function handleTableChange(pagination: { current?: number }) {
   page.value = pagination.current ?? 1;
 }
@@ -254,11 +249,7 @@ onMounted(() => {
     />
 
     <section class="records-title">
-      <a-page-header class="records-page-header" title="同步记录" :ghost="false" :back-icon="false">
-        <template #extra>
-          <a-button size="middle" @click="goDashboard">← 返回 Dashboard</a-button>
-        </template>
-      </a-page-header>
+      <a-page-header class="records-page-header" title="同步记录" :ghost="false" :back-icon="false" />
     </section>
 
     <a-row class="record-summary" :gutter="16">

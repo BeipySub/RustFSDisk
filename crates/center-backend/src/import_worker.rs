@@ -158,7 +158,7 @@ pub trait ImportRepository {
     fn fail_import(&mut self, import_job_id: Uuid, code: ImportErrorCode, message: &str);
     fn disk_registered(&self, disk_id: Uuid) -> bool;
     fn disk_enabled(&self, disk_id: Uuid) -> bool;
-    fn active_edge_auth_secret(&self, edge_code: &str) -> Option<String>;
+    fn active_edge_key(&self, edge_code: &str) -> Option<String>;
     fn validate_data_key_for_import(&self, data_key: &ImportedDataKeyBinding) -> ImportResult<()>;
     fn identity_imported(&self, identity: &LedgerIdentity) -> bool;
     fn nonce_used(&self, data_key_id: Uuid, nonce: &str) -> bool;
@@ -313,7 +313,7 @@ where
             )
         })?;
         let checked = validate_manifest(&disk_info, &manifest, &actual_manifest_sha)?;
-        let Some(edge_auth_secret) = self.repo.active_edge_auth_secret(&checked.edge_code) else {
+        let Some(edge_key) = self.repo.active_edge_key(&checked.edge_code) else {
             return Err(ImportError::new(
                 ImportErrorCode::ManifestInvalid,
                 "edge site is not active",
@@ -322,7 +322,7 @@ where
         self.repo
             .validate_data_key_for_import(&checked.data_key_binding())?;
         let disk_data_key = derive_offline_disk_data_key(
-            &edge_auth_secret,
+            &edge_key,
             &checked.edge_code,
             checked.disk_id,
             checked.data_key_id,
@@ -1227,7 +1227,7 @@ struct MemoryDataKey {
 
 #[derive(Debug, Clone)]
 struct MemoryEdgeSite {
-    edge_auth_secret: String,
+    edge_key: String,
     edge_status: String,
 }
 
@@ -1258,24 +1258,20 @@ impl MemoryRepository {
         self.disabled_disks.insert(disk_id);
     }
 
-    pub fn register_edge(
-        &mut self,
-        edge_code: impl Into<String>,
-        edge_auth_secret: impl Into<String>,
-    ) {
-        self.put_edge(edge_code, edge_auth_secret, "ACTIVE");
+    pub fn register_edge(&mut self, edge_code: impl Into<String>, edge_key: impl Into<String>) {
+        self.put_edge(edge_code, edge_key, "ACTIVE");
     }
 
     pub fn put_edge(
         &mut self,
         edge_code: impl Into<String>,
-        edge_auth_secret: impl Into<String>,
+        edge_key: impl Into<String>,
         edge_status: impl Into<String>,
     ) {
         self.edges.insert(
             edge_code.into(),
             MemoryEdgeSite {
-                edge_auth_secret: edge_auth_secret.into(),
+                edge_key: edge_key.into(),
                 edge_status: edge_status.into(),
             },
         );
@@ -1506,11 +1502,11 @@ impl ImportRepository for MemoryRepository {
         !self.disabled_disks.contains(&disk_id)
     }
 
-    fn active_edge_auth_secret(&self, edge_code: &str) -> Option<String> {
+    fn active_edge_key(&self, edge_code: &str) -> Option<String> {
         self.edges
             .get(edge_code)
             .filter(|edge| edge.edge_status == "ACTIVE")
-            .map(|edge| edge.edge_auth_secret.clone())
+            .map(|edge| edge.edge_key.clone())
     }
 
     fn validate_data_key_for_import(&self, data_key: &ImportedDataKeyBinding) -> ImportResult<()> {

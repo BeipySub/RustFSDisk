@@ -67,10 +67,10 @@ impl AppState {
             pg_pool,
             s3_client,
         ));
-        let realtime = EdgeRealtimeHub::new(config.center.edge_code.clone());
+        let realtime = EdgeRealtimeHub::new(config.edge.edge_code.clone());
         let auto_export = AutoExportOrchestrator::new(config.auto_export.clone(), control.clone());
         let detector = EdgeDiskDetector::new_with_event_publisher(
-            EdgeDiskDetectorConfig::new(config.center.edge_code.clone()),
+            EdgeDiskDetectorConfig::new(config.edge.edge_code.clone()),
             probe,
             ledger,
             realtime.clone(),
@@ -202,7 +202,7 @@ async fn readiness(State(state): State<AppState>) -> (StatusCode, Json<Readiness
         Json(ReadinessResponse {
             ok: ready,
             service: "rustfs-transfer-edge",
-            edge_code: state.config.center.edge_code.clone(),
+            edge_code: state.config.edge.edge_code.clone(),
             database_ok,
             rustfs_ok,
             disk_mount_roots,
@@ -222,7 +222,7 @@ impl HealthResponse {
         Self {
             ok: true,
             service: "rustfs-transfer-edge",
-            edge_code: state.config.center.edge_code.clone(),
+            edge_code: state.config.edge.edge_code.clone(),
         }
     }
 }
@@ -317,7 +317,7 @@ async fn edge_copy_progress_ws(State(state): State<AppState>, ws: WebSocketUpgra
             socket,
             state.control.clone(),
             state.realtime.clone(),
-            state.config.center.edge_code.clone(),
+            state.config.edge.edge_code.clone(),
         )
         .await;
     })
@@ -554,44 +554,13 @@ async fn refresh_transport_runtime_before_control(state: &AppState) -> Result<()
         })
 }
 
-fn authorize_control_api(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
-    let configured = state
-        .config
-        .server
-        .control_api_token
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            ApiError(ControlError {
-                http_status: StatusCode::SERVICE_UNAVAILABLE,
-                error_code: "CONTROL_API_DISABLED",
-                message: "edge control API token is not configured".to_string(),
-            })
-        })?;
-    let provided = headers
-        .get("X-Edge-Control-Token")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default();
-
-    if constant_time_eq(configured.as_bytes(), provided.as_bytes()) {
-        Ok(())
-    } else {
-        Err(ApiError(ControlError {
-            http_status: StatusCode::UNAUTHORIZED,
-            error_code: "UNAUTHORIZED",
-            message: "edge control API token is missing or invalid".to_string(),
-        }))
-    }
-}
-
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    left.iter()
-        .zip(right.iter())
-        .fold(0_u8, |acc, (left, right)| acc | (left ^ right))
-        == 0
+fn authorize_control_api(_state: &AppState, _headers: &HeaderMap) -> Result<(), ApiError> {
+    Err(ApiError(ControlError {
+        http_status: StatusCode::GONE,
+        error_code: "CONTROL_API_REMOVED",
+        message: "edge manual control API has been removed from the delivery configuration"
+            .to_string(),
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1007,7 +976,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn control_routes_require_local_token() {
+    async fn control_routes_are_removed() {
         let router = app(test_state(Arc::new(FakeControl::default())));
 
         let response = router
@@ -1022,11 +991,13 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.status(), StatusCode::GONE);
+        let body = json_body(response).await;
+        assert_eq!(body["error_code"], "CONTROL_API_REMOVED");
     }
 
     #[tokio::test]
-    async fn controlled_summary_requires_token_but_dashboard_summary_is_public_readonly() {
+    async fn controlled_summary_is_removed_but_dashboard_summary_is_public_readonly() {
         let control = Arc::new(FakeControl::default());
         let rescan_calls = Arc::new(AtomicUsize::new(0));
         let router = app(test_state_with_rescan(
@@ -1047,7 +1018,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(controlled.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(controlled.status(), StatusCode::GONE);
 
         let dashboard = router
             .oneshot(
@@ -1156,7 +1127,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scan_route_triggers_control_workflow() {
+    async fn scan_route_is_removed() {
         let control = Arc::new(FakeControl::default());
         let router = app(test_state(control.clone()));
 
@@ -1169,15 +1140,14 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::GONE);
         let body = json_body(response).await;
-        assert_eq!(body["scan_status"], "DONE");
-        assert!(body.get("status").is_none());
-        assert_eq!(control.calls.lock().unwrap().as_slice(), &["scan_once"]);
+        assert_eq!(body["error_code"], "CONTROL_API_REMOVED");
+        assert!(control.calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn scan_and_export_routes_refresh_disk_runtime_before_control_workflow() {
+    async fn scan_and_export_control_routes_are_removed_before_control_workflow() {
         let export_job_id = Uuid::new_v4();
         let control = Arc::new(FakeControl {
             export_job_id,
@@ -1200,7 +1170,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(scan.status(), StatusCode::OK);
+        assert_eq!(scan.status(), StatusCode::GONE);
 
         let create = router
             .clone()
@@ -1211,7 +1181,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(create.status(), StatusCode::OK);
+        assert_eq!(create.status(), StatusCode::GONE);
 
         let start = router
             .oneshot(authenticated_json(
@@ -1221,17 +1191,14 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(start.status(), StatusCode::OK);
+        assert_eq!(start.status(), StatusCode::GONE);
 
-        assert_eq!(rescan_calls.load(Ordering::SeqCst), 3);
-        assert_eq!(
-            control.calls.lock().unwrap().as_slice(),
-            &["scan_once", "create_export_job", "start_export_job"]
-        );
+        assert_eq!(rescan_calls.load(Ordering::SeqCst), 0);
+        assert!(control.calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn export_job_routes_create_query_and_start() {
+    async fn export_job_control_routes_are_removed() {
         let export_job_id = Uuid::new_v4();
         let control = Arc::new(FakeControl {
             export_job_id,
@@ -1248,10 +1215,9 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(create.status(), StatusCode::OK);
+        assert_eq!(create.status(), StatusCode::GONE);
         let create_body = json_body(create).await;
-        assert_eq!(create_body["export_job_status"], "PENDING");
-        assert!(create_body.get("status").is_none());
+        assert_eq!(create_body["error_code"], "CONTROL_API_REMOVED");
 
         let query = router
             .clone()
@@ -1261,7 +1227,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(query.status(), StatusCode::OK);
+        assert_eq!(query.status(), StatusCode::GONE);
 
         let start = router
             .oneshot(authenticated_json(
@@ -1271,19 +1237,15 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(start.status(), StatusCode::OK);
+        assert_eq!(start.status(), StatusCode::GONE);
         let start_body = json_body(start).await;
-        assert_eq!(start_body["export_job_status"], "COPYING");
-        assert_eq!(start_body["assigned_object_count"], 2);
+        assert_eq!(start_body["error_code"], "CONTROL_API_REMOVED");
 
-        assert_eq!(
-            control.calls.lock().unwrap().as_slice(),
-            &["create_export_job", "export_job", "start_export_job"]
-        );
+        assert!(control.calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn recover_export_job_route_requires_token() {
+    async fn recover_export_job_route_is_removed_without_token() {
         let export_job_id = Uuid::new_v4();
         let control = Arc::new(FakeControl {
             export_job_id,
@@ -1303,11 +1265,11 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.status(), StatusCode::GONE);
     }
 
     #[tokio::test]
-    async fn recover_export_job_route_triggers_control_without_naked_status() {
+    async fn recover_export_job_control_route_is_removed() {
         let export_job_id = Uuid::new_v4();
         let control = Arc::new(FakeControl {
             export_job_id,
@@ -1324,15 +1286,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::GONE);
         let body = json_body(response).await;
-        assert_eq!(body["export_job_status"], "COPYING");
-        assert_eq!(body["recovered_disk_count"], 1);
-        assert!(body.get("status").is_none());
-        assert_eq!(
-            control.calls.lock().unwrap().as_slice(),
-            &["recover_export_job"]
-        );
+        assert_eq!(body["error_code"], "CONTROL_API_REMOVED");
+        assert!(control.calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1509,16 +1466,13 @@ mod tests {
         let raw = r#"
             [server]
             bind = "127.0.0.1:8081"
-            control_api_token = "local-control-token"
 
             [database]
             url = "postgres://edge:edge@localhost/edge"
 
-            [center]
-            base_url = "http://center.local:8080"
+            [edge]
             edge_code = "edge-a"
-            auth_key_id = "auth-key"
-            edge_auth_secret = "edge-secret"
+            edge_key = "edge-key"
 
             [rustfs]
             endpoint = "http://127.0.0.1:9000"

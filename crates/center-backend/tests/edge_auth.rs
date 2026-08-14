@@ -13,8 +13,7 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 const EDGE_CODE: &str = "edge-a";
-const AUTH_KEY_ID: &str = "auth-key-a";
-const SECRET: &[u8] = b"edge-auth-secret";
+const EDGE_KEY: &[u8] = b"edge-key";
 
 fn state(edge_status: &str) -> AppState {
     AppState::new(CenterService::memory(store_with_edge(edge_status)))
@@ -27,8 +26,7 @@ fn store_with_edge(edge_status: &str) -> MemoryCenterStore {
         EdgeRecord {
             edge_code: EDGE_CODE.to_string(),
             edge_name: "Edge A".to_string(),
-            auth_key_id: AUTH_KEY_ID.to_string(),
-            auth_secret: String::from_utf8(SECRET.to_vec()).unwrap(),
+            edge_key: String::from_utf8(EDGE_KEY.to_vec()).unwrap(),
             edge_status: edge_status.to_string(),
         },
     );
@@ -84,7 +82,6 @@ async fn post_edge_auth(
         Method::POST.as_str(),
         "/api/edge/auth",
         EDGE_CODE,
-        AUTH_KEY_ID,
         &timestamp,
         nonce,
         body,
@@ -168,7 +165,6 @@ fn signed(
         method.as_str(),
         path,
         EDGE_CODE,
-        AUTH_KEY_ID,
         &timestamp,
         nonce,
         body,
@@ -198,7 +194,7 @@ async fn correct_signature_allows_edge_auth() {
         br#"{"edge_code":"edge-a","client_version":"1.0.0"}"#,
         Utc::now().to_rfc3339(),
         &nonce,
-        SECRET,
+        EDGE_KEY,
     )
     .await;
 
@@ -233,7 +229,7 @@ async fn timestamp_skew_returns_unauthorized() {
         br#"{"edge_code":"edge-a"}"#,
         (Utc::now() - Duration::seconds(301)).to_rfc3339(),
         &nonce,
-        SECRET,
+        EDGE_KEY,
     )
     .await;
 
@@ -251,7 +247,7 @@ async fn replayed_nonce_returns_unauthorized() {
         br#"{"edge_code":"edge-a"}"#,
         timestamp.clone(),
         &nonce,
-        SECRET,
+        EDGE_KEY,
     )
     .await;
     let second = post_edge_auth(
@@ -259,7 +255,7 @@ async fn replayed_nonce_returns_unauthorized() {
         br#"{"edge_code":"edge-a"}"#,
         timestamp,
         &nonce,
-        SECRET,
+        EDGE_KEY,
     )
     .await;
 
@@ -276,7 +272,7 @@ async fn disabled_edge_returns_unauthorized() {
         br#"{"edge_code":"edge-a"}"#,
         Utc::now().to_rfc3339(),
         &nonce,
-        SECRET,
+        EDGE_KEY,
     )
     .await;
 
@@ -292,7 +288,7 @@ async fn body_edge_code_mismatch_returns_invalid_request() {
         br#"{"edge_code":"edge-b"}"#,
         Utc::now().to_rfc3339(),
         &nonce,
-        SECRET,
+        EDGE_KEY,
     )
     .await;
 
@@ -337,7 +333,7 @@ async fn disk_verify_accepts_correct_hmac_signature() {
         &body,
         Utc::now().to_rfc3339(),
         &format!("nonce-verify-ok-{}", Uuid::new_v4()),
-        SECRET,
+        EDGE_KEY,
     );
 
     let (status, body) = post_json(state, "/api/disk/verify", body, Some(headers)).await;
@@ -358,7 +354,7 @@ async fn disk_verify_accepts_lowercase_hmac_header_names() {
         &body,
         Utc::now().to_rfc3339(),
         &format!("nonce-verify-lowercase-{}", Uuid::new_v4()),
-        SECRET,
+        EDGE_KEY,
     ));
 
     let (status, body) = post_json(state, "/api/disk/verify", body, Some(headers)).await;
@@ -396,7 +392,7 @@ async fn disk_verify_rejects_bad_timestamp_replay_body_path_and_method_signature
         &body,
         (Utc::now() - Duration::seconds(301)).to_rfc3339(),
         &format!("nonce-verify-stale-{}", Uuid::new_v4()),
-        SECRET,
+        EDGE_KEY,
     );
     let (status, _) = post_json(state.clone(), "/api/disk/verify", body.clone(), Some(stale)).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -408,7 +404,7 @@ async fn disk_verify_rejects_bad_timestamp_replay_body_path_and_method_signature
         &body,
         Utc::now().to_rfc3339(),
         &replay_nonce,
-        SECRET,
+        EDGE_KEY,
     );
     let first = post_json(
         state.clone(),
@@ -433,7 +429,7 @@ async fn disk_verify_rejects_bad_timestamp_replay_body_path_and_method_signature
         br#"{"edge_code":"edge-a"}"#,
         Utc::now().to_rfc3339(),
         &format!("nonce-verify-body-{}", Uuid::new_v4()),
-        SECRET,
+        EDGE_KEY,
     );
     let (status, _) = post_json(
         state.clone(),
@@ -450,7 +446,7 @@ async fn disk_verify_rejects_bad_timestamp_replay_body_path_and_method_signature
         &body,
         Utc::now().to_rfc3339(),
         &format!("nonce-verify-path-{}", Uuid::new_v4()),
-        SECRET,
+        EDGE_KEY,
     );
     let (status, _) = post_json(
         state.clone(),
@@ -467,7 +463,7 @@ async fn disk_verify_rejects_bad_timestamp_replay_body_path_and_method_signature
         &body,
         Utc::now().to_rfc3339(),
         &format!("nonce-verify-method-{}", Uuid::new_v4()),
-        SECRET,
+        EDGE_KEY,
     );
     let (status, _) = post_json(state, "/api/disk/verify", body, Some(signed_for_get)).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -483,7 +479,7 @@ async fn disk_verify_rejects_disabled_edge_before_business_logic() {
         &body,
         Utc::now().to_rfc3339(),
         &format!("nonce-verify-disabled-{}", Uuid::new_v4()),
-        SECRET,
+        EDGE_KEY,
     );
 
     let (status, body) = post_json(state, "/api/disk/verify", body, Some(headers)).await;
@@ -528,7 +524,7 @@ async fn export_key_accepts_correct_hmac_and_omits_expires_at() {
         &body,
         Utc::now().to_rfc3339(),
         &format!("nonce-export-ok-{}", Uuid::new_v4()),
-        SECRET,
+        EDGE_KEY,
     );
 
     let (status, response) = post_json(state, "/api/disk/export-key", body, Some(headers)).await;

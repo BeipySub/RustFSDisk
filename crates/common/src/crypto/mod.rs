@@ -68,6 +68,8 @@ pub enum CryptoError {
     Base64DecodeFailed(String),
     #[error("HMAC verification failed")]
     HmacVerificationFailed,
+    #[error("edge_key must not be empty")]
+    EmptyEdgeKey,
     #[error("disk_info.security is missing")]
     DiskInfoSecurityMissing,
     #[error("disk_info center_signature is missing")]
@@ -239,6 +241,35 @@ pub fn verify_hmac_base64(
     mac.update(canonical.string_to_sign().as_bytes());
     mac.verify_slice(&expected)
         .map_err(|_| CryptoError::HmacVerificationFailed)
+}
+
+pub fn derive_disk_data_key_from_edge_key(
+    edge_key: &str,
+    edge_code: &str,
+    disk_id: impl std::fmt::Display,
+    data_key_id: impl std::fmt::Display,
+    export_job_id: impl std::fmt::Display,
+    seal_id: impl std::fmt::Display,
+) -> Result<[u8; AES_256_GCM_KEY_LEN], CryptoError> {
+    let edge_key = edge_key.trim();
+    if edge_key.is_empty() {
+        return Err(CryptoError::EmptyEdgeKey);
+    }
+    let message = format!(
+        "rustfs-transfer:offline-disk-data-key:v1\nedge_code={}\ndisk_id={}\ndata_key_id={}\nexport_job_id={}\nseal_id={}",
+        edge_code.trim(),
+        disk_id,
+        data_key_id,
+        export_job_id,
+        seal_id
+    );
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(edge_key.as_bytes())
+        .expect("HMAC accepts any key length");
+    mac.update(message.as_bytes());
+    let bytes = mac.finalize().into_bytes();
+    let mut key = [0_u8; AES_256_GCM_KEY_LEN];
+    key.copy_from_slice(&bytes);
+    Ok(key)
 }
 
 pub fn center_signature_payload<T: Serialize>(disk_info: &T) -> Result<Value, CryptoError> {

@@ -23,7 +23,6 @@ use uuid::Uuid;
 use crate::{AppState, EdgeRecord};
 
 pub const HEADER_EDGE_CODE: &str = "X-Edge-Code";
-pub const HEADER_AUTH_KEY_ID: &str = "X-Auth-Key-Id";
 pub const HEADER_TIMESTAMP: &str = "X-Timestamp";
 pub const HEADER_NONCE: &str = "X-Nonce";
 pub const HEADER_BODY_SHA256: &str = "X-Body-SHA256";
@@ -52,7 +51,6 @@ pub async fn edge_auth_handler(
     info!(
         request_id = %authenticated.request_id,
         edge_code = %authenticated.edge.edge_code,
-        auth_key_id = %authenticated.edge.auth_key_id,
         client_version = auth_body.client_version.as_deref().unwrap_or(""),
         "edge auth accepted"
     );
@@ -89,68 +87,39 @@ pub async fn authenticate_edge_request(
         .to_vec();
 
     let edge_code = required_header(&headers, HEADER_EDGE_CODE)
-        .map_err(|reason| AuthError::unauthorized(request_id, None, None, reason))?;
-    let auth_key_id = required_header(&headers, HEADER_AUTH_KEY_ID)
-        .map_err(|reason| AuthError::unauthorized(request_id, Some(&edge_code), None, reason))?;
-    let timestamp = required_header(&headers, HEADER_TIMESTAMP).map_err(|reason| {
-        AuthError::unauthorized(request_id, Some(&edge_code), Some(&auth_key_id), reason)
-    })?;
-    let nonce = required_header(&headers, HEADER_NONCE).map_err(|reason| {
-        AuthError::unauthorized(request_id, Some(&edge_code), Some(&auth_key_id), reason)
-    })?;
-    let body_sha256 = required_header(&headers, HEADER_BODY_SHA256).map_err(|reason| {
-        AuthError::unauthorized(request_id, Some(&edge_code), Some(&auth_key_id), reason)
-    })?;
-    let signature = required_header(&headers, HEADER_SIGNATURE).map_err(|reason| {
-        AuthError::unauthorized(request_id, Some(&edge_code), Some(&auth_key_id), reason)
-    })?;
+        .map_err(|reason| AuthError::unauthorized(request_id, None, reason))?;
+    let timestamp = required_header(&headers, HEADER_TIMESTAMP)
+        .map_err(|reason| AuthError::unauthorized(request_id, Some(&edge_code), reason))?;
+    let nonce = required_header(&headers, HEADER_NONCE)
+        .map_err(|reason| AuthError::unauthorized(request_id, Some(&edge_code), reason))?;
+    let body_sha256 = required_header(&headers, HEADER_BODY_SHA256)
+        .map_err(|reason| AuthError::unauthorized(request_id, Some(&edge_code), reason))?;
+    let signature = required_header(&headers, HEADER_SIGNATURE)
+        .map_err(|reason| AuthError::unauthorized(request_id, Some(&edge_code), reason))?;
 
     let edge = state
         .service
         .edge_for_auth(&edge_code)
         .await
-        .map_err(|_| {
-            AuthError::unauthorized(
-                request_id,
-                Some(&edge_code),
-                Some(&auth_key_id),
-                "edge_lookup_failed",
-            )
-        })?
-        .ok_or_else(|| {
-            AuthError::unauthorized(
-                request_id,
-                Some(&edge_code),
-                Some(&auth_key_id),
-                "edge_not_found",
-            )
-        })?;
+        .map_err(|_| AuthError::unauthorized(request_id, Some(&edge_code), "edge_lookup_failed"))?
+        .ok_or_else(|| AuthError::unauthorized(request_id, Some(&edge_code), "edge_not_found"))?;
 
-    if edge.edge_status != "ACTIVE" || edge.auth_key_id != auth_key_id {
+    if edge.edge_status != "ACTIVE" {
         return Err(AuthError::unauthorized(
             request_id,
             Some(&edge_code),
-            Some(&auth_key_id),
-            "edge_disabled_or_key_mismatch",
+            "edge_disabled",
         ));
     }
 
     let request_time = DateTime::parse_from_rfc3339(&timestamp)
-        .map_err(|_| {
-            AuthError::unauthorized(
-                request_id,
-                Some(&edge_code),
-                Some(&auth_key_id),
-                "bad_timestamp",
-            )
-        })?
+        .map_err(|_| AuthError::unauthorized(request_id, Some(&edge_code), "bad_timestamp"))?
         .with_timezone(&Utc);
     let now = Utc::now();
     if (now - request_time).num_seconds().abs() > MAX_TIMESTAMP_SKEW_SECONDS {
         return Err(AuthError::unauthorized(
             request_id,
             Some(&edge_code),
-            Some(&auth_key_id),
             "timestamp_skew",
         ));
     }
@@ -159,7 +128,6 @@ pub async fn authenticate_edge_request(
         return Err(AuthError::unauthorized(
             request_id,
             Some(&edge_code),
-            Some(&auth_key_id),
             "body_sha256_mismatch",
         ));
     }
@@ -171,20 +139,13 @@ pub async fn authenticate_edge_request(
         nonce: nonce.clone(),
         body_sha256,
     };
-    verify_hmac_base64(edge.auth_secret.as_bytes(), &canonical, &signature).map_err(|_| {
-        AuthError::unauthorized(
-            request_id,
-            Some(&edge_code),
-            Some(&auth_key_id),
-            "bad_signature",
-        )
-    })?;
+    verify_hmac_base64(edge.edge_key.as_bytes(), &canonical, &signature)
+        .map_err(|_| AuthError::unauthorized(request_id, Some(&edge_code), "bad_signature"))?;
 
-    if !NONCE_CACHE.insert_once(&auth_key_id, &nonce, now) {
+    if !NONCE_CACHE.insert_once(&edge_code, &nonce, now) {
         return Err(AuthError::unauthorized(
             request_id,
             Some(&edge_code),
-            Some(&auth_key_id),
             "nonce_replay",
         ));
     }
@@ -203,7 +164,6 @@ pub fn signed_headers(
     method: &str,
     path_with_query: &str,
     edge_code: &str,
-    auth_key_id: &str,
     timestamp: &str,
     nonce: &str,
     body: &[u8],
@@ -220,7 +180,6 @@ pub fn signed_headers(
     let signature = rustfs_transfer_common::crypto::sign_hmac_base64(secret, &canonical);
     let mut headers = HeaderMap::new();
     headers.insert(HEADER_EDGE_CODE, edge_code.parse()?);
-    headers.insert(HEADER_AUTH_KEY_ID, auth_key_id.parse()?);
     headers.insert(HEADER_TIMESTAMP, timestamp.parse()?);
     headers.insert(HEADER_NONCE, nonce.parse()?);
     headers.insert(HEADER_BODY_SHA256, body_sha256.parse()?);
@@ -237,16 +196,10 @@ pub struct AuthError {
 }
 
 impl AuthError {
-    fn unauthorized(
-        request_id: Uuid,
-        edge_code: Option<&str>,
-        auth_key_id: Option<&str>,
-        reason: &'static str,
-    ) -> Self {
+    fn unauthorized(request_id: Uuid, edge_code: Option<&str>, reason: &'static str) -> Self {
         warn!(
             request_id = %request_id,
             edge_code = edge_code.unwrap_or(""),
-            auth_key_id = auth_key_id.unwrap_or(""),
             reject_reason = reason,
             "edge auth rejected"
         );
@@ -300,10 +253,10 @@ struct NonceCache {
 }
 
 impl NonceCache {
-    fn insert_once(&self, auth_key_id: &str, nonce: &str, now: DateTime<Utc>) -> bool {
+    fn insert_once(&self, edge_code: &str, nonce: &str, now: DateTime<Utc>) -> bool {
         let mut entries = self.entries.lock().expect("nonce cache lock poisoned");
         entries.retain(|_, expires_at| *expires_at > now);
-        let key = format!("{auth_key_id}:{nonce}");
+        let key = format!("{edge_code}:{nonce}");
         if entries.contains_key(&key) {
             return false;
         }

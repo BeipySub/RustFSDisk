@@ -6,7 +6,7 @@ pub struct EdgeConfig {
     #[serde(default)]
     pub server: ServerConfig,
     pub database: DatabaseConfig,
-    pub center: CenterConfig,
+    pub edge: EdgeIdentityConfig,
     pub rustfs: RustfsConfig,
     #[serde(default)]
     pub paths: PathConfig,
@@ -22,10 +22,6 @@ pub struct EdgeConfig {
 pub struct ServerConfig {
     #[serde(default = "default_bind")]
     pub bind: SocketAddr,
-    #[serde(default)]
-    pub control_api_token: Option<String>,
-    #[serde(default)]
-    pub control_api_token_env: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -36,16 +32,9 @@ pub struct DatabaseConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct CenterConfig {
-    #[serde(default)]
-    pub base_url: String,
+pub struct EdgeIdentityConfig {
     pub edge_code: String,
-    #[serde(default)]
-    pub auth_key_id: String,
-    #[serde(default)]
-    pub edge_auth_secret: String,
-    #[serde(default)]
-    pub edge_auth_secret_env: Option<String>,
+    pub edge_key: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -110,45 +99,9 @@ impl EdgeConfig {
     }
 
     fn apply_env_overrides(&mut self) {
-        if self
-            .server
-            .control_api_token
-            .as_deref()
-            .unwrap_or("")
-            .trim()
-            .is_empty()
-        {
-            if let Some(token) = read_optional_env(self.server.control_api_token_env.as_deref()) {
-                self.server.control_api_token = Some(token);
-            }
-        }
-        if let Ok(token) = env::var("RUSTFS_TRANSFER__SERVER__CONTROL_API_TOKEN") {
-            if !token.trim().is_empty() {
-                self.server.control_api_token = Some(token);
-            }
-        }
         override_string("RUSTFS_TRANSFER__DATABASE__URL", &mut self.database.url);
-        override_string(
-            "RUSTFS_TRANSFER__CENTER__BASE_URL",
-            &mut self.center.base_url,
-        );
-        override_string(
-            "RUSTFS_TRANSFER__CENTER__EDGE_CODE",
-            &mut self.center.edge_code,
-        );
-        override_string(
-            "RUSTFS_TRANSFER__CENTER__AUTH_KEY_ID",
-            &mut self.center.auth_key_id,
-        );
-        override_string(
-            "RUSTFS_TRANSFER__CENTER__EDGE_AUTH_SECRET",
-            &mut self.center.edge_auth_secret,
-        );
-        if self.center.edge_auth_secret.trim().is_empty() {
-            if let Some(secret) = read_optional_env(self.center.edge_auth_secret_env.as_deref()) {
-                self.center.edge_auth_secret = secret;
-            }
-        }
+        override_string("RUSTFS_TRANSFER__EDGE__EDGE_CODE", &mut self.edge.edge_code);
+        override_string("RUSTFS_TRANSFER__EDGE__EDGE_KEY", &mut self.edge.edge_key);
         override_string(
             "RUSTFS_TRANSFER__RUSTFS__ENDPOINT",
             &mut self.rustfs.endpoint,
@@ -224,8 +177,8 @@ impl EdgeConfig {
 
     fn validate(&self) -> anyhow::Result<()> {
         ensure_non_empty("database.url", &self.database.url)?;
-        ensure_non_empty("center.edge_code", &self.center.edge_code)?;
-        ensure_non_empty("center.edge_auth_secret", &self.center.edge_auth_secret)?;
+        ensure_non_empty("edge.edge_code", &self.edge.edge_code)?;
+        ensure_non_empty("edge.edge_key", &self.edge.edge_key)?;
         ensure_non_empty("rustfs.endpoint", &self.rustfs.endpoint)?;
         ensure_optional_non_empty("rustfs.access_key_id", &self.rustfs.access_key_id)?;
         ensure_optional_non_empty("rustfs.secret_access_key", &self.rustfs.secret_access_key)?;
@@ -259,8 +212,6 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind: default_bind(),
-            control_api_token: None,
-            control_api_token_env: None,
         }
     }
 }
@@ -421,11 +372,9 @@ mod tests {
             [database]
             url = "postgres://edge:edge@localhost/edge"
 
-            [center]
-            base_url = "http://center.local:8080"
+            [edge]
             edge_code = "edge-a"
-            auth_key_id = "auth-key-example"
-            edge_auth_secret = "example-dev-secret"
+            edge_key = "example-dev-key"
 
             [rustfs]
             endpoint = "http://127.0.0.1:9000"
@@ -436,8 +385,8 @@ mod tests {
         let config = EdgeConfig::from_toml(raw).expect("config loads");
 
         assert_eq!(config.server.bind.port(), 8081);
-        assert_eq!(config.center.edge_code, "edge-a");
-        assert_eq!(config.server.control_api_token, None);
+        assert_eq!(config.edge.edge_code, "edge-a");
+        assert_eq!(config.edge.edge_key, "example-dev-key");
         assert_eq!(config.rustfs.region, "us-east-1");
         assert_eq!(config.paths.disk_mount_roots, vec!["/mnt/rustfs-transfer"]);
         assert!(!config.auto_export.enabled);
@@ -452,24 +401,18 @@ mod tests {
     }
 
     #[test]
-    fn loads_example_style_secret_env_and_transport_root() {
+    fn loads_example_style_edge_key_env_and_transport_root() {
         let _guard = ENV_LOCK.lock().expect("env lock poisoned");
         clear_rustfs_credential_env();
-        std::env::set_var("RUSTFS_TRANSFER__TEST_EDGE_SECRET", "secret-from-env");
+        std::env::set_var("RUSTFS_TRANSFER__EDGE__EDGE_KEY", "key-from-env");
         std::env::set_var("RUSTFS_TRANSFER__TEST_RESCAN_TOKEN", "rescan-token");
-        std::env::set_var("RUSTFS_TRANSFER__TEST_CONTROL_TOKEN", "control-token");
         let raw = r#"
-            [server]
-            control_api_token_env = "RUSTFS_TRANSFER__TEST_CONTROL_TOKEN"
-
             [database]
             url = "postgres://edge:edge@localhost/edge"
 
-            [center]
-            base_url = "http://center.local:8080"
+            [edge]
             edge_code = "edge-a"
-            auth_key_id = "auth-key-example"
-            edge_auth_secret_env = "RUSTFS_TRANSFER__TEST_EDGE_SECRET"
+            edge_key = "example-dev-key"
 
             [rustfs]
             endpoint = "http://127.0.0.1:9000"
@@ -485,29 +428,24 @@ mod tests {
 
         let config = EdgeConfig::from_toml(raw).expect("config loads");
 
-        assert_eq!(config.center.edge_auth_secret, "secret-from-env");
-        assert_eq!(
-            config.server.control_api_token.as_deref(),
-            Some("control-token")
-        );
+        assert_eq!(config.edge.edge_key, "key-from-env");
         assert_eq!(config.paths.disk_mount_roots, vec!["/mnt/rustfs-transfer"]);
         assert_eq!(config.rescan_token(), Some("rescan-token"));
-        std::env::remove_var("RUSTFS_TRANSFER__TEST_EDGE_SECRET");
+        std::env::remove_var("RUSTFS_TRANSFER__EDGE__EDGE_KEY");
         std::env::remove_var("RUSTFS_TRANSFER__TEST_RESCAN_TOKEN");
-        std::env::remove_var("RUSTFS_TRANSFER__TEST_CONTROL_TOKEN");
     }
 
     #[test]
-    fn center_base_url_and_auth_key_id_are_not_required_for_offline_export() {
+    fn edge_identity_is_required_for_offline_export() {
         let _guard = ENV_LOCK.lock().expect("env lock poisoned");
         clear_rustfs_credential_env();
         let raw = r#"
             [database]
             url = "postgres://edge:edge@localhost/edge"
 
-            [center]
+            [edge]
             edge_code = "edge-a"
-            edge_auth_secret = "example-dev-secret"
+            edge_key = "example-dev-key"
 
             [rustfs]
             endpoint = "http://127.0.0.1:9000"
@@ -517,9 +455,8 @@ mod tests {
 
         let config = EdgeConfig::from_toml(raw).expect("offline edge config loads");
 
-        assert_eq!(config.center.edge_code, "edge-a");
-        assert!(config.center.base_url.is_empty());
-        assert!(config.center.auth_key_id.is_empty());
+        assert_eq!(config.edge.edge_code, "edge-a");
+        assert_eq!(config.edge.edge_key, "example-dev-key");
     }
 
     #[test]
@@ -535,11 +472,9 @@ mod tests {
             [database]
             url = "postgres://edge:edge@localhost/edge"
 
-            [center]
-            base_url = "http://center.local:8080"
+            [edge]
             edge_code = "edge-a"
-            auth_key_id = "auth-key-example"
-            edge_auth_secret = "example-dev-secret"
+            edge_key = "example-dev-key"
 
             [rustfs]
             endpoint = "http://127.0.0.1:9000"
@@ -582,11 +517,9 @@ mod tests {
             [database]
             url = "postgres://edge:edge@localhost/edge"
 
-            [center]
-            base_url = "http://center.local:8080"
+            [edge]
             edge_code = "edge-a"
-            auth_key_id = "auth-key-example"
-            edge_auth_secret = "example-dev-secret"
+            edge_key = "example-dev-key"
 
             [rustfs]
             endpoint = "http://127.0.0.1:9000"
@@ -614,11 +547,9 @@ mod tests {
             [database]
             url = "postgres://edge:edge@localhost/edge"
 
-            [center]
-            base_url = "http://center.local:8080"
+            [edge]
             edge_code = "edge-a"
-            auth_key_id = "auth-key-example"
-            edge_auth_secret = "example-dev-secret"
+            edge_key = "example-dev-key"
 
             [rustfs]
             endpoint = "http://127.0.0.1:9000"

@@ -9,8 +9,7 @@ use std::{
 use anyhow::{anyhow, Context};
 use aws_sdk_s3::{primitives::DateTime as SmithyDateTime, Client};
 use chrono::{DateTime, NaiveDateTime, Utc};
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use rustfs_transfer_common::crypto::derive_disk_data_key_from_edge_key;
 use sqlx::{PgPool, Row};
 use tokio::{runtime::Handle, sync::RwLock, task};
 use uuid::Uuid;
@@ -23,8 +22,6 @@ use crate::{
     },
     progress::{ObjectInventorySnapshot, ProgressAggregator},
 };
-
-type HmacSha256 = Hmac<Sha256>;
 
 pub type ExportWorkerFuture<'a> =
     Pin<Box<dyn Future<Output = anyhow::Result<ExportWorkerReport>> + Send + 'a>>;
@@ -87,7 +84,7 @@ impl ExportWorkerLauncher for ProductionExportWorkerLauncher {
             let disks = load_worker_disks(&self.pool, &disk_ids).await?;
             let progress = install_copy_progress(
                 &self.copy_progress,
-                &self.config.center.edge_code,
+                &self.config.edge.edge_code,
                 export_job_id,
             )
             .await;
@@ -107,21 +104,22 @@ impl ExportWorkerLauncher for ProductionExportWorkerLauncher {
                 }
 
                 let seal_id = Uuid::new_v4();
-                let key = derive_offline_disk_data_key(
-                    &self.config.center.edge_auth_secret,
-                    &self.config.center.edge_code,
+                let key = derive_disk_data_key_from_edge_key(
+                    &self.config.edge.edge_key,
+                    &self.config.edge.edge_code,
                     disk.disk_id,
                     disk_info.data_key_id,
                     export_job_id,
                     seal_id,
-                )?;
+                )
+                .map_err(|err| anyhow!(err.to_string()))?;
 
                 let config = DiskWorkerConfig {
                     disk_id: disk.disk_id,
                     disk_sn: disk.sn,
                     mount_path: disk.mount_path,
-                    edge_code: self.config.center.edge_code.clone(),
-                    edge_name: self.config.center.edge_code.clone(),
+                    edge_code: self.config.edge.edge_code.clone(),
+                    edge_name: self.config.edge.edge_code.clone(),
                     export_job_id,
                     seal_id,
                     data_key_id: disk_info.data_key_id,
@@ -287,31 +285,6 @@ impl DiskInfoForExport {
             data_key_id,
         })
     }
-}
-
-fn derive_offline_disk_data_key(
-    edge_auth_secret: &str,
-    edge_code: &str,
-    disk_id: Uuid,
-    data_key_id: Uuid,
-    export_job_id: Uuid,
-    seal_id: Uuid,
-) -> anyhow::Result<[u8; 32]> {
-    let secret = edge_auth_secret.trim();
-    if secret.is_empty() {
-        anyhow::bail!("center.edge_auth_secret is required for offline export key derivation");
-    }
-
-    let message = format!(
-        "rustfs-transfer:offline-disk-data-key:v1\nedge_code={edge_code}\ndisk_id={disk_id}\ndata_key_id={data_key_id}\nexport_job_id={export_job_id}\nseal_id={seal_id}"
-    );
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(secret.as_bytes())
-        .expect("HMAC-SHA256 accepts any key length");
-    mac.update(message.as_bytes());
-    let bytes = mac.finalize().into_bytes();
-    let mut key = [0_u8; 32];
-    key.copy_from_slice(&bytes);
-    Ok(key)
 }
 
 async fn seal_export_job_if_complete(pool: &PgPool, export_job_id: Uuid) -> anyhow::Result<()> {
@@ -812,7 +785,7 @@ mod tests {
         let export_job_id = Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap();
         let seal_id = Uuid::parse_str("44444444-4444-4444-4444-444444444444").unwrap();
 
-        let key = derive_offline_disk_data_key(
+        let key = derive_disk_data_key_from_edge_key(
             "edge-secret",
             "edge-a",
             disk_id,
@@ -830,8 +803,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_edge_auth_secret_for_offline_export() {
-        let err = derive_offline_disk_data_key(
+    fn rejects_missing_edge_key_for_offline_export() {
+        let err = derive_disk_data_key_from_edge_key(
             " ",
             "edge-a",
             Uuid::new_v4(),
@@ -841,7 +814,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(err.to_string().contains("center.edge_auth_secret"));
+        assert!(err.to_string().contains("edge_key"));
     }
 
     #[test]
