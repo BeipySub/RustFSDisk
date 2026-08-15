@@ -158,8 +158,61 @@
 | TASK-S1-WEB-EDGE-TIMELINE-001 | Edge Dashboard 插盘即时反馈、每盘时间线和扫描态展示 | P1 主闭环 | Web / Edge | [x] | Day 3 下午 | TASK-S1-EDGE-WS-BOOT-001, TASK-S1-WEB-EDGE-PROD-001 |
 | TASK-S1-EDGE-AUTO-DEPLOY-001 | Edge 自动流程配置开关、部署检查和回滚说明 | P1 主闭环 | Deploy / Edge | [x] | Day 3 下午 | TASK-S1-EDGE-AUTO-001 |
 | TASK-S1-P0-EDGE-OFFLINE-PACK-001 | Edge 离线打包：删除运行期 Center 校验和 export-key，复用 edge_auth_secret 派生封盘 disk_data_key | P0 解阻塞 | Edge / Center / Deploy / QA | [x] | Day 4 需求调整 | TASK-S1-SECURITY-HOTFIX-007, TASK-S1-EDGE-005, TASK-S1-CENTER-004 |
+| TASK-S1-P0-STREAM-STORAGE-V2-001 | 运输盘流式存储 v2 破坏性升级：PACK/FRAMES、容量预算和前端契约替换 | P0 解阻塞 | Common / DB / Edge / Center / Web / Tests | [x] | Day 4 需求调整 | TASK-S1-P0-EDGE-OFFLINE-PACK-001 |
 | TASK-S1-EDGE-REALTIME-QA-001 | Edge 前后端实时可视化端到端联调验收 | P0 解阻塞 | Integration / QA | [x] | Day 3 下午 | TASK-S1-P0-EDGE-OFFLINE-PACK-001, TASK-S1-EDGE-AUTO-001, TASK-S1-EDGE-WS-BOOT-001, TASK-S1-WEB-EDGE-TIMELINE-001, TASK-S1-EDGE-AUTO-DEPLOY-001 |
 | TASK-S1-INTEGRATION-001 | 主闭环联调、验收、风险登记和交付检查 | P2 交付增强 | Integration | [~] | Day 2 下午 | Day 2 主闭环任务 |
+
+---
+
+# 开发任务卡片：TASK-S1-P0-STREAM-STORAGE-V2-001
+
+### 任务基本信息
+
+- **任务 ID**：TASK-S1-P0-STREAM-STORAGE-V2-001
+- **任务名称**：运输盘流式存储 v2 破坏性升级：PACK/FRAMES、容量预算和前端契约替换
+- **所属 Track / 模块**：
+  - [x] Track 1: Common
+  - [x] Track 2: Edge
+  - [x] Track 3: Center
+  - [x] Track 4: Web
+  - [x] Track 5: Tests / DB
+- **任务状态**：[x] 开发完成
+- **负责人 / Role**：Codex
+- **计划时间**：Day 4 需求调整
+- **依赖任务**：TASK-S1-P0-EDGE-OFFLINE-PACK-001
+
+### 任务目标与范围
+
+- **核心目标**：按 `docs/02-方案设计/运输盘流式存储整改方案.md` 直接替换运输盘存储协议为 v2，删除 v1 manifest、对象级单文件密文模型、chunk 通讯字段和前端兼容 parser。
+- **对应代码位置**：`crates/common/`、`sql/edge/`、`sql/center/`、`crates/edge-backend/`、`crates/center-backend/`、`web/edge-web/`、`web/center-web/`、测试 fixture。
+
+### 协议与数据结构约束
+
+- Edge 只生成 `manifest_version = 2.0.0`。
+- Center 只导入 `manifest_version = 2.0.0`。
+- `PACK` 对象固定 `frame_total = 0`。
+- `FRAMES` 对象固定 `frame_total > 0`，frame 可以跨盘导入后合并。
+- HTTP / WebSocket / 前端类型删除 v1 `relative_data_path/chunk_*/nonce/tag/aad/ciphertext_sha256` 展示字段。
+- Dashboard 汇总只使用 `global_progress`，HTTP 分页只使用 `page/page_size/total/items`。
+- 容量分配按 `estimated_landing_bytes`，不得按源对象 `size_bytes`。
+
+### 安全与状态机边界
+
+- 保留 AES-256-GCM。
+- 运输盘和前端响应不得暴露明文 `disk_data_key`。
+- `RECOVERY_REQUIRED` 只能作为 `last_error_code`，不得写入盘内生命周期或 `runtime_status`。
+- 不修改 `docs/v1.0冻结/`。
+
+### 验收与检查清单
+
+- [ ] Common v2 manifest、AAD、KDF 和 golden 测试通过。
+- [ ] Edge/Center SQL 迁移改为 v2 表结构和约束。
+- [ ] Edge 按 PACK/FRAMES 写盘、封盘和容量预算分配。
+- [ ] Center 按 PACK/FRAMES 校验、解密、导入和 frame 合并。
+- [ ] HTTP/WebSocket DTO 删除 v1 字段和兼容别名。
+- [ ] 双端前端类型和展示删除 v1 字段、fallback parser。
+- [ ] fixture 和测试更新到 v2。
+- [ ] 必跑验证按改动范围执行并记录结果。
 
 ---
 

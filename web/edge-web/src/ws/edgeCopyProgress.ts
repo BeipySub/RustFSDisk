@@ -42,8 +42,7 @@ export interface CopyProgressEvent {
   scan?: EdgeScanProgress | null;
   object_inventory?: EdgeObjectInventory;
   export_job?: EdgeExportJobSnapshot | null;
-  global?: EdgeGlobalProgress;
-  global_progress?: EdgeGlobalProgress;
+  global_progress: EdgeGlobalProgress;
   disks?: Partial<EdgeDiskProgress>[];
   ws_connected?: boolean;
   last_http_refresh_at?: string;
@@ -142,7 +141,6 @@ export function applyCopyProgressEvent(
     edge_name: event.edge_name || summary.edge_name,
     object_inventory: event.object_inventory,
     export_job: event.export_job ?? summary.export_job,
-    global: event.global,
     global_progress: event.global_progress ?? summary.global_progress,
     disks: event.disks ?? [],
     ws_connected: true,
@@ -171,10 +169,6 @@ export function applyCopyProgressEvent(
         : event.event_type === "COPY_PROGRESS" && event.export_job !== undefined
         ? normalizedEvent.export_job
         : summary.export_job,
-    global:
-      clearTerminalExport || event.event_type === "COPY_PROGRESS"
-        ? normalizedEvent.global
-        : summary.global,
     global_progress:
       clearTerminalExport || event.event_type === "COPY_PROGRESS"
         ? normalizedEvent.global_progress
@@ -227,6 +221,7 @@ function mergeDiskProgress(current: EdgeDiskProgress, next: EdgeDiskProgress): E
     filesystem_uuid: next.filesystem_uuid || current.filesystem_uuid,
     fs_uuid: next.fs_uuid || current.fs_uuid,
     capacity_bytes: next.capacity_bytes || current.capacity_bytes,
+    reserve_bytes: next.reserve_bytes || current.reserve_bytes,
     object_budget_bytes: next.object_budget_bytes || current.object_budget_bytes,
   };
 }
@@ -287,8 +282,15 @@ export function parseCopyProgressEvent(data: unknown): CopyProgressEvent | null 
       scan: event.scan ?? null,
       object_inventory: event.object_inventory,
       export_job: event.export_job ?? null,
-      global: event.global,
-      global_progress: event.global_progress,
+      global_progress: event.global_progress ?? {
+        total_bytes: 0,
+        done_bytes: 0,
+        remaining_bytes: 0,
+        speed_bytes_per_sec: 0,
+        object_total: 0,
+        object_done: 0,
+        object_remaining: 0,
+      },
       disks: Array.isArray(event.disks) ? event.disks : [],
       ws_connected: true,
       last_http_refresh_at: event.last_http_refresh_at,

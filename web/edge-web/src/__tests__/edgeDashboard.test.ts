@@ -176,8 +176,8 @@ test("normalizes deployed export job list wire shape", () => {
     {
       page: 1,
       page_size: 8,
-      total_count: 1,
-      records: [
+      total: 1,
+      items: [
         {
           export_job_id: "job-2",
           edge_code: "edge-demo",
@@ -806,7 +806,6 @@ test("removes only the unplugged disk and hides its sealed task summary", () => 
       object_total: 1,
       object_done: 1,
     }),
-    global: { total_bytes: 10, done_bytes: 10, remaining_bytes: 0, speed_bytes_per_sec: 0, object_total: 1, object_done: 1, object_remaining: 0 },
     global_progress: { total_bytes: 10, done_bytes: 10, remaining_bytes: 0, speed_bytes_per_sec: 0, object_total: 1, object_done: 1, object_remaining: 0 },
     disks: [
       { disk_presence_id: "presence-a", disk_id: "disk-a", disk_sn: "SN-A", runtime_status: "SEALED" },
@@ -824,7 +823,6 @@ test("removes only the unplugged disk and hides its sealed task summary", () => 
     event_time: "2026-08-14T02:43:00Z",
     source: "edge",
     edge_code: "edge-demo",
-    global: { total_bytes: 0, done_bytes: 0, remaining_bytes: 0, speed_bytes_per_sec: 0, object_total: 0, object_done: 0, object_remaining: 0 },
     global_progress: { total_bytes: 0, done_bytes: 0, remaining_bytes: 0, speed_bytes_per_sec: 0, object_total: 0, object_done: 0, object_remaining: 0 },
     disks: [{ disk_presence_id: "presence-a", disk_id: "disk-a", disk_sn: "SN-A", runtime_status: "REMOVED" }],
     message: "removed",
@@ -833,7 +831,7 @@ test("removes only the unplugged disk and hides its sealed task summary", () => 
   assert.equal(merged.disks.length, 1);
   assert.equal(merged.disks[0]?.disk_presence_id, "presence-b");
   assert.equal(merged.export_job, undefined);
-  assert.equal(merged.global.done_bytes, 0);
+  assert.equal(merged.global_progress.done_bytes, 0);
 });
 
 test("preserves HTTP object inventory when websocket omits inventory", () => {

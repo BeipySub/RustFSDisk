@@ -40,14 +40,14 @@ const recordColumns = [
   { title: "中控归档", key: "archive", ellipsis: true },
   { title: "大小", key: "size", width: 96, ellipsis: true },
   { title: "导入任务", key: "import_job", width: 92, ellipsis: true },
-  { title: "分块组", key: "chunk_group", width: 92, ellipsis: true },
+  { title: "存储模式", key: "storage_mode", width: 96, ellipsis: true },
   { title: "操作", key: "action", width: 92, fixed: "right" as const },
 ];
 
 const pageCount = computed(() => Math.max(1, Math.ceil(total.value / pageSize)));
 const selectedRecord = computed(() => records.value.find((record) => recordKey(record) === selectedRecordKey.value) ?? records.value[0] ?? null);
 const edgeCount = computed(() => edgeOptions.value.length || new Set(records.value.map((record) => record.edge_code).filter(Boolean)).size);
-const chunkedCount = computed(() => records.value.filter((record) => record.chunk_group_id).length);
+const framesCount = computed(() => records.value.filter((record) => record.storage_mode === "FRAMES").length);
 const importedBytes = computed(() => records.value.reduce((sum, record) => sum + record.source_size_bytes, 0));
 const edgeSelectOptions = computed(() => [
   { value: "", label: "全部边缘站点" },
@@ -274,7 +274,7 @@ onMounted(() => {
       <a-col :span="6">
         <a-card class="summary-card" size="small" :bordered="false">
           <img alt="" src="/assets/fustfs-baseline/a04-failed-lock-small-v1.png" />
-          <a-statistic title="分块对象" :value="chunkedCount" />
+          <a-statistic title="FRAMES 对象" :value="framesCount" />
         </a-card>
       </a-col>
     </a-row>
@@ -345,9 +345,10 @@ onMounted(() => {
           <template v-else-if="column.key === 'import_job'">
             <span :title="record.import_job_id">{{ shortHash(record.import_job_id) }}</span>
           </template>
-          <template v-else-if="column.key === 'chunk_group'">
-            <a-tag v-if="record.chunk_group_id" color="blue">跨盘分块</a-tag>
-            <a-tag v-else>普通对象</a-tag>
+          <template v-else-if="column.key === 'storage_mode'">
+            <a-tag :color="record.storage_mode === 'FRAMES' ? 'blue' : undefined">
+              {{ record.storage_mode }}{{ record.frame_total > 0 ? ` / ${record.frame_total}` : "" }}
+            </a-tag>
           </template>
           <template v-else-if="column.key === 'action'">
             <a-button type="link" size="small" @click.stop="openDetail(record)">查看详情</a-button>
@@ -377,9 +378,10 @@ onMounted(() => {
           <a-descriptions class="drawer-descriptions manifest-lines" :column="1" size="small" :colon="false">
             <a-descriptions-item label="import_job_id">{{ selected.import_job_id || "--" }}</a-descriptions-item>
             <a-descriptions-item label="export_job_id">{{ selected.export_job_id ?? "--" }}</a-descriptions-item>
-            <a-descriptions-item label="chunk_group_id">{{ selected.chunk_group_id ?? "--" }}</a-descriptions-item>
+            <a-descriptions-item label="storage_mode">{{ selected.storage_mode }}</a-descriptions-item>
+            <a-descriptions-item label="frame_total">{{ selected.frame_total }}</a-descriptions-item>
             <a-descriptions-item label="plaintext_sha256">{{ shortHash(selected.plaintext_sha256) }}</a-descriptions-item>
-            <a-descriptions-item label="ciphertext_sha256">{{ shortHash(selected.ciphertext_sha256) }}</a-descriptions-item>
+            <a-descriptions-item label="pack_ciphertext_sha256">{{ shortHash(selected.pack_ciphertext_sha256) }}</a-descriptions-item>
           </a-descriptions>
           <p class="drawer-note"><i>i</i> object_ledger 是中控对象导入去重和来源追踪权威表；分类来源为 edge_site.edge_code。</p>
         </template>

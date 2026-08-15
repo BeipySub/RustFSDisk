@@ -91,28 +91,32 @@ impl ObjectSnapshotRepository for PgObjectSnapshotRepository {
             sqlx::query(
                 r#"
                 INSERT INTO export_object (
+                    object_id,
                     export_job_id,
                     bucket,
                     object_key,
+                    storage_mode,
                     etag,
                     size_bytes,
+                    estimated_landing_bytes,
                     last_modified,
-                    chunk_size_bytes,
+                    frame_total,
                     status,
                     error_code,
                     error_message
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                VALUES ($1, $2, $3, $4, 'PACK', $5, $6, $7, $8, 0, $9, $10, $11)
                 ON CONFLICT DO NOTHING
                 "#,
             )
+            .bind(uuid::Uuid::new_v4())
             .bind(export_job_id)
             .bind(&object.bucket)
             .bind(&object.object_key)
             .bind(&object.etag)
             .bind(object.size_bytes)
+            .bind(object.size_bytes.saturating_add(4096))
             .bind(object.last_modified.naive_utc())
-            .bind(object.size_bytes)
             .bind(object_status)
             .bind(error_code_value)
             .bind(error_message_value)

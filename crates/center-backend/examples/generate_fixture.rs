@@ -2,14 +2,15 @@ use std::{collections::BTreeMap, fs, path::PathBuf};
 
 use rustfs_transfer_common::{
     crypto::{
-        encode_base64, encrypt_aes256_gcm, object_aad, sha256_lower_hex, sign_hmac_base64,
-        CanonicalRequest, ObjectAad,
+        encode_base64, encrypt_aes256_gcm, pack_object_aad, sha256_lower_hex, sign_hmac_base64,
+        CanonicalRequest, PackObjectAad,
     },
     protocol::{
         DiskInfo, DiskInfoCenter, DiskInfoDisk, DiskInfoEdge, DiskInfoManifest, DiskInfoProtocol,
         DiskInfoSecurity, DiskInfoStatus, DiskStatusCode, ExportManifest, ManifestObject,
-        ObjectStatus, TransferDisk, ENCRYPTION_ALG_AES_256_GCM, MANIFEST_VERSION, PROTOCOL_NAME,
-        PROTOCOL_ROOT_DIR, PROTOCOL_VERSION, SIGNATURE_ALG_HMAC_SHA256,
+        ManifestPackRef, ObjectStatus, StorageMode, TransferDisk, ENCRYPTION_ALG_AES_256_GCM,
+        MANIFEST_VERSION, PROTOCOL_NAME, PROTOCOL_ROOT_DIR, PROTOCOL_VERSION,
+        SIGNATURE_ALG_HMAC_SHA256,
     },
 };
 use serde_json::json;
@@ -83,26 +84,29 @@ fn write_sealed_disk(mount_path: &PathBuf) -> anyhow::Result<()> {
     let bucket = "source";
     let key = "alpha.txt";
     let plaintext = b"hello archive fixture";
+    let object_id = Uuid::new_v4();
     let disk_data_key = [7_u8; 32];
     let nonce = [3_u8; 12];
-    let aad = object_aad(ObjectAad {
+    let pack_path = "packs/export-fixture/pack-000001.pack";
+    let pack_index_path = "packs/export-fixture/pack-000001.idx";
+    let plaintext_sha256 = sha256_lower_hex(plaintext);
+    let aad = pack_object_aad(PackObjectAad {
         disk_id: &disk_id.to_string(),
         seal_id: &seal_id.to_string(),
         export_job_id: &export_job_id.to_string(),
+        object_id: &object_id.to_string(),
         bucket,
         object_key: key,
-        chunk_group_id: None,
-        chunk_index: 0,
-        chunk_total: 1,
-        chunk_offset_bytes: 0,
+        pack_path,
+        pack_offset_bytes: 0,
+        plaintext_sha256: &plaintext_sha256,
     });
     let encrypted = encrypt_aes256_gcm(&disk_data_key, &nonce, plaintext, &aad)?;
-    let relative_data_path = "data/source/alpha.txt.enc";
     let relative_meta_path = "meta/source/alpha.txt.json";
 
     let disk = TransferDisk::new(mount_path);
     disk.ensure_layout()?;
-    disk.write_object_atomic(relative_data_path, &encrypted.ciphertext)?;
+    disk.write_object_atomic(pack_path, &encrypted.ciphertext)?;
     disk.write_metadata(
         relative_meta_path,
         &json!({
@@ -114,31 +118,31 @@ fn write_sealed_disk(mount_path: &PathBuf) -> anyhow::Result<()> {
     )?;
 
     let object = ManifestObject {
+        object_id: object_id.to_string(),
         bucket: bucket.to_string(),
         key: key.to_string(),
-        relative_data_path: relative_data_path.to_string(),
-        encrypted: true,
-        encryption_alg: ENCRYPTION_ALG_AES_256_GCM.to_string(),
+        storage_mode: StorageMode::Pack,
         data_key_id: data_key_id.to_string(),
-        nonce: encode_base64(&nonce),
-        tag: encode_base64(&encrypted.tag),
-        aad: String::from_utf8(aad)?,
-        ciphertext_size_bytes: encrypted.ciphertext.len() as u64,
-        ciphertext_sha256: sha256_lower_hex(&encrypted.ciphertext),
-        chunked: false,
-        chunk_group_id: String::new(),
-        chunk_index: 0,
-        chunk_total: 1,
-        chunk_offset_bytes: 0,
-        chunk_size_bytes: plaintext.len() as u64,
-        chunk_sha256: sha256_lower_hex(&encrypted.ciphertext),
+        pack_ref: Some(ManifestPackRef {
+            pack_path: pack_path.to_string(),
+            pack_index_path: pack_index_path.to_string(),
+            pack_offset_bytes: 0,
+            ciphertext_size_bytes: encrypted.ciphertext.len() as u64,
+            nonce: encode_base64(&nonce),
+            tag: encode_base64(&encrypted.tag),
+            aad: String::from_utf8(aad)?,
+            ciphertext_sha256: sha256_lower_hex(&encrypted.ciphertext),
+        }),
+        frames: Vec::new(),
+        frame_total: 0,
         relative_meta_path: relative_meta_path.to_string(),
         size_bytes: plaintext.len() as u64,
+        estimated_landing_bytes: plaintext.len() as u64 + 4096,
         etag: "fixture-etag-1".to_string(),
         last_modified: "2026-08-09T00:00:00Z".to_string(),
         content_type: "text/plain".to_string(),
         metadata: BTreeMap::new(),
-        plaintext_sha256: sha256_lower_hex(plaintext),
+        plaintext_sha256,
         exported_at: "2026-08-09T00:01:00Z".to_string(),
         object_status: ObjectStatus::Exported,
     };

@@ -1,8 +1,9 @@
 use rustfs_transfer_common::crypto::{
     canonical_path_with_query, center_signature_canonical_json, decode_base64, decode_hex,
     decrypt_aes256_gcm, encode_base64, encode_hex_lower, encrypt_aes256_gcm, generate_nonce,
-    object_aad, sha256_lower_hex, sign_center_signature, sign_hmac_base64, verify_center_signature,
-    verify_hmac_base64, CanonicalRequest, CryptoError, ObjectAad, QueryParam, AES_GCM_NONCE_LEN,
+    pack_object_aad, sha256_lower_hex, sign_center_signature, sign_hmac_base64,
+    verify_center_signature, verify_hmac_base64, CanonicalRequest, CryptoError, PackObjectAad,
+    QueryParam, AES_GCM_NONCE_LEN,
 };
 use serde_json::json;
 
@@ -130,16 +131,16 @@ fn query_canonicalization_sorts_and_percent_encodes_names_and_values() {
 fn aes_gcm_round_trips_with_protocol_aad() {
     let key = [7_u8; 32];
     let nonce = [3_u8; AES_GCM_NONCE_LEN];
-    let aad = object_aad(ObjectAad {
+    let aad = pack_object_aad(PackObjectAad {
         disk_id: "disk-1",
         seal_id: "seal-1",
         export_job_id: "export-1",
+        object_id: "object-1",
         bucket: "source-bucket",
         object_key: "path/to/object.bin",
-        chunk_group_id: None,
-        chunk_index: 0,
-        chunk_total: 1,
-        chunk_offset_bytes: 0,
+        pack_path: "packs/export-1/pack-object-1.pack",
+        pack_offset_bytes: 0,
+        plaintext_sha256: "plaintext-sha",
     });
 
     let encrypted = encrypt_aes256_gcm(&key, &nonce, b"plaintext object bytes", &aad).unwrap();

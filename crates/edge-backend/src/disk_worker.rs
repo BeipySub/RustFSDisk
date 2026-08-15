@@ -17,7 +17,8 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::progress::ProgressAggregator;
-use rustfs_transfer_common::crypto::{object_aad, ObjectAad};
+use rustfs_transfer_common::crypto::{pack_object_aad, PackObjectAad};
+use rustfs_transfer_common::protocol::{StorageMode, MANIFEST_VERSION};
 
 const PROTOCOL_ROOT: &str = "rustfs-transfer";
 const MANIFEST_PATH: &str = "manifests/export_manifest.json";
@@ -127,42 +128,34 @@ pub trait ExportObjectRepository {
 #[derive(Debug, Clone)]
 pub struct ExportObjectTask {
     pub id: i64,
+    pub object_id: Uuid,
     pub bucket: String,
     pub object_key: String,
     pub etag: String,
     pub size_bytes: u64,
     pub last_modified: DateTime<Utc>,
-    pub chunked: bool,
-    pub chunk_group_id: Option<Uuid>,
-    pub chunk_index: i32,
-    pub chunk_total: i32,
-    pub chunk_offset_bytes: u64,
-    pub chunk_size_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportedObjectUpdate {
-    pub object_id: i64,
+    pub row_id: i64,
+    pub object_id: Uuid,
     pub bucket: String,
     pub key: String,
-    pub relative_data_path: String,
+    pub storage_mode: StorageMode,
     pub relative_meta_path: String,
     pub plaintext_sha256: String,
-    pub ciphertext_sha256: String,
-    pub ciphertext_size_bytes: u64,
-    pub encrypted: bool,
-    pub encryption_alg: String,
     pub data_key_id: Uuid,
-    pub nonce: String,
-    pub tag: String,
-    pub aad: String,
-    pub chunked: bool,
-    pub chunk_group_id: Option<Uuid>,
-    pub chunk_index: i32,
-    pub chunk_total: i32,
-    pub chunk_offset_bytes: u64,
-    pub chunk_size_bytes: u64,
-    pub chunk_sha256: String,
+    pub pack_path: String,
+    pub pack_index_path: String,
+    pub pack_offset_bytes: u64,
+    pub pack_ciphertext_size_bytes: u64,
+    pub pack_nonce: String,
+    pub pack_tag: String,
+    pub pack_aad: String,
+    pub pack_ciphertext_sha256: String,
+    pub frame_total: u32,
+    pub estimated_landing_bytes: u64,
     pub size_bytes: u64,
     pub etag: String,
     pub last_modified: DateTime<Utc>,
@@ -185,26 +178,17 @@ pub struct ExportManifest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestObject {
+    pub object_id: Uuid,
     pub bucket: String,
     pub key: String,
-    pub relative_data_path: String,
-    pub encrypted: bool,
-    pub encryption_alg: String,
+    pub storage_mode: StorageMode,
     pub data_key_id: Uuid,
-    pub nonce: String,
-    pub tag: String,
-    pub aad: String,
-    pub ciphertext_size_bytes: u64,
-    pub ciphertext_sha256: String,
-    pub chunked: bool,
-    pub chunk_group_id: Option<Uuid>,
-    pub chunk_index: i32,
-    pub chunk_total: i32,
-    pub chunk_offset_bytes: u64,
-    pub chunk_size_bytes: u64,
-    pub chunk_sha256: String,
+    pub pack_ref: ManifestPackRef,
+    pub frames: Vec<ManifestFrameRef>,
+    pub frame_total: u32,
     pub relative_meta_path: String,
     pub size_bytes: u64,
+    pub estimated_landing_bytes: u64,
     pub etag: String,
     pub last_modified: DateTime<Utc>,
     pub content_type: Option<String>,
@@ -212,6 +196,32 @@ pub struct ManifestObject {
     pub plaintext_sha256: String,
     pub exported_at: DateTime<Utc>,
     pub object_status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestPackRef {
+    pub pack_path: String,
+    pub pack_index_path: String,
+    pub pack_offset_bytes: u64,
+    pub ciphertext_size_bytes: u64,
+    pub nonce: String,
+    pub tag: String,
+    pub aad: String,
+    pub ciphertext_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestFrameRef {
+    pub frame_index: u32,
+    pub frame_total: u32,
+    pub frame_offset_bytes: u64,
+    pub frame_size_bytes: u64,
+    pub relative_frame_path: String,
+    pub ciphertext_size_bytes: u64,
+    pub nonce: String,
+    pub tag: String,
+    pub aad: String,
+    pub ciphertext_sha256: String,
 }
 
 pub struct DiskWorker<'a, S, R> {
@@ -250,7 +260,7 @@ where
         let objects = self
             .repository
             .assigned_objects(self.config.export_job_id, self.config.disk_id)?;
-        let total_bytes = objects.iter().map(|object| object.chunk_size_bytes).sum();
+        let total_bytes = objects.iter().map(|object| object.size_bytes).sum();
         self.progress.register_disk(
             self.config.disk_id.to_string(),
             "",
@@ -288,17 +298,23 @@ where
     }
 
     fn export_one_object(&self, object: &ExportObjectTask) -> Result<()> {
-        let relative_data_path = data_path(&self.config.export_job_id, object.id);
-        let partial_path = format!("{relative_data_path}.partial");
-        validate_relative_path(&relative_data_path, "data/")?;
-        validate_relative_path(&partial_path, "data/")?;
+        let object_id = object.object_id;
+        let pack_path = data_path(&self.config.export_job_id, object.id);
+        let pack_index_path = pack_index_path(&self.config.export_job_id, object.id);
+        let partial_path = format!("{pack_path}.partial");
+        validate_relative_path(&pack_path, "packs/")?;
+        validate_relative_path(&pack_index_path, "packs/")?;
+        validate_relative_path(&partial_path, "packs/")?;
 
         self.progress.start_object(
             &self.config.disk_id.to_string(),
+            &object.object_id.to_string(),
             &object.bucket,
             &object.object_key,
-            &relative_data_path,
-            object.chunk_size_bytes,
+            StorageMode::Pack.as_str(),
+            0,
+            0,
+            object.size_bytes,
         );
         self.repository.mark_copying(object.id, &partial_path)?;
 
@@ -307,16 +323,13 @@ where
             .head_object(&object.bucket, &object.object_key)?;
         ensure_head_matches_task(object, &before)?;
 
-        let mut reader = self.source.open_object(
-            &object.bucket,
-            &object.object_key,
-            object.chunk_offset_bytes,
-            object.chunk_size_bytes,
-        )?;
+        let mut reader =
+            self.source
+                .open_object(&object.bucket, &object.object_key, 0, object.size_bytes)?;
         let mut plaintext =
-            Vec::with_capacity(object.chunk_size_bytes.min(COPY_BUFFER_BYTES as u64) as usize);
+            Vec::with_capacity(object.size_bytes.min(COPY_BUFFER_BYTES as u64) as usize);
         let mut plaintext_hasher = Sha256::new();
-        let mut remaining = object.chunk_size_bytes;
+        let mut remaining = object.size_bytes;
         let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
         while remaining > 0 {
             let max_read = remaining.min(buffer.len() as u64) as usize;
@@ -326,7 +339,7 @@ where
             if read == 0 {
                 return Err(DiskWorkerError::ChecksumMismatch(format!(
                     "source ended before {} bytes",
-                    object.chunk_size_bytes
+                    object.size_bytes
                 )));
             }
             plaintext.extend_from_slice(&buffer[..read]);
@@ -350,7 +363,13 @@ where
         let mut nonce_bytes = [0_u8; 12];
         OsRng.fill_bytes(&mut nonce_bytes);
         let nonce = BASE64.encode(nonce_bytes);
-        let aad = build_aad(&self.config, object);
+        let aad = build_pack_aad(
+            &self.config,
+            object,
+            &object_id,
+            &pack_path,
+            &plaintext_sha256,
+        );
         let mut ciphertext = plaintext;
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&self.config.disk_data_key));
         let tag = cipher
@@ -364,10 +383,18 @@ where
         let ciphertext_sha256 = sha256_hex(&ciphertext);
 
         atomic_write_bytes(&self.root().join(&partial_path), &ciphertext)?;
-        let final_path = self.root().join(&relative_data_path);
+        let final_path = self.root().join(&pack_path);
         fs::rename(self.root().join(&partial_path), &final_path).map_err(classify_io_error)?;
         fsync_file(&final_path)?;
         fsync_parent(&final_path)?;
+        let pack_index = json!({
+            "object_id": object_id,
+            "pack_path": pack_path,
+            "pack_offset_bytes": 0,
+            "ciphertext_size_bytes": ciphertext.len(),
+            "ciphertext_sha256": ciphertext_sha256,
+        });
+        atomic_write_json(&self.root().join(&pack_index_path), &pack_index)?;
 
         let relative_meta_path = meta_path(&self.config.export_job_id, object.id);
         validate_relative_path(&relative_meta_path, "meta/")?;
@@ -383,27 +410,24 @@ where
         atomic_write_json(&self.root().join(&relative_meta_path), &metadata_json)?;
 
         let exported = ExportedObjectUpdate {
-            object_id: object.id,
+            row_id: object.id,
+            object_id,
             bucket: object.bucket.clone(),
             key: object.object_key.clone(),
-            relative_data_path,
+            storage_mode: StorageMode::Pack,
             relative_meta_path,
             plaintext_sha256,
-            ciphertext_sha256: ciphertext_sha256.clone(),
-            ciphertext_size_bytes: ciphertext.len() as u64,
-            encrypted: true,
-            encryption_alg: ENCRYPTION_ALG.to_string(),
             data_key_id: self.config.data_key_id,
-            nonce,
-            tag,
-            aad,
-            chunked: object.chunked,
-            chunk_group_id: object.chunk_group_id,
-            chunk_index: object.chunk_index,
-            chunk_total: object.chunk_total,
-            chunk_offset_bytes: object.chunk_offset_bytes,
-            chunk_size_bytes: object.chunk_size_bytes,
-            chunk_sha256: ciphertext_sha256,
+            pack_path,
+            pack_index_path,
+            pack_offset_bytes: 0,
+            pack_ciphertext_size_bytes: ciphertext.len() as u64,
+            pack_nonce: nonce,
+            pack_tag: tag,
+            pack_aad: aad,
+            pack_ciphertext_sha256: ciphertext_sha256,
+            frame_total: 0,
+            estimated_landing_bytes: object.size_bytes.saturating_add(4096),
             size_bytes: object.size_bytes,
             etag: object.etag.clone(),
             last_modified: object.last_modified,
@@ -429,12 +453,13 @@ where
             .map(ManifestObject::from)
             .collect();
         for object in &objects {
-            validate_relative_path(&object.relative_data_path, "data/")?;
+            validate_relative_path(&object.pack_ref.pack_path, "packs/")?;
+            validate_relative_path(&object.pack_ref.pack_index_path, "packs/")?;
             validate_relative_path(&object.relative_meta_path, "meta/")?;
         }
 
         let manifest = ExportManifest {
-            manifest_version: "1.0.0".to_string(),
+            manifest_version: MANIFEST_VERSION.to_string(),
             seal_id: self.config.seal_id,
             export_job_id: self.config.export_job_id,
             disk_id: self.config.disk_id,
@@ -601,7 +626,8 @@ where
 
     fn ensure_protocol_dirs(&self) -> Result<()> {
         for relative in [
-            "data",
+            "packs",
+            "frames",
             "meta",
             "manifests",
             "logs",
@@ -622,26 +648,26 @@ where
 impl From<ExportedObjectUpdate> for ManifestObject {
     fn from(value: ExportedObjectUpdate) -> Self {
         Self {
+            object_id: value.object_id,
             bucket: value.bucket,
             key: value.key,
-            relative_data_path: value.relative_data_path,
-            encrypted: value.encrypted,
-            encryption_alg: value.encryption_alg,
+            storage_mode: value.storage_mode,
             data_key_id: value.data_key_id,
-            nonce: value.nonce,
-            tag: value.tag,
-            aad: value.aad,
-            ciphertext_size_bytes: value.ciphertext_size_bytes,
-            ciphertext_sha256: value.ciphertext_sha256,
-            chunked: value.chunked,
-            chunk_group_id: value.chunk_group_id,
-            chunk_index: value.chunk_index,
-            chunk_total: value.chunk_total,
-            chunk_offset_bytes: value.chunk_offset_bytes,
-            chunk_size_bytes: value.chunk_size_bytes,
-            chunk_sha256: value.chunk_sha256,
+            pack_ref: ManifestPackRef {
+                pack_path: value.pack_path,
+                pack_index_path: value.pack_index_path,
+                pack_offset_bytes: value.pack_offset_bytes,
+                ciphertext_size_bytes: value.pack_ciphertext_size_bytes,
+                nonce: value.pack_nonce,
+                tag: value.pack_tag,
+                aad: value.pack_aad,
+                ciphertext_sha256: value.pack_ciphertext_sha256,
+            },
+            frames: Vec::new(),
+            frame_total: value.frame_total,
             relative_meta_path: value.relative_meta_path,
             size_bytes: value.size_bytes,
+            estimated_landing_bytes: value.estimated_landing_bytes,
             etag: value.etag,
             last_modified: value.last_modified,
             content_type: value.content_type,
@@ -666,35 +692,36 @@ fn ensure_head_matches_task(object: &ExportObjectTask, head: &SourceObjectHead) 
     Ok(())
 }
 
-fn build_aad(config: &DiskWorkerConfig, object: &ExportObjectTask) -> String {
+fn build_pack_aad(
+    config: &DiskWorkerConfig,
+    object: &ExportObjectTask,
+    object_id: &Uuid,
+    pack_path: &str,
+    plaintext_sha256: &str,
+) -> String {
     let disk_id = config.disk_id.to_string();
     let seal_id = config.seal_id.to_string();
     let export_job_id = config.export_job_id.to_string();
-    let chunk_group_id = object.chunk_group_id.map(|id| id.to_string());
-    let chunk_index = object
-        .chunk_index
-        .try_into()
-        .expect("export task chunk_index is non-negative");
-    let chunk_total = object
-        .chunk_total
-        .try_into()
-        .expect("export task chunk_total is non-negative");
-    String::from_utf8(object_aad(ObjectAad {
+    String::from_utf8(pack_object_aad(PackObjectAad {
         disk_id: &disk_id,
         seal_id: &seal_id,
         export_job_id: &export_job_id,
+        object_id: &object_id.to_string(),
         bucket: &object.bucket,
         object_key: &object.object_key,
-        chunk_group_id: chunk_group_id.as_deref(),
-        chunk_index,
-        chunk_total,
-        chunk_offset_bytes: object.chunk_offset_bytes,
+        pack_path,
+        pack_offset_bytes: 0,
+        plaintext_sha256,
     }))
     .expect("object AAD is formatted as UTF-8")
 }
 
 fn data_path(export_job_id: &Uuid, object_id: i64) -> String {
-    format!("data/{export_job_id}/{object_id}.bin")
+    format!("packs/{export_job_id}/pack-{object_id}.pack")
+}
+
+fn pack_index_path(export_job_id: &Uuid, object_id: i64) -> String {
+    format!("packs/{export_job_id}/pack-{object_id}.idx")
 }
 
 fn meta_path(export_job_id: &Uuid, object_id: i64) -> String {
@@ -831,7 +858,7 @@ fn total_manifest_bytes(manifest: &ExportManifest) -> u64 {
     manifest
         .objects
         .iter()
-        .map(|object| object.chunk_size_bytes)
+        .map(|object| object.size_bytes)
         .sum()
 }
 

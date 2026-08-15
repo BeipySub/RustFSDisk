@@ -14,9 +14,9 @@ use uuid::Uuid;
 use crate::{
     center_security::CenterSecurity,
     import_worker::{
-        ArchiveStorage, ChunkPartRecord, ImportClaim, ImportCompletion, ImportError,
-        ImportErrorCode, ImportJobStart, ImportOutcome, ImportProgressSnapshot, ImportRepository,
-        ImportWorker, ImportedDataKeyBinding, LedgerIdentity, LedgerRecord, ProgressAggregator,
+        ArchiveStorage, ImportClaim, ImportCompletion, ImportError, ImportErrorCode,
+        ImportJobStart, ImportOutcome, ImportProgressSnapshot, ImportRepository, ImportWorker,
+        ImportedDataKeyBinding, LedgerIdentity, LedgerRecord, ProgressAggregator,
     },
 };
 
@@ -462,10 +462,10 @@ impl ImportRepository for PgImportRepository {
             .block_on(async {
                 sqlx::query_scalar::<_, i64>(
                     r#"
-                    SELECT
-                      (SELECT COUNT(*) FROM object_ledger WHERE data_key_id = $1 AND nonce = $2)
-                      +
-                      (SELECT COUNT(*) FROM chunk_import_part WHERE data_key_id = $1 AND nonce = $2)
+                    SELECT COUNT(*)
+                    FROM object_ledger
+                    WHERE data_key_id = $1
+                      AND pack_nonce = $2
                     "#,
                 )
                 .bind(data_key_id)
@@ -485,10 +485,11 @@ impl ImportRepository for PgImportRepository {
                 r#"
                 INSERT INTO object_ledger(
                     edge_code, source_bucket, source_key, source_etag, source_size_bytes,
-                    source_last_modified, plaintext_sha256, ciphertext_sha256, chunk_group_id,
-                    data_key_id, nonce, import_bucket, import_key, export_job_id, import_job_id
+                    source_last_modified, storage_mode, frame_total, plaintext_sha256,
+                    pack_ciphertext_sha256, data_key_id, pack_nonce, import_bucket, import_key,
+                    export_job_id, import_job_id
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
                 ON CONFLICT DO NOTHING
                 "#,
             )
@@ -498,11 +499,12 @@ impl ImportRepository for PgImportRepository {
             .bind(&record.identity.source_etag)
             .bind(record.identity.source_size_bytes as i64)
             .bind(last_modified)
+            .bind(record.storage_mode.as_str())
+            .bind(record.frame_total as i32)
             .bind(&record.plaintext_sha256)
-            .bind(&record.ciphertext_sha256)
-            .bind(record.chunk_group_id)
+            .bind(&record.pack_ciphertext_sha256)
             .bind(record.data_key_id)
-            .bind(&record.nonce)
+            .bind(&record.pack_nonce)
             .bind(&record.import_bucket)
             .bind(&record.import_key)
             .bind(record.export_job_id)
@@ -511,41 +513,6 @@ impl ImportRepository for PgImportRepository {
             .await?;
             Ok::<_, anyhow::Error>(())
         });
-    }
-
-    fn register_chunk_part(&mut self, part: ChunkPartRecord) {
-        let _ = self.handle.block_on(async {
-            sqlx::query(
-                r#"
-                INSERT INTO chunk_import_part(
-                    chunk_group_id, chunk_index, chunk_total, chunk_offset_bytes, chunk_size_bytes,
-                    chunk_sha256, ciphertext_sha256, plaintext_sha256, data_key_id, nonce,
-                    tag, aad, disk_id, seal_id, import_job_id, relative_data_path,
-                    staged_ciphertext_path, staged_ciphertext_sha256, status, verified_at
-                )
-                VALUES ($1, $2, $3, $4, $5, $6, $6, $7, $8, $9, '', '', $10, $11, $12, '', '', $6, 'VERIFIED', NOW() AT TIME ZONE 'UTC')
-                ON CONFLICT DO NOTHING
-                "#,
-            )
-            .bind(part.chunk_group_id)
-            .bind(part.chunk_index as i32)
-            .bind(part.chunk_total as i32)
-            .bind(part.chunk_offset_bytes as i64)
-            .bind(part.chunk_size_bytes as i64)
-            .bind(&part.ciphertext_sha256)
-            .bind(sha256_hex(&part.plaintext))
-            .bind(part.data_key_id)
-            .bind(&part.nonce)
-            .bind(part.disk_id)
-            .bind(part.seal_id)
-            .bind(part.import_job_id)
-            .execute(&self.pool)
-            .await
-        });
-    }
-
-    fn chunk_parts(&self, _chunk_group_id: Uuid) -> Vec<ChunkPartRecord> {
-        Vec::new()
     }
 }
 
@@ -677,11 +644,6 @@ fn parse_db_time(value: &str) -> anyhow::Result<NaiveDateTime> {
     Ok(DateTime::parse_from_rfc3339(value)?
         .with_timezone(&Utc)
         .naive_utc())
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    hex::encode(Sha256::digest(bytes))
 }
 
 #[cfg(test)]

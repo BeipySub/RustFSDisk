@@ -18,7 +18,7 @@ use crate::center_security::{
     derive_offline_disk_data_key, verify_disk_info_with_key, ENCRYPTION_ALG_AES_256_GCM,
     SIGNATURE_ALG_HMAC_SHA256,
 };
-use rustfs_transfer_common::crypto::{object_aad, ObjectAad};
+use rustfs_transfer_common::crypto::{pack_object_aad, PackObjectAad};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportErrorCode {
@@ -121,31 +121,16 @@ pub struct LedgerIdentity {
 #[derive(Debug, Clone)]
 pub struct LedgerRecord {
     pub identity: LedgerIdentity,
+    pub storage_mode: StorageMode,
+    pub frame_total: u32,
     pub plaintext_sha256: String,
-    pub ciphertext_sha256: Option<String>,
-    pub chunk_group_id: Option<Uuid>,
+    pub pack_ciphertext_sha256: Option<String>,
     pub data_key_id: Option<Uuid>,
-    pub nonce: Option<String>,
+    pub pack_nonce: Option<String>,
     pub import_bucket: String,
     pub import_key: String,
     pub export_job_id: Uuid,
     pub import_job_id: Uuid,
-}
-
-#[derive(Debug, Clone)]
-pub struct ChunkPartRecord {
-    pub chunk_group_id: Uuid,
-    pub chunk_index: u32,
-    pub chunk_total: u32,
-    pub chunk_offset_bytes: u64,
-    pub chunk_size_bytes: u64,
-    pub disk_id: Uuid,
-    pub seal_id: Uuid,
-    pub import_job_id: Uuid,
-    pub data_key_id: Uuid,
-    pub nonce: String,
-    pub ciphertext_sha256: String,
-    pub plaintext: Vec<u8>,
 }
 
 pub trait ImportRepository {
@@ -163,8 +148,6 @@ pub trait ImportRepository {
     fn identity_imported(&self, identity: &LedgerIdentity) -> bool;
     fn nonce_used(&self, data_key_id: Uuid, nonce: &str) -> bool;
     fn insert_ledger(&mut self, record: LedgerRecord);
-    fn register_chunk_part(&mut self, part: ChunkPartRecord);
-    fn chunk_parts(&self, chunk_group_id: Uuid) -> Vec<ChunkPartRecord>;
 }
 
 pub trait ArchiveStorage {
@@ -423,7 +406,13 @@ where
                 self.progress.object_done(object.progress_bytes());
                 continue;
             }
-            if self.repo.nonce_used(object.data_key_id, &object.nonce) {
+            let pack_ref = object.pack_ref.as_ref().ok_or_else(|| {
+                ImportError::new(
+                    ImportErrorCode::ManifestInvalid,
+                    "PACK object is missing pack_ref",
+                )
+            })?;
+            if self.repo.nonce_used(object.data_key_id, &pack_ref.nonce) {
                 return Err(ImportError::new(
                     ImportErrorCode::NonceReused,
                     "data_key_id + nonce has already been imported",
@@ -431,28 +420,17 @@ where
             }
 
             let plaintext = self.decrypt_object(protocol_root, disk_info, object, disk_data_key)?;
-            if object.chunked {
-                self.register_chunk(object, checked, import_job_id, plaintext)?;
-                if self.try_merge_chunk_group(object, checked, import_job_id, &import_bucket)? {
-                    imported_count += 1;
-                    imported_bytes += object.size_bytes;
-                    self.progress.object_done(object.progress_bytes());
-                } else {
-                    self.progress.object_done(object.progress_bytes());
-                }
-                continue;
-            }
-
             let import_key = archive_key(&object.bucket, &object.key);
             self.storage
                 .upload_object(&import_bucket, &import_key, &plaintext)?;
             self.repo.insert_ledger(LedgerRecord {
                 identity,
+                storage_mode: StorageMode::Pack,
+                frame_total: 0,
                 plaintext_sha256: object.plaintext_sha256.clone(),
-                ciphertext_sha256: Some(object.ciphertext_sha256.clone()),
-                chunk_group_id: None,
+                pack_ciphertext_sha256: Some(pack_ref.ciphertext_sha256.clone()),
                 data_key_id: Some(object.data_key_id),
-                nonce: Some(object.nonce.clone()),
+                pack_nonce: Some(pack_ref.nonce.clone()),
                 import_bucket: import_bucket.clone(),
                 import_key,
                 export_job_id: checked.export_job_id,
@@ -479,8 +457,14 @@ where
                 "object data_key_id does not match disk_info security.data_key_id",
             ));
         }
+        let pack_ref = object.pack_ref.as_ref().ok_or_else(|| {
+            ImportError::new(
+                ImportErrorCode::ManifestInvalid,
+                "PACK object is missing pack_ref",
+            )
+        })?;
         let ciphertext_path =
-            safe_protocol_path(protocol_root, &object.relative_data_path, Some("data/"))?;
+            safe_protocol_path(protocol_root, &pack_ref.pack_path, Some("packs/"))?;
         let ciphertext = fs::read(&ciphertext_path).map_err(|err| {
             ImportError::new(
                 ImportErrorCode::ManifestInvalid,
@@ -488,21 +472,21 @@ where
             )
         })?;
         let actual_ciphertext_sha = sha256_hex(&ciphertext);
-        if actual_ciphertext_sha != object.ciphertext_sha256 {
+        if actual_ciphertext_sha != pack_ref.ciphertext_sha256 {
             return Err(ImportError::new(
                 ImportErrorCode::ChecksumMismatch,
                 "ciphertext sha256 mismatch",
             ));
         }
-        if ciphertext.len() as u64 != object.ciphertext_size_bytes {
+        if ciphertext.len() as u64 != pack_ref.ciphertext_size_bytes {
             return Err(ImportError::new(
                 ImportErrorCode::ChecksumMismatch,
                 "ciphertext size mismatch",
             ));
         }
 
-        let nonce = decode_b64_or_hex("nonce", &object.nonce)?;
-        let tag = decode_b64_or_hex("tag", &object.tag)?;
+        let nonce = decode_b64_or_hex("nonce", &pack_ref.nonce)?;
+        let tag = decode_b64_or_hex("tag", &pack_ref.tag)?;
         if nonce.len() != 12 || tag.len() != 16 {
             return Err(ImportError::new(
                 ImportErrorCode::DecryptFailed,
@@ -518,7 +502,7 @@ where
                 Nonce::from_slice(&nonce),
                 aes_gcm::aead::Payload {
                     msg: payload.as_ref(),
-                    aad: object.aad.as_bytes(),
+                    aad: pack_ref.aad.as_bytes(),
                 },
             )
             .map_err(|_| {
@@ -527,96 +511,13 @@ where
                     "AES-GCM authentication failed",
                 )
             })?;
-        if sha256_hex(&plaintext) != object.plaintext_sha256 && !object.chunked {
+        if sha256_hex(&plaintext) != object.plaintext_sha256 {
             return Err(ImportError::new(
                 ImportErrorCode::ChecksumMismatch,
                 "plaintext sha256 mismatch",
             ));
         }
         Ok(plaintext)
-    }
-
-    fn register_chunk(
-        &mut self,
-        object: &ManifestObject,
-        checked: &CheckedManifest,
-        import_job_id: Uuid,
-        plaintext: Vec<u8>,
-    ) -> ImportResult<()> {
-        let chunk_group_id = object.chunk_group_id.ok_or_else(|| {
-            ImportError::new(
-                ImportErrorCode::ManifestInvalid,
-                "chunked object is missing chunk_group_id",
-            )
-        })?;
-        self.repo.register_chunk_part(ChunkPartRecord {
-            chunk_group_id,
-            chunk_index: object.chunk_index,
-            chunk_total: object.chunk_total,
-            chunk_offset_bytes: object.chunk_offset_bytes,
-            chunk_size_bytes: object.chunk_size_bytes,
-            disk_id: checked.disk_id,
-            seal_id: checked.seal_id,
-            import_job_id,
-            data_key_id: object.data_key_id,
-            nonce: object.nonce.clone(),
-            ciphertext_sha256: object.ciphertext_sha256.clone(),
-            plaintext,
-        });
-        Ok(())
-    }
-
-    fn try_merge_chunk_group(
-        &mut self,
-        object: &ManifestObject,
-        checked: &CheckedManifest,
-        import_job_id: Uuid,
-        import_bucket: &str,
-    ) -> ImportResult<bool> {
-        let chunk_group_id = object.chunk_group_id.ok_or_else(|| {
-            ImportError::new(
-                ImportErrorCode::ManifestInvalid,
-                "chunked object is missing chunk_group_id",
-            )
-        })?;
-        let mut parts = self.repo.chunk_parts(chunk_group_id);
-        if parts.len() != object.chunk_total as usize {
-            return Ok(false);
-        }
-        parts.sort_by_key(|part| part.chunk_index);
-        validate_registered_parts(&parts, object)?;
-        let mut plaintext = Vec::with_capacity(object.size_bytes as usize);
-        for part in &parts {
-            plaintext.extend_from_slice(&part.plaintext);
-        }
-        if plaintext.len() as u64 != object.size_bytes
-            || sha256_hex(&plaintext) != object.plaintext_sha256
-        {
-            return Err(ImportError::new(
-                ImportErrorCode::ChecksumMismatch,
-                "merged chunk plaintext sha256 mismatch",
-            ));
-        }
-        let identity = object.identity(&checked.edge_code);
-        if self.repo.identity_imported(&identity) {
-            return Ok(true);
-        }
-        let import_key = archive_key(&object.bucket, &object.key);
-        self.storage
-            .upload_object(import_bucket, &import_key, &plaintext)?;
-        self.repo.insert_ledger(LedgerRecord {
-            identity,
-            plaintext_sha256: object.plaintext_sha256.clone(),
-            ciphertext_sha256: None,
-            chunk_group_id: Some(chunk_group_id),
-            data_key_id: None,
-            nonce: None,
-            import_bucket: import_bucket.to_string(),
-            import_key,
-            export_job_id: checked.export_job_id,
-            import_job_id,
-        });
-        Ok(true)
     }
 }
 
@@ -712,34 +613,19 @@ struct ExportManifest {
 
 #[derive(Debug, Clone, Deserialize)]
 struct ManifestObject {
+    object_id: Uuid,
     bucket: String,
     key: String,
-    relative_data_path: String,
-    #[serde(default)]
-    encrypted: bool,
-    encryption_alg: String,
+    storage_mode: StorageMode,
     data_key_id: Uuid,
-    nonce: String,
-    tag: String,
-    aad: String,
-    ciphertext_size_bytes: u64,
-    ciphertext_sha256: String,
     #[serde(default)]
-    chunked: bool,
-    #[serde(default, deserialize_with = "empty_uuid_as_none")]
-    chunk_group_id: Option<Uuid>,
+    pack_ref: Option<ManifestPackRef>,
     #[serde(default)]
-    chunk_index: u32,
-    #[serde(default = "one")]
-    chunk_total: u32,
-    #[serde(default)]
-    chunk_offset_bytes: u64,
-    #[serde(default)]
-    chunk_size_bytes: u64,
-    #[serde(default)]
-    chunk_sha256: String,
+    frames: Vec<serde_json::Value>,
+    frame_total: u32,
     relative_meta_path: String,
     size_bytes: u64,
+    estimated_landing_bytes: u64,
     etag: String,
     last_modified: String,
     plaintext_sha256: String,
@@ -759,12 +645,36 @@ impl ManifestObject {
     }
 
     fn progress_bytes(&self) -> u64 {
-        if self.chunked {
-            self.chunk_size_bytes
-        } else {
-            self.size_bytes
+        self.size_bytes
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum StorageMode {
+    Pack,
+    Frames,
+}
+
+impl StorageMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pack => "PACK",
+            Self::Frames => "FRAMES",
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ManifestPackRef {
+    pack_path: String,
+    pack_index_path: String,
+    pack_offset_bytes: u64,
+    ciphertext_size_bytes: u64,
+    nonce: String,
+    tag: String,
+    aad: String,
+    ciphertext_sha256: String,
 }
 
 #[derive(Debug, Clone)]
@@ -789,23 +699,6 @@ impl CheckedManifest {
     }
 }
 
-fn one() -> u32 {
-    1
-}
-
-fn empty_uuid_as_none<'de, D>(deserializer: D) -> Result<Option<Uuid>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = Option::<String>::deserialize(deserializer)?;
-    match value.as_deref() {
-        None | Some("") => Ok(None),
-        Some(raw) => Uuid::parse_str(raw)
-            .map(Some)
-            .map_err(serde::de::Error::custom),
-    }
-}
-
 fn read_disk_info(protocol_root: &Path) -> ImportResult<DiskInfo> {
     let path = protocol_root.join("disk_info.json");
     let bytes = fs::read(&path).map_err(|err| {
@@ -823,8 +716,7 @@ fn read_disk_info(protocol_root: &Path) -> ImportResult<DiskInfo> {
 }
 
 fn validate_disk_info(disk_info: &DiskInfo, center_signature_key: &[u8]) -> ImportResult<()> {
-    if disk_info.protocol.name != "rustfs-offline-transfer"
-        || !disk_info.protocol.version.starts_with("1.")
+    if disk_info.protocol.name != "rustfs-offline-transfer" || disk_info.protocol.version != "2.0.0"
     {
         return Err(ImportError::new(
             ImportErrorCode::ManifestInvalid,
@@ -864,7 +756,7 @@ fn validate_manifest(
     manifest: &ExportManifest,
     manifest_sha256: &str,
 ) -> ImportResult<CheckedManifest> {
-    if manifest.manifest_version != "1.0.0" {
+    if manifest.manifest_version != "2.0.0" {
         return Err(ImportError::new(
             ImportErrorCode::ManifestInvalid,
             "unsupported manifest version",
@@ -929,176 +821,73 @@ fn validate_manifest(
 
 fn validate_objects(manifest: &ExportManifest) -> ImportResult<()> {
     let mut nonces = HashSet::new();
-    let mut chunks: HashMap<Uuid, Vec<&ManifestObject>> = HashMap::new();
     for object in &manifest.objects {
+        let pack_ref = object.pack_ref.as_ref().ok_or_else(|| {
+            ImportError::new(
+                ImportErrorCode::ManifestInvalid,
+                "PACK object is missing pack_ref",
+            )
+        })?;
         if object.object_status != "EXPORTED"
-            || !object.encrypted
-            || object.encryption_alg != "AES-256-GCM"
+            || object.storage_mode != StorageMode::Pack
             || object.bucket.is_empty()
             || object.key.is_empty()
             || object.plaintext_sha256.len() != 64
-            || object.ciphertext_sha256.len() != 64
+            || pack_ref.ciphertext_sha256.len() != 64
+            || object.estimated_landing_bytes < object.size_bytes.saturating_add(4096)
+            || object.frame_total != 0
+            || !object.frames.is_empty()
         {
             return Err(ImportError::new(
                 ImportErrorCode::ManifestInvalid,
                 "manifest object has invalid fields",
             ));
         }
-        if !object.relative_data_path.starts_with("data/")
+        if !pack_ref.pack_path.starts_with("packs/")
+            || !pack_ref.pack_index_path.starts_with("packs/")
             || !object.relative_meta_path.starts_with("meta/")
         {
             return Err(ImportError::new(
                 ImportErrorCode::ManifestInvalid,
-                "object paths must be under data/ and meta/",
+                "object paths must be under packs/ and meta/",
             ));
         }
-        if !nonces.insert((object.data_key_id, object.nonce.clone())) {
+        if !nonces.insert((object.data_key_id, pack_ref.nonce.clone())) {
             return Err(ImportError::new(
                 ImportErrorCode::NonceReused,
                 "manifest contains duplicate data_key_id + nonce",
             ));
         }
         validate_object_aad(manifest, object)?;
-        if object.chunked {
-            validate_chunk_object(object)?;
-            chunks
-                .entry(object.chunk_group_id.expect("validated chunk_group_id"))
-                .or_default()
-                .push(object);
-        } else if object.chunk_index != 0
-            || object.chunk_total != 1
-            || object.chunk_offset_bytes != 0
-            || object.chunk_size_bytes != object.size_bytes
-        {
-            return Err(ImportError::new(
-                ImportErrorCode::ManifestInvalid,
-                "plain object contains invalid chunk fields",
-            ));
-        }
-    }
-    for group in chunks.values() {
-        validate_manifest_chunk_group(group)?;
     }
     Ok(())
 }
 
 fn validate_object_aad(manifest: &ExportManifest, object: &ManifestObject) -> ImportResult<()> {
+    let pack_ref = object.pack_ref.as_ref().ok_or_else(|| {
+        ImportError::new(
+            ImportErrorCode::ManifestInvalid,
+            "PACK object is missing pack_ref",
+        )
+    })?;
     let disk_id = manifest.disk_id.to_string();
     let seal_id = manifest.seal_id.to_string();
     let export_job_id = manifest.export_job_id.to_string();
-    let chunk_group_id = object.chunk_group_id.map(|id| id.to_string());
-    let expected = object_aad(ObjectAad {
+    let expected = pack_object_aad(PackObjectAad {
         disk_id: &disk_id,
         seal_id: &seal_id,
         export_job_id: &export_job_id,
+        object_id: &object.object_id.to_string(),
         bucket: &object.bucket,
         object_key: &object.key,
-        chunk_group_id: chunk_group_id.as_deref(),
-        chunk_index: object.chunk_index,
-        chunk_total: object.chunk_total,
-        chunk_offset_bytes: object.chunk_offset_bytes,
+        pack_path: &pack_ref.pack_path,
+        pack_offset_bytes: pack_ref.pack_offset_bytes,
+        plaintext_sha256: &object.plaintext_sha256,
     });
-    if object.aad.as_bytes() != expected.as_slice() {
+    if pack_ref.aad.as_bytes() != expected.as_slice() {
         return Err(ImportError::new(
             ImportErrorCode::ManifestInvalid,
             "manifest object aad does not match bound fields",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_chunk_object(object: &ManifestObject) -> ImportResult<()> {
-    if object.chunk_group_id.is_none()
-        || object.chunk_total <= 1
-        || object.chunk_total > 1_000_000
-        || object.chunk_index >= object.chunk_total
-        || object.chunk_size_bytes == 0
-        || object.chunk_offset_bytes >= object.size_bytes
-    {
-        return Err(ImportError::new(
-            ImportErrorCode::ManifestInvalid,
-            "chunk object contains invalid chunk fields",
-        ));
-    }
-    if !object.chunk_sha256.is_empty() && object.chunk_sha256 != object.ciphertext_sha256 {
-        return Err(ImportError::new(
-            ImportErrorCode::ChecksumMismatch,
-            "chunk sha256 does not match ciphertext sha256",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_manifest_chunk_group(group: &[&ManifestObject]) -> ImportResult<()> {
-    let first = group[0];
-    let mut seen = HashSet::new();
-    for object in group {
-        if object.chunk_group_id != first.chunk_group_id
-            || object.chunk_total != first.chunk_total
-            || object.bucket != first.bucket
-            || object.key != first.key
-            || object.etag != first.etag
-            || object.size_bytes != first.size_bytes
-            || object.last_modified != first.last_modified
-            || object.plaintext_sha256 != first.plaintext_sha256
-        {
-            return Err(ImportError::new(
-                ImportErrorCode::ManifestInvalid,
-                "chunk group source fields are inconsistent",
-            ));
-        }
-        if !seen.insert(object.chunk_index) {
-            return Err(ImportError::new(
-                ImportErrorCode::ManifestInvalid,
-                "duplicate chunk_index in manifest",
-            ));
-        }
-    }
-    if group.len() == first.chunk_total as usize {
-        let mut sorted = group.to_vec();
-        sorted.sort_by_key(|object| object.chunk_index);
-        let mut offset = 0_u64;
-        for (expected_index, object) in sorted.iter().enumerate() {
-            if object.chunk_index != expected_index as u32 || object.chunk_offset_bytes != offset {
-                return Err(ImportError::new(
-                    ImportErrorCode::ManifestInvalid,
-                    "chunk group is not continuous",
-                ));
-            }
-            offset += object.chunk_size_bytes;
-        }
-        if offset != first.size_bytes {
-            return Err(ImportError::new(
-                ImportErrorCode::ManifestInvalid,
-                "chunk sizes do not sum to source size",
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn validate_registered_parts(
-    parts: &[ChunkPartRecord],
-    object: &ManifestObject,
-) -> ImportResult<()> {
-    let mut offset = 0_u64;
-    for (expected_index, part) in parts.iter().enumerate() {
-        if part.chunk_index != expected_index as u32
-            || part.chunk_total != object.chunk_total
-            || part.chunk_offset_bytes != offset
-            || part.chunk_size_bytes != part.plaintext.len() as u64
-        {
-            return Err(ImportError::new(
-                ImportErrorCode::ManifestInvalid,
-                "registered chunk parts are not continuous",
-            ));
-        }
-        offset += part.chunk_size_bytes;
-    }
-    if offset != object.size_bytes {
-        return Err(ImportError::new(
-            ImportErrorCode::ManifestInvalid,
-            "registered chunk parts do not cover source object",
         ));
     }
     Ok(())
@@ -1246,7 +1035,6 @@ pub struct MemoryRepository {
     data_keys: HashMap<(Uuid, Uuid), MemoryDataKey>,
     jobs: HashMap<(Uuid, Uuid), MemoryImportJob>,
     ledger: Vec<LedgerRecord>,
-    chunks: HashMap<(Uuid, u32), ChunkPartRecord>,
 }
 
 impl MemoryRepository {
@@ -1521,32 +1309,12 @@ impl ImportRepository for MemoryRepository {
 
     fn nonce_used(&self, data_key_id: Uuid, nonce: &str) -> bool {
         self.ledger.iter().any(|record| {
-            record.data_key_id == Some(data_key_id) && record.nonce.as_deref() == Some(nonce)
-        }) || self
-            .chunks
-            .values()
-            .any(|part| part.data_key_id == data_key_id && part.nonce == nonce)
+            record.data_key_id == Some(data_key_id) && record.pack_nonce.as_deref() == Some(nonce)
+        })
     }
 
     fn insert_ledger(&mut self, record: LedgerRecord) {
         self.ledger.push(record);
-    }
-
-    fn register_chunk_part(&mut self, part: ChunkPartRecord) {
-        self.chunks
-            .entry((part.chunk_group_id, part.chunk_index))
-            .or_insert(part);
-    }
-
-    fn chunk_parts(&self, chunk_group_id: Uuid) -> Vec<ChunkPartRecord> {
-        let mut parts = self
-            .chunks
-            .values()
-            .filter(|part| part.chunk_group_id == chunk_group_id)
-            .cloned()
-            .collect::<Vec<_>>();
-        parts.sort_by_key(|part| part.chunk_index);
-        parts
     }
 }
 

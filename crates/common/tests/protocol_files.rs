@@ -6,9 +6,9 @@ use rustfs_transfer_common::error::TransferErrorCode;
 use rustfs_transfer_common::protocol::{
     validate_relative_path, DiskInfo, DiskInfoCenter, DiskInfoDisk, DiskInfoEdge, DiskInfoManifest,
     DiskInfoProtocol, DiskInfoSecurity, DiskInfoStatus, DiskStatusCode, ExportManifest,
-    ManifestObject, ObjectStatus, TransferDisk, DISK_INFO_PATH, ENCRYPTION_ALG_AES_256_GCM,
-    MANIFEST_PATH, MANIFEST_SHA256_PATH, PROTOCOL_NAME, PROTOCOL_ROOT_DIR, PROTOCOL_VERSION,
-    SIGNATURE_ALG_HMAC_SHA256,
+    ManifestObject, ManifestPackRef, ObjectStatus, StorageMode, TransferDisk, DISK_INFO_PATH,
+    ENCRYPTION_ALG_AES_256_GCM, MANIFEST_PATH, MANIFEST_SHA256_PATH, MANIFEST_VERSION,
+    PROTOCOL_NAME, PROTOCOL_ROOT_DIR, PROTOCOL_VERSION, SIGNATURE_ALG_HMAC_SHA256,
 };
 use uuid::Uuid;
 
@@ -28,10 +28,15 @@ fn writes_and_reads_protocol_files_atomically() {
     let read_metadata: BTreeMap<String, String> = disk.read_metadata(metadata_path).unwrap();
     assert_eq!(read_metadata, metadata);
 
-    disk.write_object_atomic("data/object-1.enc", b"ciphertext")
+    disk.write_object_atomic("packs/export-job-1/pack-000001.pack", b"ciphertext")
         .unwrap();
     assert_eq!(
-        fs::read(mount.join(PROTOCOL_ROOT_DIR).join("data/object-1.enc")).unwrap(),
+        fs::read(
+            mount
+                .join(PROTOCOL_ROOT_DIR)
+                .join("packs/export-job-1/pack-000001.pack")
+        )
+        .unwrap(),
         b"ciphertext"
     );
 
@@ -113,7 +118,11 @@ fn partial_paths_and_non_exported_objects_do_not_enter_valid_manifest() {
     let disk = TransferDisk::new(&mount);
 
     let mut partial_manifest = sample_manifest();
-    partial_manifest.objects[0].relative_data_path = "data/object-1.enc.partial".to_string();
+    partial_manifest.objects[0]
+        .pack_ref
+        .as_mut()
+        .unwrap()
+        .pack_path = "packs/object-1.pack.partial".to_string();
     let err = disk.write_manifest(&partial_manifest).unwrap_err();
     assert_eq!(err.code, TransferErrorCode::ManifestInvalid);
 
@@ -166,33 +175,33 @@ fn sample_disk_info() -> DiskInfo {
 
 fn sample_manifest() -> ExportManifest {
     ExportManifest {
-        manifest_version: "1.0.0".to_string(),
+        manifest_version: MANIFEST_VERSION.to_string(),
         seal_id: "seal-1".to_string(),
         export_job_id: "export-job-1".to_string(),
         disk_id: "disk-1".to_string(),
         edge_code: "edge-a".to_string(),
         create_time: "2026-08-09T00:00:00Z".to_string(),
         objects: vec![ManifestObject {
+            object_id: "11111111-1111-1111-1111-111111111111".to_string(),
             bucket: "bucket".to_string(),
             key: "object.txt".to_string(),
-            relative_data_path: "data/object-1.enc".to_string(),
-            encrypted: true,
-            encryption_alg: ENCRYPTION_ALG_AES_256_GCM.to_string(),
+            storage_mode: StorageMode::Pack,
             data_key_id: "data-key-1".to_string(),
-            nonce: "nonce".to_string(),
-            tag: "tag".to_string(),
-            aad: "aad".to_string(),
-            ciphertext_size_bytes: 10,
-            ciphertext_sha256: "cipher-sha".to_string(),
-            chunked: false,
-            chunk_group_id: String::new(),
-            chunk_index: 0,
-            chunk_total: 1,
-            chunk_offset_bytes: 0,
-            chunk_size_bytes: 10,
-            chunk_sha256: "cipher-sha".to_string(),
+            pack_ref: Some(ManifestPackRef {
+                pack_path: "packs/export-job-1/pack-000001.pack".to_string(),
+                pack_index_path: "packs/export-job-1/pack-000001.idx".to_string(),
+                pack_offset_bytes: 0,
+                ciphertext_size_bytes: 10,
+                nonce: "nonce".to_string(),
+                tag: "tag".to_string(),
+                aad: "aad".to_string(),
+                ciphertext_sha256: "cipher-sha".to_string(),
+            }),
+            frames: Vec::new(),
+            frame_total: 0,
             relative_meta_path: "meta/object-1.json".to_string(),
             size_bytes: 10,
+            estimated_landing_bytes: 4096,
             etag: "etag".to_string(),
             last_modified: "2026-08-09T00:00:00Z".to_string(),
             content_type: "text/plain".to_string(),

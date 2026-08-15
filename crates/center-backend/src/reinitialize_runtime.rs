@@ -362,7 +362,7 @@ fn validate_sealed_payload_self_consistent(
     }
     let manifest: SealedExportManifest = serde_json::from_slice(&manifest_bytes)
         .context("parse sealed export manifest for discard gate")?;
-    if manifest.manifest_version != "1.0.0"
+    if manifest.manifest_version != "2.0.0"
         || manifest.disk_id != disk_info.disk.disk_id
         || manifest.seal_id.to_string() != edge.seal_id
         || manifest.export_job_id.to_string() != edge.export_job_id
@@ -385,11 +385,19 @@ fn validate_sealed_payload_self_consistent(
         ));
     }
     for object in &manifest.objects {
-        checked_protocol_path(&protocol_root, &object.relative_data_path)?
-            .try_exists()
-            .with_context(|| format!("check data path {}", object.relative_data_path))?
-            .then_some(())
-            .ok_or_else(|| anyhow!("sealed discard manifest data path is missing"))?;
+        let object_paths = object.payload_paths();
+        if object_paths.is_empty() {
+            return Err(anyhow!(
+                "sealed discard manifest object payload path is missing"
+            ));
+        }
+        for object_path in object_paths {
+            checked_protocol_path(&protocol_root, object_path)?
+                .try_exists()
+                .with_context(|| format!("check object path {object_path}"))?
+                .then_some(())
+                .ok_or_else(|| anyhow!("sealed discard manifest object path is missing"))?;
+        }
         checked_protocol_path(&protocol_root, &object.relative_meta_path)?
             .try_exists()
             .with_context(|| format!("check meta path {}", object.relative_meta_path))?
@@ -425,23 +433,49 @@ struct SealedExportManifest {
 
 #[derive(Debug, Deserialize)]
 struct SealedManifestObject {
-    relative_data_path: String,
+    storage_mode: String,
+    pack_ref: Option<SealedManifestPackRef>,
     #[serde(default)]
-    chunked: bool,
-    #[serde(default)]
-    chunk_size_bytes: u64,
+    frames: Vec<SealedManifestFrameRef>,
+    frame_total: u32,
     size_bytes: u64,
     relative_meta_path: String,
 }
 
 impl SealedManifestObject {
     fn progress_bytes(&self) -> u64 {
-        if self.chunked {
-            self.chunk_size_bytes
+        self.size_bytes
+    }
+
+    fn payload_paths(&self) -> Vec<&str> {
+        if self.storage_mode == "PACK" {
+            self.pack_ref
+                .as_ref()
+                .map(|pack_ref| vec![pack_ref.pack_path.as_str()])
+                .unwrap_or_default()
+        } else if self.storage_mode == "FRAMES" {
+            if self.frame_total as usize == self.frames.len() {
+                self.frames
+                    .iter()
+                    .map(|frame| frame.frame_path.as_str())
+                    .collect()
+            } else {
+                Vec::new()
+            }
         } else {
-            self.size_bytes
+            Vec::new()
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct SealedManifestPackRef {
+    pack_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SealedManifestFrameRef {
+    frame_path: String,
 }
 
 fn reject_partials(mount_path: &Path) -> anyhow::Result<()> {
@@ -737,6 +771,7 @@ mod tests {
 
     const EXPORT_MANIFEST: &str = "manifests/export_manifest.json";
     const EXPORT_MANIFEST_SHA256: &str = "manifests/export_manifest.sha256";
+    const PACK_OBJECT_PATH: &str = "packs/export-fixture/pack-object.pack";
 
     #[derive(Default)]
     struct MemoryRepo {
@@ -1568,7 +1603,7 @@ mod tests {
             .to_string()
             .contains("confirm_discard_sealed_export must be true"));
         assert_eq!(fs::read(temp.root().join(DISK_INFO_FILE)).unwrap(), before);
-        assert!(temp.root().join("data/object.enc").exists());
+        assert!(temp.root().join(PACK_OBJECT_PATH).exists());
         assert!(repo.0.lock().unwrap().runtime.is_empty());
     }
 
@@ -1617,7 +1652,7 @@ mod tests {
                 .object_count,
             0
         );
-        assert!(!temp.root().join("data/object.enc").exists());
+        assert!(!temp.root().join(PACK_OBJECT_PATH).exists());
         assert!(!temp.root().join("meta/object.json").exists());
         assert!(!temp.root().join("manifests/export_manifest.json").exists());
         assert!(temp.root().join("quarantine/partial").is_dir());
@@ -1660,7 +1695,7 @@ mod tests {
 
         assert!(error.to_string().contains("manifest sha256"));
         assert_eq!(fs::read(temp.root().join(DISK_INFO_FILE)).unwrap(), before);
-        assert!(temp.root().join("data/object.enc").exists());
+        assert!(temp.root().join(PACK_OBJECT_PATH).exists());
         assert!(repo.0.lock().unwrap().runtime.is_empty());
     }
 
@@ -1739,7 +1774,7 @@ mod tests {
                 .code,
             DiskStatusCode::Sealed
         );
-        assert!(temp.root().join("data/object.enc").exists());
+        assert!(temp.root().join(PACK_OBJECT_PATH).exists());
         assert!(temp.root().join("meta/object.json").exists());
         assert!(temp.root().join("manifests/export_manifest.json").exists());
         let guard = repo.0.lock().unwrap();
@@ -1823,43 +1858,48 @@ mod tests {
 
     fn write_sealed_disk(temp: &TempDisk, disk_id: Uuid, seal_id: Uuid, old_key: Uuid) {
         let export_job_id = Uuid::new_v4();
-        fs::create_dir_all(temp.root().join("data")).unwrap();
+        fs::create_dir_all(temp.root().join("packs/export-fixture")).unwrap();
         fs::create_dir_all(temp.root().join("meta")).unwrap();
         fs::create_dir_all(temp.root().join("manifests")).unwrap();
-        fs::write(temp.root().join("data/object.enc"), b"ciphertext").unwrap();
+        fs::write(temp.root().join(PACK_OBJECT_PATH), b"ciphertext").unwrap();
+        fs::write(
+            temp.root().join("packs/export-fixture/pack-object.idx"),
+            b"{}",
+        )
+        .unwrap();
         fs::write(temp.root().join("meta/object.json"), b"{}").unwrap();
 
         let manifest = serde_json::json!({
-            "manifest_version": "1.0.0",
+            "manifest_version": "2.0.0",
             "disk_id": disk_id,
             "seal_id": seal_id,
             "export_job_id": export_job_id,
             "edge_code": "edge-a",
             "objects": [{
+                "object_id": Uuid::new_v4(),
                 "bucket": "test",
                 "key": "object.bin",
-                "relative_data_path": "data/object.enc",
-                "encrypted": true,
-                "encryption_alg": "AES-256-GCM",
+                "storage_mode": "PACK",
                 "data_key_id": old_key,
-                "nonce": "nonce",
-                "tag": "tag",
-                "aad": "aad",
-                "ciphertext_size_bytes": 10,
-                "ciphertext_sha256": "ciphertext-sha",
-                "chunked": false,
-                "chunk_group_id": "",
-                "chunk_index": 0,
-                "chunk_total": 1,
-                "chunk_offset_bytes": 0,
-                "chunk_size_bytes": 0,
-                "chunk_sha256": "",
+                "pack_ref": {
+                    "pack_path": PACK_OBJECT_PATH,
+                    "pack_index_path": "packs/export-fixture/pack-object.idx",
+                    "pack_offset_bytes": 0,
+                    "ciphertext_size_bytes": 10,
+                    "nonce": "nonce",
+                    "tag": "tag",
+                    "aad": "aad",
+                    "ciphertext_sha256": "ciphertext-sha"
+                },
+                "frames": [],
+                "frame_total": 0,
                 "relative_meta_path": "meta/object.json",
                 "size_bytes": 10,
                 "etag": "etag",
                 "last_modified": "2026-08-11T00:00:00Z",
                 "plaintext_sha256": "plaintext-sha",
-                "object_status": "EXPORTED"
+                "object_status": "EXPORTED",
+                "estimated_landing_bytes": 4096
             }]
         });
         let manifest_bytes = serde_json::to_vec_pretty(&manifest).unwrap();

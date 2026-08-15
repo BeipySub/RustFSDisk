@@ -13,7 +13,7 @@ use rustfs_transfer_center::import_worker::{
     ImportErrorCode, ImportOutcome, ImportWorker, MemoryArchiveStorage, MemoryRepository,
     ProgressAggregator, DATA_KEY_STATUS_ISSUED, DATA_KEY_STATUS_SEALED_READONLY,
 };
-use rustfs_transfer_common::crypto::{object_aad, ObjectAad};
+use rustfs_transfer_common::crypto::{pack_object_aad, PackObjectAad};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -171,31 +171,48 @@ fn rejects_same_seal_with_different_manifest_sha256() {
 }
 
 #[test]
-fn does_not_write_ledger_for_missing_cross_disk_chunk() {
-    let fixture = SealedDiskFixture::new_chunk("large.bin", b"first half".to_vec(), 0, 2);
+fn rejects_frames_object_until_frame_import_is_implemented() {
+    let fixture = SealedDiskFixture::new_plain("large.bin", b"first half".to_vec());
+    fixture.rewrite_manifest(|manifest| {
+        let object = &mut manifest["objects"][0];
+        let pack_ref = object["pack_ref"].take();
+        object["storage_mode"] = json!("FRAMES");
+        object["pack_ref"] = Value::Null;
+        object["frame_total"] = json!(1);
+        object["frames"] = json!([{
+            "frame_index": 0,
+            "frame_path": pack_ref["pack_path"].clone(),
+            "frame_offset_bytes": 0,
+            "ciphertext_size_bytes": pack_ref["ciphertext_size_bytes"].clone(),
+            "nonce": pack_ref["nonce"].clone(),
+            "tag": pack_ref["tag"].clone(),
+            "aad": pack_ref["aad"].clone(),
+            "ciphertext_sha256": pack_ref["ciphertext_sha256"].clone()
+        }]);
+    });
     let mut repo = fixture.repository();
     let mut storage = MemoryArchiveStorage::default();
     let mut progress = ProgressAggregator::default();
 
-    ImportWorker::new(
+    let err = ImportWorker::new(
         &mut repo,
         &mut storage,
         &mut progress,
         fixture.signature_key.clone(),
     )
     .import_sealed_disk(&fixture.root)
-    .expect("single valid chunk registers");
+    .expect_err("frames objects are rejected until frame import is implemented");
 
+    assert_eq!(err.code, ImportErrorCode::ManifestInvalid);
     assert!(repo.ledger().is_empty());
     assert!(storage.objects().is_empty());
-    assert_eq!(progress.snapshot().import_job_status, "DONE");
 }
 
 #[test]
 fn invalid_manifest_path_returns_standard_error_code() {
     let fixture = SealedDiskFixture::new_plain("alpha.txt", b"hello archive".to_vec());
     fixture.rewrite_manifest(|manifest| {
-        manifest["objects"][0]["relative_data_path"] = json!("../escape.enc");
+        manifest["objects"][0]["pack_ref"]["pack_path"] = json!("../escape.enc");
     });
     let mut repo = fixture.repository();
     let mut storage = MemoryArchiveStorage::default();
@@ -218,7 +235,7 @@ fn invalid_manifest_path_returns_standard_error_code() {
 fn aad_mismatch_returns_standard_error_code_before_decrypt() {
     let fixture = SealedDiskFixture::new_plain("alpha.txt", b"hello archive".to_vec());
     fixture.rewrite_manifest(|manifest| {
-        manifest["objects"][0]["aad"] = json!("disk_id=other");
+        manifest["objects"][0]["pack_ref"]["aad"] = json!("disk_id=other");
     });
     let mut repo = fixture.repository();
     let mut storage = MemoryArchiveStorage::default();
@@ -241,7 +258,9 @@ fn aad_mismatch_returns_standard_error_code_before_decrypt() {
 fn ciphertext_checksum_mismatch_returns_standard_error_code() {
     let fixture = SealedDiskFixture::new_plain("alpha.txt", b"hello archive".to_vec());
     fs::write(
-        fixture.root.join("data/alpha.txt.enc"),
+        fixture
+            .root
+            .join("packs/export-fixture/pack-alpha.txt.pack"),
         b"tampered ciphertext",
     )
     .unwrap();
@@ -266,7 +285,8 @@ fn ciphertext_checksum_mismatch_returns_standard_error_code() {
 fn decrypt_failure_marks_job_failed_and_keeps_disk_unimported() {
     let fixture = SealedDiskFixture::new_plain("alpha.txt", b"hello archive".to_vec());
     fixture.rewrite_manifest(|manifest| {
-        manifest["objects"][0]["tag"] = json!(general_purpose::STANDARD.encode([0_u8; 16]));
+        manifest["objects"][0]["pack_ref"]["tag"] =
+            json!(general_purpose::STANDARD.encode([0_u8; 16]));
     });
     let mut repo = fixture.repository();
     let mut storage = MemoryArchiveStorage::default();
@@ -307,7 +327,7 @@ fn offline_disk_data_key_matches_edge_derivation_vector() {
 
     assert_eq!(
         hex::encode(key),
-        "6beef782ba8dca85c86c597ffc3b328dae0473857c4fc6f6cc841070e245c0c1"
+        "16fcbbcde45c48904fbd38a690115ef35287479bb3efd5a3cf5c74c5bb23d633"
     );
 }
 
@@ -451,23 +471,13 @@ struct SealedDiskFixture {
 
 impl SealedDiskFixture {
     fn new_plain(key: &str, plaintext: Vec<u8>) -> Self {
-        Self::new_object(key, plaintext, false, 0, 1)
+        Self::new_object(key, plaintext)
     }
 
-    fn new_chunk(key: &str, plaintext: Vec<u8>, chunk_index: u32, chunk_total: u32) -> Self {
-        Self::new_object(key, plaintext, true, chunk_index, chunk_total)
-    }
-
-    fn new_object(
-        key: &str,
-        plaintext: Vec<u8>,
-        chunked: bool,
-        chunk_index: u32,
-        chunk_total: u32,
-    ) -> Self {
+    fn new_object(key: &str, plaintext: Vec<u8>) -> Self {
         let root = std::env::temp_dir().join(format!("rustfs-transfer-test-{}", Uuid::new_v4()));
         fs::create_dir_all(root.join("manifests")).unwrap();
-        fs::create_dir_all(root.join("data")).unwrap();
+        fs::create_dir_all(root.join("packs/export-fixture")).unwrap();
         fs::create_dir_all(root.join("meta")).unwrap();
 
         let disk_id = Uuid::new_v4();
@@ -476,7 +486,7 @@ impl SealedDiskFixture {
         let data_key_id = Uuid::new_v4();
         let center_key_id = Uuid::new_v4();
         let signature_key = vec![0x31; 32];
-        let chunk_group_id = Uuid::new_v4();
+        let object_id = Uuid::new_v4();
         let edge_auth_secret = "edge-a-offline-secret".to_string();
         let key_bytes = derive_offline_disk_data_key(
             &edge_auth_secret,
@@ -488,73 +498,62 @@ impl SealedDiskFixture {
         )
         .unwrap()
         .to_vec();
-        let nonce_bytes = nonce_for(chunk_index);
+        let nonce_bytes = nonce_for();
         let disk_id_text = disk_id.to_string();
         let seal_id_text = seal_id.to_string();
         let export_job_id_text = export_job_id.to_string();
-        let chunk_group_id_text = chunk_group_id.to_string();
-        let aad = object_aad(ObjectAad {
+        let object_id_text = object_id.to_string();
+        let plaintext_sha256 = sha256_hex(&plaintext);
+        let object_path = format!("packs/export-fixture/pack-{key}.pack");
+        let index_path = format!("packs/export-fixture/pack-{key}.idx");
+        let aad = pack_object_aad(PackObjectAad {
             disk_id: &disk_id_text,
             seal_id: &seal_id_text,
             export_job_id: &export_job_id_text,
+            object_id: &object_id_text,
             bucket: "source",
             object_key: key,
-            chunk_group_id: if chunked {
-                Some(chunk_group_id_text.as_str())
-            } else {
-                None
-            },
-            chunk_index,
-            chunk_total,
-            chunk_offset_bytes: chunk_index as u64 * plaintext.len() as u64,
+            pack_path: &object_path,
+            pack_offset_bytes: 0,
+            plaintext_sha256: &plaintext_sha256,
         });
         let (ciphertext, tag) = encrypt(&key_bytes, &nonce_bytes, &aad, &plaintext);
-        let object_path = format!("data/{key}.enc");
         fs::write(root.join(&object_path), &ciphertext).unwrap();
+        fs::write(root.join(&index_path), b"{}").unwrap();
         fs::write(root.join(format!("meta/{key}.json")), b"{}").unwrap();
 
-        let plain_hash = if chunked {
-            sha256_hex(b"first halfsecond half")
-        } else {
-            sha256_hex(&plaintext)
-        };
-        let chunk_size_bytes = plaintext.len() as u64;
-        let size_bytes = if chunked {
-            chunk_size_bytes * chunk_total as u64
-        } else {
-            chunk_size_bytes
-        };
+        let size_bytes = plaintext.len() as u64;
         let object = json!({
+            "object_id": object_id,
             "bucket": "source",
             "key": key,
-            "relative_data_path": object_path,
-            "encrypted": true,
-            "encryption_alg": ENCRYPTION_ALG_AES_256_GCM,
+            "storage_mode": "PACK",
             "data_key_id": data_key_id,
-            "nonce": general_purpose::STANDARD.encode(nonce_bytes),
-            "tag": general_purpose::STANDARD.encode(tag),
-            "aad": String::from_utf8(aad).unwrap(),
-            "ciphertext_size_bytes": ciphertext.len() as u64,
-            "ciphertext_sha256": sha256_hex(&ciphertext),
-            "chunked": chunked,
-            "chunk_group_id": if chunked { chunk_group_id.to_string() } else { String::new() },
-            "chunk_index": chunk_index,
-            "chunk_total": chunk_total,
-            "chunk_offset_bytes": chunk_index as u64 * chunk_size_bytes,
-            "chunk_size_bytes": chunk_size_bytes,
-            "chunk_sha256": sha256_hex(&ciphertext),
+            "pack_ref": {
+                "pack_path": object_path,
+                "pack_index_path": index_path,
+                "pack_offset_bytes": 0,
+                "ciphertext_size_bytes": ciphertext.len() as u64,
+                "nonce": general_purpose::STANDARD.encode(nonce_bytes),
+                "tag": general_purpose::STANDARD.encode(tag),
+                "aad": String::from_utf8(aad).unwrap(),
+                "ciphertext_sha256": sha256_hex(&ciphertext)
+            },
+            "frames": [],
+            "frame_total": 0,
             "relative_meta_path": format!("meta/{key}.json"),
             "size_bytes": size_bytes,
             "etag": "etag-1",
             "last_modified": "2026-08-09T00:00:00Z",
             "content_type": "application/octet-stream",
             "metadata": {},
-            "plaintext_sha256": plain_hash,
+            "plaintext_sha256": plaintext_sha256,
             "exported_at": "2026-08-09T00:01:00Z",
-            "object_status": "EXPORTED"
+            "object_status": "EXPORTED",
+            "estimated_landing_bytes": size_bytes + 4096
         });
         let manifest = json!({
-            "manifest_version": "1.0.0",
+            "manifest_version": "2.0.0",
             "seal_id": seal_id,
             "export_job_id": export_job_id,
             "disk_id": disk_id,
@@ -570,7 +569,7 @@ impl SealedDiskFixture {
         let disk_info = json!({
             "protocol": {
                 "name": "rustfs-offline-transfer",
-                "version": "1.0.0"
+                "version": "2.0.0"
             },
             "disk": {
                 "disk_id": disk_id,
@@ -600,7 +599,7 @@ impl SealedDiskFixture {
                 "manifest_path": "manifests/export_manifest.json",
                 "manifest_sha256_path": "manifests/export_manifest.sha256",
                 "object_count": 1,
-                "total_bytes": chunk_size_bytes,
+                "total_bytes": size_bytes,
                 "manifest_sha256": manifest_sha
             },
             "security": {
@@ -688,10 +687,8 @@ fn encrypt(key: &[u8], nonce: &[u8], aad: &[u8], plaintext: &[u8]) -> (Vec<u8>, 
     (payload, tag)
 }
 
-fn nonce_for(index: u32) -> [u8; 12] {
-    let mut nonce = [1_u8; 12];
-    nonce[11] = index as u8 + 1;
-    nonce
+fn nonce_for() -> [u8; 12] {
+    [1_u8; 12]
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

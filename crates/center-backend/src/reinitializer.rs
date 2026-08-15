@@ -498,7 +498,15 @@ fn validate_registered_disk_identity(
 
 fn clean_sealed_payload(mount_path: &Path) -> Result<(), ReinitializeError> {
     let root = protocol_root(mount_path);
-    for dir_name in ["data", "meta", "manifests", "logs", "quarantine"] {
+    for dir_name in [
+        "packs",
+        "frames",
+        "data",
+        "meta",
+        "manifests",
+        "logs",
+        "quarantine",
+    ] {
         let path = root.join(dir_name);
         if path.exists() {
             fs::remove_dir_all(&path).map_err(|source| ReinitializeError::Fs {
@@ -528,7 +536,15 @@ impl SealedPayloadBackup {
         })?;
 
         let mut moved_dirs = Vec::new();
-        for dir_name in ["data", "meta", "manifests", "logs", "quarantine"] {
+        for dir_name in [
+            "packs",
+            "frames",
+            "data",
+            "meta",
+            "manifests",
+            "logs",
+            "quarantine",
+        ] {
             let from = root.join(dir_name);
             if !from.exists() {
                 continue;
@@ -550,7 +566,15 @@ impl SealedPayloadBackup {
     }
 
     fn restore(&mut self) -> Result<(), ReinitializeError> {
-        for dir_name in ["data", "meta", "manifests", "logs", "quarantine"] {
+        for dir_name in [
+            "packs",
+            "frames",
+            "data",
+            "meta",
+            "manifests",
+            "logs",
+            "quarantine",
+        ] {
             let recreated = self.root.join(dir_name);
             if recreated.exists() {
                 fs::remove_dir_all(&recreated).map_err(|source| ReinitializeError::Fs {

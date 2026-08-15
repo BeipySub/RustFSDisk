@@ -8,10 +8,13 @@ use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CurrentObjectProgress {
+    pub object_id: String,
     pub bucket: String,
     pub key: String,
     pub display_name: String,
-    pub relative_data_path: String,
+    pub storage_mode: String,
+    pub frame_index: u32,
+    pub frame_total: u32,
     pub size_bytes: u64,
     pub done_bytes: u64,
     pub remaining_bytes: u64,
@@ -266,9 +269,12 @@ impl ProgressAggregator {
     pub fn start_object(
         &self,
         disk_id: &str,
+        object_id: impl Into<String>,
         bucket: impl Into<String>,
         key: impl Into<String>,
-        relative_data_path: impl Into<String>,
+        storage_mode: impl Into<String>,
+        frame_index: u32,
+        frame_total: u32,
         size_bytes: u64,
     ) {
         let key = key.into();
@@ -277,10 +283,13 @@ impl ProgressAggregator {
         state.event_type = "COPY_PROGRESS".to_string();
         if let Some(disk) = state.disks.get_mut(disk_id) {
             disk.current_object = Some(CurrentObjectProgress {
+                object_id: object_id.into(),
                 bucket: bucket.into(),
                 key,
                 display_name,
-                relative_data_path: relative_data_path.into(),
+                storage_mode: storage_mode.into(),
+                frame_index,
+                frame_total,
                 size_bytes,
                 done_bytes: 0,
                 remaining_bytes: size_bytes,

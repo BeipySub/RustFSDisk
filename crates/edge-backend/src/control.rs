@@ -340,10 +340,13 @@ pub struct EdgeDiskProgressSummary {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct DashboardCurrentObject {
+    pub object_id: String,
     pub bucket: String,
     pub key: String,
     pub display_name: String,
-    pub relative_data_path: String,
+    pub storage_mode: String,
+    pub frame_index: u32,
+    pub frame_total: u32,
     pub size_bytes: u64,
     pub done_bytes: u64,
     pub remaining_bytes: u64,
@@ -896,8 +899,8 @@ async fn load_export_job(
         LEFT JOIN LATERAL (
             SELECT COUNT(*) AS object_count,
                    COUNT(*) FILTER (WHERE status = 'EXPORTED') AS copied_count,
-                   COALESCE(SUM(chunk_size_bytes), 0) AS total_bytes,
-                   COALESCE(SUM(chunk_size_bytes) FILTER (WHERE status = 'EXPORTED'), 0) AS copied_bytes
+                   COALESCE(SUM(size_bytes), 0) AS total_bytes,
+                   COALESCE(SUM(size_bytes) FILTER (WHERE status = 'EXPORTED'), 0) AS copied_bytes
             FROM export_object
             WHERE export_job_id = ej.export_job_id
         ) objects ON TRUE
@@ -1178,8 +1181,8 @@ async fn load_export_job_disks(
             dr.error_message,
             COUNT(*) AS object_total,
             COUNT(*) FILTER (WHERE eo.status = 'EXPORTED') AS object_done,
-            COALESCE(SUM(eo.chunk_size_bytes), 0)::bigint AS total_bytes,
-            COALESCE(SUM(CASE WHEN eo.status = 'EXPORTED' THEN eo.chunk_size_bytes ELSE 0 END), 0)::bigint AS done_bytes
+            COALESCE(SUM(eo.size_bytes), 0)::bigint AS total_bytes,
+            COALESCE(SUM(CASE WHEN eo.status = 'EXPORTED' THEN eo.size_bytes ELSE 0 END), 0)::bigint AS done_bytes
         FROM export_object eo
         LEFT JOIN disk_runtime dr ON dr.disk_id = eo.disk_id
         WHERE eo.export_job_id = $1
@@ -1396,7 +1399,7 @@ async fn assigned_copy_progress_disk(
             disk.capacity_bytes,
             batch
                 .iter()
-                .map(|object| object.chunk_size_bytes.max(0) as u64)
+                .map(|object| object.size_bytes.max(0) as u64)
                 .sum(),
             batch.len() as u64,
             disk.free_bytes,
@@ -1557,10 +1560,13 @@ fn enrich_disks_from_copy_progress(
                 .current_object
                 .as_ref()
                 .map(|current| DashboardCurrentObject {
+                    object_id: current.object_id.clone(),
                     bucket: current.bucket.clone(),
                     key: current.key.clone(),
                     display_name: current.display_name.clone(),
-                    relative_data_path: current.relative_data_path.clone(),
+                    storage_mode: current.storage_mode.clone(),
+                    frame_index: current.frame_index,
+                    frame_total: current.frame_total,
                     size_bytes: current.size_bytes,
                     done_bytes: current.done_bytes,
                     remaining_bytes: current.remaining_bytes,
@@ -1656,7 +1662,7 @@ fn disk_runtime_message(
 fn assigned_bytes(objects: &[AssignedExportObject]) -> u64 {
     objects
         .iter()
-        .map(|object| object.chunk_size_bytes.max(0) as u64)
+        .map(|object| object.size_bytes.max(0) as u64)
         .sum()
 }
 
@@ -1764,7 +1770,7 @@ fn ensure_recovery_object_guard(object_guard: &RecoveryObjectGuard) -> Result<()
     if object_guard.dirty_count != 0 {
         return Err(ControlError::conflict(
             "EXPORT_OBJECT_ALREADY_WRITTEN",
-            "one or more export objects already has hash, nonce, partial, data, or metadata fields",
+            "one or more export objects already has pack, frame, nonce, partial, or metadata fields",
         ));
     }
     Ok(())
@@ -1790,17 +1796,21 @@ async fn load_recovery_object_guard(
           COUNT(*) FILTER (WHERE disk_id IS NULL) AS null_disk_count,
           COUNT(*) FILTER (
             WHERE plaintext_sha256 IS NOT NULL
-               OR ciphertext_sha256 IS NOT NULL
-               OR ciphertext_size_bytes IS NOT NULL
-               OR encryption_alg IS NOT NULL
                OR data_key_id IS NOT NULL
-               OR nonce IS NOT NULL
-               OR tag IS NOT NULL
-               OR aad IS NOT NULL
-               OR chunk_sha256 IS NOT NULL
+               OR pack_path IS NOT NULL
+               OR pack_index_path IS NOT NULL
+               OR pack_ciphertext_size_bytes IS NOT NULL
+               OR pack_nonce IS NOT NULL
+               OR pack_tag IS NOT NULL
+               OR pack_aad IS NOT NULL
+               OR pack_ciphertext_sha256 IS NOT NULL
                OR partial_path IS NOT NULL
-               OR relative_data_path IS NOT NULL
                OR relative_meta_path IS NOT NULL
+               OR EXISTS (
+                    SELECT 1
+                    FROM export_object_frame AS eof
+                    WHERE eof.export_object_id = export_object.id
+               )
           ) AS dirty_count
         FROM export_object
         WHERE export_job_id = $1

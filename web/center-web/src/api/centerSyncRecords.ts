@@ -16,9 +16,10 @@ export interface CenterSyncRecord {
   source_etag?: string;
   source_size_bytes: number;
   source_last_modified?: string;
+  storage_mode: "PACK" | "FRAMES";
+  frame_total: number;
   plaintext_sha256?: string;
-  ciphertext_sha256?: string;
-  chunk_group_id?: string;
+  pack_ciphertext_sha256?: string;
   import_bucket: string;
   import_key: string;
   export_job_id?: string;
@@ -47,15 +48,12 @@ interface CenterSyncRecordsWireResponse {
   page?: number;
   page_size?: number;
   total?: number;
-  total_count?: number;
   items?: Partial<CenterSyncRecord>[];
-  records?: Partial<CenterSyncRecord>[];
   edges?: CenterEdgeOption[];
 }
 
 interface CenterEdgeOptionsWireResponse {
   items?: CenterEdgeOption[];
-  records?: CenterEdgeOption[];
   edges?: CenterEdgeOption[];
 }
 
@@ -81,7 +79,7 @@ export async function fetchCenterEdgeOptions(): Promise<CenterEdgeOption[]> {
     localPath(centerEdgeOptionsPath(), "/api/center/edge-sites"),
   );
   if (Array.isArray(payload)) return payload.map(normalizeEdgeOption).filter((edge) => edge.edge_code);
-  return (payload.edges ?? payload.items ?? payload.records ?? [])
+  return (payload.edges ?? payload.items ?? [])
     .map(normalizeEdgeOption)
     .filter((edge) => edge.edge_code);
 }
@@ -102,8 +100,8 @@ export function normalizeSyncRecordsResponse(
   return {
     page: numberValue(payload.page, query.page),
     page_size: numberValue(payload.page_size, query.page_size),
-    total: numberValue(payload.total ?? payload.total_count),
-    items: (payload.items ?? payload.records ?? []).map(normalizeSyncRecord),
+    total: numberValue(payload.total),
+    items: (payload.items ?? []).map(normalizeSyncRecord),
     edges: payload.edges?.map(normalizeEdgeOption).filter((edge) => edge.edge_code),
   };
 }
@@ -129,9 +127,10 @@ function normalizeSyncRecord(payload: Partial<CenterSyncRecord>): CenterSyncReco
     source_etag: payload.source_etag,
     source_size_bytes: numberValue(payload.source_size_bytes),
     source_last_modified: payload.source_last_modified,
+    storage_mode: payload.storage_mode ?? "PACK",
+    frame_total: numberValue(payload.frame_total),
     plaintext_sha256: payload.plaintext_sha256,
-    ciphertext_sha256: payload.ciphertext_sha256,
-    chunk_group_id: payload.chunk_group_id,
+    pack_ciphertext_sha256: payload.pack_ciphertext_sha256,
     import_bucket: payload.import_bucket ?? "",
     import_key: payload.import_key ?? "",
     export_job_id: payload.export_job_id,

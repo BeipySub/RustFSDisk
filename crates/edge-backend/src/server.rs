@@ -885,10 +885,13 @@ mod tests {
                         percent: 10.1010101010101,
                     },
                     current_object: Some(DashboardCurrentObject {
+                        object_id: Uuid::new_v4().to_string(),
                         bucket: "test".to_string(),
                         key: "alpha.bin".to_string(),
                         display_name: "alpha.bin".to_string(),
-                        relative_data_path: "alpha.bin".to_string(),
+                        storage_mode: "PACK".to_string(),
+                        frame_index: 0,
+                        frame_total: 0,
                         size_bytes: 99,
                         done_bytes: 10,
                         remaining_bytes: 89,
@@ -1429,9 +1432,12 @@ mod tests {
         );
         progress.start_object(
             "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
             "bucket-a",
             "alpha.bin",
-            "data/alpha.bin",
+            "PACK",
+            0,
+            0,
             99,
         );
         progress.complete_object("11111111-1111-1111-1111-111111111111");

@@ -16,8 +16,8 @@ use crate::error::{TransferError, TransferErrorCode, TransferResult};
 use std::fs::File;
 
 pub const PROTOCOL_NAME: &str = "rustfs-offline-transfer";
-pub const PROTOCOL_VERSION: &str = "1.0.0";
-pub const MANIFEST_VERSION: &str = "1.0.0";
+pub const PROTOCOL_VERSION: &str = "2.0.0";
+pub const MANIFEST_VERSION: &str = "2.0.0";
 pub const TRANSFER_ROOT: &str = "/rustfs-transfer/";
 pub const PROTOCOL_ROOT_DIR: &str = "rustfs-transfer";
 pub const DISK_INFO_PATH: &str = "disk_info.json";
@@ -26,6 +26,8 @@ pub const EXPORT_MANIFEST_SHA256_PATH: &str = "manifests/export_manifest.sha256"
 pub const MANIFEST_PATH: &str = EXPORT_MANIFEST_PATH;
 pub const MANIFEST_SHA256_PATH: &str = EXPORT_MANIFEST_SHA256_PATH;
 pub const DATA_DIR: &str = "data";
+pub const PACKS_DIR: &str = "packs";
+pub const FRAMES_DIR: &str = "frames";
 pub const META_DIR: &str = "meta";
 pub const MANIFESTS_DIR: &str = "manifests";
 pub const LOGS_DIR: &str = "logs";
@@ -131,6 +133,22 @@ pub enum ChunkImportPartStatus {
     Verified,
     Merged,
     Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum StorageMode {
+    Pack,
+    Frames,
+}
+
+impl StorageMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pack => "PACK",
+            Self::Frames => "FRAMES",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -278,26 +296,19 @@ pub struct ExportManifest {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ManifestObject {
+    pub object_id: String,
     pub bucket: String,
     pub key: String,
-    pub relative_data_path: String,
-    pub encrypted: bool,
-    pub encryption_alg: String,
+    pub storage_mode: StorageMode,
     pub data_key_id: String,
-    pub nonce: String,
-    pub tag: String,
-    pub aad: String,
-    pub ciphertext_size_bytes: u64,
-    pub ciphertext_sha256: String,
-    pub chunked: bool,
-    pub chunk_group_id: String,
-    pub chunk_index: u32,
-    pub chunk_total: u32,
-    pub chunk_offset_bytes: u64,
-    pub chunk_size_bytes: u64,
-    pub chunk_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pack_ref: Option<ManifestPackRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frames: Vec<ManifestFrameRef>,
+    pub frame_total: u32,
     pub relative_meta_path: String,
     pub size_bytes: u64,
+    pub estimated_landing_bytes: u64,
     pub etag: String,
     pub last_modified: String,
     pub content_type: String,
@@ -305,6 +316,32 @@ pub struct ManifestObject {
     pub plaintext_sha256: String,
     pub exported_at: String,
     pub object_status: ObjectStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ManifestPackRef {
+    pub pack_path: String,
+    pub pack_index_path: String,
+    pub pack_offset_bytes: u64,
+    pub ciphertext_size_bytes: u64,
+    pub nonce: String,
+    pub tag: String,
+    pub aad: String,
+    pub ciphertext_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ManifestFrameRef {
+    pub frame_index: u32,
+    pub frame_total: u32,
+    pub frame_offset_bytes: u64,
+    pub frame_size_bytes: u64,
+    pub relative_frame_path: String,
+    pub ciphertext_size_bytes: u64,
+    pub nonce: String,
+    pub tag: String,
+    pub aad: String,
+    pub ciphertext_sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -434,7 +471,10 @@ pub struct DiskCopyProgress {
     pub total_bytes: u64,
     pub done_bytes: u64,
     pub remaining_bytes: u64,
+    pub capacity_bytes: u64,
     pub free_bytes: u64,
+    pub reserve_bytes: u64,
+    pub object_budget_bytes: u64,
     pub speed_bytes_per_sec: u64,
     pub object_total: u64,
     pub object_done: u64,
@@ -453,6 +493,10 @@ pub struct DiskImportProgress {
     pub total_bytes: u64,
     pub done_bytes: u64,
     pub remaining_bytes: u64,
+    pub capacity_bytes: u64,
+    pub free_bytes: u64,
+    pub reserve_bytes: u64,
+    pub object_budget_bytes: u64,
     pub speed_bytes_per_sec: u64,
     pub object_total: u64,
     pub object_done: u64,
@@ -465,14 +509,17 @@ pub struct DiskImportProgress {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CurrentObjectProgress {
+    pub object_id: String,
+    pub storage_mode: StorageMode,
     pub bucket: String,
     pub key: String,
     pub display_name: String,
-    pub relative_data_path: String,
     pub size_bytes: u64,
     pub done_bytes: u64,
     pub remaining_bytes: u64,
     pub speed_bytes_per_sec: u64,
+    pub frame_index: u32,
+    pub frame_total: u32,
     pub object_status: ObjectStatus,
 }
 
@@ -508,6 +555,8 @@ impl TransferDisk {
     pub fn ensure_layout(&self) -> TransferResult<()> {
         for relative in [
             DATA_DIR,
+            PACKS_DIR,
+            FRAMES_DIR,
             META_DIR,
             MANIFESTS_DIR,
             LOGS_DIR,
@@ -582,11 +631,18 @@ impl TransferDisk {
 
     pub fn write_object_atomic(
         &self,
-        relative_data_path: &str,
+        relative_object_path: &str,
         bytes: &[u8],
     ) -> TransferResult<()> {
-        require_under(relative_data_path, DATA_DIR)?;
-        self.write_bytes_atomic(relative_data_path, bytes, TempFileKind::ObjectPartial)
+        let normalized = relative_object_path.replace('\\', "/");
+        if !(normalized.starts_with(&format!("{PACKS_DIR}/"))
+            || normalized.starts_with(&format!("{FRAMES_DIR}/")))
+        {
+            return Err(manifest_invalid(
+                "object data path must be under packs/ or frames/",
+            ));
+        }
+        self.write_bytes_atomic(relative_object_path, bytes, TempFileKind::ObjectPartial)
     }
 
     pub fn scan_partials(&self) -> TransferResult<PartialScan> {
@@ -728,16 +784,58 @@ pub fn validate_relative_path(relative_path: &str) -> TransferResult<()> {
 }
 
 pub fn validate_manifest(manifest: &ExportManifest) -> TransferResult<()> {
+    if manifest.manifest_version != MANIFEST_VERSION {
+        return Err(manifest_invalid("manifest_version must be 2.0.0"));
+    }
     for object in &manifest.objects {
         if object.object_status != ObjectStatus::Exported {
             return Err(manifest_invalid(
                 "only EXPORTED objects are allowed in export_manifest.json",
             ));
         }
-        require_under(&object.relative_data_path, DATA_DIR)?;
         require_under(&object.relative_meta_path, META_DIR)?;
-        reject_partial_path(&object.relative_data_path)?;
         reject_partial_path(&object.relative_meta_path)?;
+        match object.storage_mode {
+            StorageMode::Pack => {
+                if object.frame_total != 0 {
+                    return Err(manifest_invalid("PACK object frame_total must be 0"));
+                }
+                if !object.frames.is_empty() {
+                    return Err(manifest_invalid("PACK object frames must be empty"));
+                }
+                let pack_ref = object
+                    .pack_ref
+                    .as_ref()
+                    .ok_or_else(|| manifest_invalid("PACK object must contain pack_ref"))?;
+                require_under(&pack_ref.pack_path, PACKS_DIR)?;
+                require_under(&pack_ref.pack_index_path, PACKS_DIR)?;
+                reject_partial_path(&pack_ref.pack_path)?;
+                reject_partial_path(&pack_ref.pack_index_path)?;
+            }
+            StorageMode::Frames => {
+                if object.pack_ref.is_some() {
+                    return Err(manifest_invalid("FRAMES object pack_ref must be null"));
+                }
+                if object.frame_total == 0 {
+                    return Err(manifest_invalid(
+                        "FRAMES object frame_total must be greater than 0",
+                    ));
+                }
+                if object.frames.len() != object.frame_total as usize {
+                    return Err(manifest_invalid("FRAMES object frames length mismatch"));
+                }
+                for frame in &object.frames {
+                    if frame.frame_total != object.frame_total {
+                        return Err(manifest_invalid("frame_total mismatch"));
+                    }
+                    if frame.frame_index >= object.frame_total {
+                        return Err(manifest_invalid("frame_index out of range"));
+                    }
+                    require_under(&frame.relative_frame_path, FRAMES_DIR)?;
+                    reject_partial_path(&frame.relative_frame_path)?;
+                }
+            }
+        }
     }
     Ok(())
 }

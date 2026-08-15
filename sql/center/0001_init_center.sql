@@ -164,9 +164,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_import_job_seal_active_or_done
   WHERE status IN ('PENDING', 'IMPORTING', 'DONE');
 CREATE INDEX IF NOT EXISTS idx_import_job_seal_manifest ON import_job(disk_id, seal_id, manifest_sha256);
 
-CREATE TABLE IF NOT EXISTS chunk_import_group (
+CREATE TABLE IF NOT EXISTS object_frame_import (
   id BIGSERIAL PRIMARY KEY,
-  chunk_group_id UUID NOT NULL,
+  object_id UUID NOT NULL,
   edge_code VARCHAR(255) NOT NULL,
   source_bucket VARCHAR(255) NOT NULL,
   source_key TEXT NOT NULL,
@@ -174,103 +174,67 @@ CREATE TABLE IF NOT EXISTS chunk_import_group (
   source_size_bytes BIGINT NOT NULL,
   source_last_modified TIMESTAMP NOT NULL,
   plaintext_sha256 VARCHAR(64) NOT NULL,
-  chunk_total INTEGER NOT NULL,
-  received_count INTEGER NOT NULL DEFAULT 0,
-  received_bytes BIGINT NOT NULL DEFAULT 0,
-  status VARCHAR(32) NOT NULL,
-  import_bucket VARCHAR(255),
-  import_key TEXT,
-  created_at TIMESTAMP NOT NULL DEFAULT (NOW() AT TIME ZONE 'UTC'),
-  updated_at TIMESTAMP NOT NULL DEFAULT (NOW() AT TIME ZONE 'UTC'),
-  finish_time TIMESTAMP,
-  error_code VARCHAR(64),
-  error_message TEXT,
-  CONSTRAINT ck_chunk_import_group_status CHECK (status IN ('WAITING_PARTS', 'READY_TO_MERGE', 'MERGING', 'DONE', 'FAILED', 'CANCELLED')),
-  CONSTRAINT ck_chunk_import_group_chunk_total CHECK (chunk_total > 1 AND chunk_total <= 1000000)
-);
-
-COMMENT ON TABLE chunk_import_group IS '跨盘大对象导入聚合状态表；全部分块到齐并校验后才能合并导入。';
-COMMENT ON COLUMN chunk_import_group.id IS '数据库自增主键。';
-COMMENT ON COLUMN chunk_import_group.chunk_group_id IS '跨盘分块对象的聚合组 ID。';
-COMMENT ON COLUMN chunk_import_group.edge_code IS '分块对象来源边缘站点编码。';
-COMMENT ON COLUMN chunk_import_group.source_bucket IS '源 RustFS bucket 名称。';
-COMMENT ON COLUMN chunk_import_group.source_key IS '源 RustFS object key。';
-COMMENT ON COLUMN chunk_import_group.source_etag IS '源对象 ETag。';
-COMMENT ON COLUMN chunk_import_group.source_size_bytes IS '源对象总字节数。';
-COMMENT ON COLUMN chunk_import_group.source_last_modified IS '源对象 last_modified，归一化为 UTC。';
-COMMENT ON COLUMN chunk_import_group.plaintext_sha256 IS '源对象整体明文 SHA256；所有分块解密合并后必须校验该值。';
-COMMENT ON COLUMN chunk_import_group.chunk_total IS '该源对象被拆分出的分块总数。';
-COMMENT ON COLUMN chunk_import_group.received_count IS '中控已接收并登记的有效分块数量。';
-COMMENT ON COLUMN chunk_import_group.received_bytes IS '中控已接收并登记的有效分块总字节数。';
-COMMENT ON COLUMN chunk_import_group.status IS '跨盘分块聚合状态；WAITING_PARTS 表示等待分块，READY_TO_MERGE 表示分块到齐待合并，MERGING 表示合并上传中，DONE 表示已导入并写账本，FAILED 表示聚合或合并失败，CANCELLED 表示取消。';
-COMMENT ON COLUMN chunk_import_group.import_bucket IS '中控 RustFS 归档 bucket；分块到齐后导入使用。';
-COMMENT ON COLUMN chunk_import_group.import_key IS '中控 RustFS 导入 object key；分块到齐后导入使用。';
-COMMENT ON COLUMN chunk_import_group.created_at IS '首次发现分块的 UTC 时间。';
-COMMENT ON COLUMN chunk_import_group.updated_at IS '聚合组最近更新的 UTC 时间。';
-COMMENT ON COLUMN chunk_import_group.finish_time IS '合并导入完成、失败或取消的 UTC 时间。';
-COMMENT ON COLUMN chunk_import_group.error_code IS '聚合失败时的标准错误码，例如 MANIFEST_INVALID、CHECKSUM_MISMATCH、DECRYPT_FAILED、NONCE_REUSED。';
-COMMENT ON COLUMN chunk_import_group.error_message IS '分块聚合失败或异常时的错误说明。';
-
-CREATE UNIQUE INDEX IF NOT EXISTS uq_chunk_import_group_id ON chunk_import_group(chunk_group_id);
-CREATE INDEX IF NOT EXISTS idx_chunk_import_group_status ON chunk_import_group(status, updated_at);
-
-CREATE TABLE IF NOT EXISTS chunk_import_part (
-  id BIGSERIAL PRIMARY KEY,
-  chunk_group_id UUID NOT NULL,
-  chunk_index INTEGER NOT NULL,
-  chunk_total INTEGER NOT NULL,
-  chunk_offset_bytes BIGINT NOT NULL,
-  chunk_size_bytes BIGINT NOT NULL,
-  chunk_sha256 VARCHAR(64) NOT NULL,
+  frame_index INTEGER NOT NULL,
+  frame_total INTEGER NOT NULL,
+  frame_offset_bytes BIGINT NOT NULL,
+  frame_size_bytes BIGINT NOT NULL,
+  relative_frame_path TEXT NOT NULL,
+  ciphertext_size_bytes BIGINT NOT NULL,
   ciphertext_sha256 VARCHAR(64) NOT NULL,
-  plaintext_sha256 VARCHAR(64) NOT NULL,
   data_key_id UUID NOT NULL,
   nonce VARCHAR(255) NOT NULL,
   tag VARCHAR(255) NOT NULL,
   aad TEXT NOT NULL,
   disk_id UUID NOT NULL,
   seal_id UUID NOT NULL,
+  export_job_id UUID NOT NULL,
   import_job_id UUID NOT NULL,
-  relative_data_path TEXT NOT NULL,
-  staged_ciphertext_path TEXT NOT NULL,
-  staged_ciphertext_sha256 VARCHAR(64) NOT NULL,
-  status VARCHAR(32) NOT NULL,
-  registered_at TIMESTAMP NOT NULL DEFAULT (NOW() AT TIME ZONE 'UTC'),
+  staged_plaintext_path TEXT NOT NULL,
+  staged_plaintext_sha256 VARCHAR(64) NOT NULL,
+  status VARCHAR(32) NOT NULL DEFAULT 'VERIFIED',
+  import_bucket VARCHAR(255),
+  import_key TEXT,
+  created_at TIMESTAMP NOT NULL DEFAULT (NOW() AT TIME ZONE 'UTC'),
+  updated_at TIMESTAMP NOT NULL DEFAULT (NOW() AT TIME ZONE 'UTC'),
   verified_at TIMESTAMP,
+  merged_at TIMESTAMP,
   error_code VARCHAR(64),
   error_message TEXT,
-  CONSTRAINT ck_chunk_import_part_status CHECK (status IN ('REGISTERED', 'VERIFIED', 'MERGED', 'FAILED'))
+  CONSTRAINT ck_object_frame_import_status CHECK (status IN ('VERIFIED', 'MERGED', 'FAILED')),
+  CONSTRAINT ck_object_frame_import_index CHECK (frame_index >= 0 AND frame_index < frame_total)
 );
 
-COMMENT ON TABLE chunk_import_part IS '跨盘大对象分块明细表；同一 chunk_group_id + chunk_index 只能登记一次。';
-COMMENT ON COLUMN chunk_import_part.id IS '数据库自增主键。';
-COMMENT ON COLUMN chunk_import_part.chunk_group_id IS '所属跨盘分块对象聚合组 ID。';
-COMMENT ON COLUMN chunk_import_part.chunk_index IS '当前分块序号，从 0 开始。';
-COMMENT ON COLUMN chunk_import_part.chunk_total IS '该源对象的分块总数。';
-COMMENT ON COLUMN chunk_import_part.chunk_offset_bytes IS '当前分块在源对象中的起始偏移字节数。';
-COMMENT ON COLUMN chunk_import_part.chunk_size_bytes IS '当前分块明文字节数。';
-COMMENT ON COLUMN chunk_import_part.chunk_sha256 IS '当前分块密文 SHA256；与 manifest objects[].chunk_sha256 或 ciphertext_sha256 一致。';
-COMMENT ON COLUMN chunk_import_part.ciphertext_sha256 IS '密文文件 SHA256；中控读取分块文件后必须校验。';
-COMMENT ON COLUMN chunk_import_part.plaintext_sha256 IS '源对象整体明文 SHA256；用于和分组表核对。';
-COMMENT ON COLUMN chunk_import_part.data_key_id IS '数据加密密钥编号；用于解密和 nonce 唯一性校验。';
-COMMENT ON COLUMN chunk_import_part.nonce IS 'AES-GCM nonce；同一 data_key_id + nonce 在分块明细中必须唯一。';
-COMMENT ON COLUMN chunk_import_part.tag IS 'AES-GCM 认证标签；用于认证密文未被篡改。';
-COMMENT ON COLUMN chunk_import_part.aad IS 'AES-GCM 附加认证数据；必须与 manifest 记录一致。';
-COMMENT ON COLUMN chunk_import_part.disk_id IS '携带该分块的运输盘逻辑 ID。';
-COMMENT ON COLUMN chunk_import_part.seal_id IS '携带该分块的运输盘封盘批次 ID。';
-COMMENT ON COLUMN chunk_import_part.import_job_id IS '登记该分块的中控导入任务业务 ID。';
-COMMENT ON COLUMN chunk_import_part.relative_data_path IS '分块密文文件相对 /rustfs-transfer/ 的路径。';
-COMMENT ON COLUMN chunk_import_part.staged_ciphertext_path IS '中控端本地暂存密文路径，相对 /var/lib/rustfs-transfer/chunks/。';
-COMMENT ON COLUMN chunk_import_part.staged_ciphertext_sha256 IS '中控端暂存密文 SHA256；必须与 ciphertext_sha256 一致。';
-COMMENT ON COLUMN chunk_import_part.status IS '分块状态；REGISTERED 表示已登记，VERIFIED 表示密文校验和解密认证通过且已暂存，MERGED 表示已参与合并导入，FAILED 表示分块失败。';
-COMMENT ON COLUMN chunk_import_part.registered_at IS '分块登记的 UTC 时间。';
-COMMENT ON COLUMN chunk_import_part.verified_at IS '分块校验完成的 UTC 时间。';
-COMMENT ON COLUMN chunk_import_part.error_code IS '分块失败时的标准错误码。';
-COMMENT ON COLUMN chunk_import_part.error_message IS '分块失败时的错误说明。';
+COMMENT ON TABLE object_frame_import IS '中控端 FRAMES 对象 frame 导入账本；全部 frame 到齐后合并上传并写入 object_ledger。';
+COMMENT ON COLUMN object_frame_import.object_id IS 'FRAMES 对象业务 ID。';
+COMMENT ON COLUMN object_frame_import.frame_index IS '当前 frame 序号，从 0 开始。';
+COMMENT ON COLUMN object_frame_import.frame_total IS '对象 frame 总数。';
+COMMENT ON COLUMN object_frame_import.staged_plaintext_path IS 'Center 本地已解密 frame 暂存路径；不写入运输盘或前端响应。';
 
-CREATE UNIQUE INDEX IF NOT EXISTS uq_chunk_import_part_group_index ON chunk_import_part(chunk_group_id, chunk_index);
-CREATE UNIQUE INDEX IF NOT EXISTS uq_chunk_import_part_data_key_nonce ON chunk_import_part(data_key_id, nonce);
-CREATE INDEX IF NOT EXISTS idx_chunk_import_part_job ON chunk_import_part(import_job_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_object_frame_import_object_index
+  ON object_frame_import(export_job_id, object_id, frame_index);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_object_frame_import_data_key_nonce
+  ON object_frame_import(data_key_id, nonce);
+CREATE INDEX IF NOT EXISTS idx_object_frame_import_merge
+  ON object_frame_import(export_job_id, object_id, status, frame_index);
+
+CREATE TABLE IF NOT EXISTS import_nonce_ledger (
+  id BIGSERIAL PRIMARY KEY,
+  data_key_id UUID NOT NULL,
+  nonce VARCHAR(255) NOT NULL,
+  disk_id UUID NOT NULL,
+  seal_id UUID NOT NULL,
+  export_job_id UUID NOT NULL,
+  object_id UUID NOT NULL,
+  storage_mode VARCHAR(16) NOT NULL,
+  frame_index INTEGER,
+  import_job_id UUID NOT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT (NOW() AT TIME ZONE 'UTC')
+);
+
+COMMENT ON TABLE import_nonce_ledger IS '中控导入 nonce 账本；保证同一 data_key_id + nonce 历史唯一。';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_import_nonce_ledger_data_key_nonce
+  ON import_nonce_ledger(data_key_id, nonce);
 
 CREATE TABLE IF NOT EXISTS object_ledger (
   id BIGSERIAL PRIMARY KEY,
@@ -281,10 +245,11 @@ CREATE TABLE IF NOT EXISTS object_ledger (
   source_size_bytes BIGINT NOT NULL,
   source_last_modified TIMESTAMP NOT NULL,
   plaintext_sha256 VARCHAR(64) NOT NULL,
-  ciphertext_sha256 VARCHAR(64),
-  chunk_group_id UUID,
+  storage_mode VARCHAR(16) NOT NULL DEFAULT 'PACK',
+  frame_total INTEGER NOT NULL DEFAULT 0,
+  pack_ciphertext_sha256 VARCHAR(64),
   data_key_id UUID,
-  nonce VARCHAR(255),
+  pack_nonce VARCHAR(255),
   import_bucket VARCHAR(255) NOT NULL,
   import_key TEXT NOT NULL,
   export_job_id UUID NOT NULL,
@@ -301,10 +266,11 @@ COMMENT ON COLUMN object_ledger.source_etag IS '源对象 ETag。';
 COMMENT ON COLUMN object_ledger.source_size_bytes IS '源对象字节数。';
 COMMENT ON COLUMN object_ledger.source_last_modified IS '源对象 last_modified，归一化为 UTC。';
 COMMENT ON COLUMN object_ledger.plaintext_sha256 IS '源对象明文 SHA256；用于审计和内容完整性校验。';
-COMMENT ON COLUMN object_ledger.ciphertext_sha256 IS '运输盘密文文件 SHA256；中控导入前校验运输盘文件完整性。';
-COMMENT ON COLUMN object_ledger.chunk_group_id IS '跨盘分块组 ID；普通对象为空，跨盘对象必填。';
-COMMENT ON COLUMN object_ledger.data_key_id IS '普通对象使用的数据加密密钥编号；跨盘对象在 chunk_import_part 中逐分块记录。';
-COMMENT ON COLUMN object_ledger.nonce IS '普通对象 AES-GCM nonce；跨盘对象在 chunk_import_part 中逐分块记录。';
+COMMENT ON COLUMN object_ledger.storage_mode IS '对象导入时的 v2 存储模式，取值 PACK 或 FRAMES。';
+COMMENT ON COLUMN object_ledger.frame_total IS 'FRAMES 对象 frame 总数；PACK 固定为 0。';
+COMMENT ON COLUMN object_ledger.pack_ciphertext_sha256 IS 'PACK 对象密文 SHA256；FRAMES 对象逐 frame 记录在 object_frame_import。';
+COMMENT ON COLUMN object_ledger.data_key_id IS 'PACK 对象使用的数据加密密钥编号；FRAMES 对象在 object_frame_import 中逐 frame 记录。';
+COMMENT ON COLUMN object_ledger.pack_nonce IS 'PACK 对象 AES-GCM nonce；FRAMES 对象在 object_frame_import 中逐 frame 记录。';
 COMMENT ON COLUMN object_ledger.import_bucket IS '中控 RustFS 归档 bucket 名称，例如 archive-site001。';
 COMMENT ON COLUMN object_ledger.import_key IS '中控 RustFS 导入 object key。';
 COMMENT ON COLUMN object_ledger.export_job_id IS '边缘端导出任务业务 ID；来自 manifest 或 disk_info.json。';
@@ -312,11 +278,8 @@ COMMENT ON COLUMN object_ledger.import_job_id IS '成功导入该对象的导入
 COMMENT ON COLUMN object_ledger.imported_at IS '对象上传成功且账本写入成功的 UTC 时间。';
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_object_ledger_data_key_nonce
-  ON object_ledger(data_key_id, nonce)
-  WHERE data_key_id IS NOT NULL AND nonce IS NOT NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS uq_object_ledger_chunk_group
-  ON object_ledger(chunk_group_id)
-  WHERE chunk_group_id IS NOT NULL;
+  ON object_ledger(data_key_id, pack_nonce)
+  WHERE data_key_id IS NOT NULL AND pack_nonce IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_object_ledger_source_version
   ON object_ledger(edge_code, source_bucket, source_key, source_etag, source_size_bytes, source_last_modified);
 CREATE INDEX IF NOT EXISTS idx_object_ledger_import_job ON object_ledger(import_job_id);

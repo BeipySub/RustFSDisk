@@ -19,6 +19,7 @@ type HmacSha256 = Hmac<Sha256>;
 pub const AES_256_GCM_KEY_LEN: usize = 32;
 pub const AES_GCM_NONCE_LEN: usize = 12;
 pub const AES_GCM_TAG_LEN: usize = 16;
+pub const DISK_DATA_KEY_KDF_DOMAIN_V2: &str = "rustfs-transfer:offline-disk-data-key:v2";
 
 const QUERY_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b' ')
@@ -141,16 +142,32 @@ pub struct AesGcmCiphertext {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ObjectAad<'a> {
+pub struct PackObjectAad<'a> {
     pub disk_id: &'a str,
     pub seal_id: &'a str,
     pub export_job_id: &'a str,
+    pub object_id: &'a str,
     pub bucket: &'a str,
     pub object_key: &'a str,
-    pub chunk_group_id: Option<&'a str>,
-    pub chunk_index: u32,
-    pub chunk_total: u32,
-    pub chunk_offset_bytes: u64,
+    pub pack_path: &'a str,
+    pub pack_offset_bytes: u64,
+    pub plaintext_sha256: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameObjectAad<'a> {
+    pub disk_id: &'a str,
+    pub seal_id: &'a str,
+    pub export_job_id: &'a str,
+    pub object_id: &'a str,
+    pub bucket: &'a str,
+    pub object_key: &'a str,
+    pub frame_index: u32,
+    pub frame_total: u32,
+    pub frame_offset_bytes: u64,
+    pub frame_size_bytes: u64,
+    pub relative_frame_path: &'a str,
+    pub plaintext_sha256: &'a str,
 }
 
 pub fn sha256_lower_hex(bytes: &[u8]) -> String {
@@ -256,7 +273,7 @@ pub fn derive_disk_data_key_from_edge_key(
         return Err(CryptoError::EmptyEdgeKey);
     }
     let message = format!(
-        "rustfs-transfer:offline-disk-data-key:v1\nedge_code={}\ndisk_id={}\ndata_key_id={}\nexport_job_id={}\nseal_id={}",
+        "{DISK_DATA_KEY_KDF_DOMAIN_V2}\nedge_code={}\ndisk_id={}\ndata_key_id={}\nexport_job_id={}\nseal_id={}",
         edge_code.trim(),
         disk_id,
         data_key_id,
@@ -335,7 +352,7 @@ pub fn verify_center_signature<T: Serialize>(
     }
 }
 
-fn canonical_json(value: &Value) -> String {
+pub fn canonical_json(value: &Value) -> String {
     match value {
         Value::Null => "null".to_string(),
         Value::Bool(value) => value.to_string(),
@@ -371,19 +388,38 @@ fn canonical_number(number: &Number) -> String {
     number.to_string()
 }
 
-pub fn object_aad(aad: ObjectAad<'_>) -> Vec<u8> {
-    format!(
-        "disk_id={};seal_id={};export_job_id={};bucket={};key={};chunk_group_id={};chunk_index={};chunk_total={};chunk_offset_bytes={}",
-        aad.disk_id,
-        aad.seal_id,
-        aad.export_job_id,
-        aad.bucket,
-        aad.object_key,
-        aad.chunk_group_id.unwrap_or_default(),
-        aad.chunk_index,
-        aad.chunk_total,
-        aad.chunk_offset_bytes
-    )
+pub fn pack_object_aad(aad: PackObjectAad<'_>) -> Vec<u8> {
+    canonical_json(&json!({
+        "aad_type": "PACK_OBJECT",
+        "disk_id": aad.disk_id,
+        "seal_id": aad.seal_id,
+        "export_job_id": aad.export_job_id,
+        "object_id": aad.object_id,
+        "bucket": aad.bucket,
+        "key": aad.object_key,
+        "pack_path": aad.pack_path,
+        "pack_offset_bytes": aad.pack_offset_bytes,
+        "plaintext_sha256": aad.plaintext_sha256
+    }))
+    .into_bytes()
+}
+
+pub fn frame_object_aad(aad: FrameObjectAad<'_>) -> Vec<u8> {
+    canonical_json(&json!({
+        "aad_type": "FRAME_OBJECT",
+        "disk_id": aad.disk_id,
+        "seal_id": aad.seal_id,
+        "export_job_id": aad.export_job_id,
+        "object_id": aad.object_id,
+        "bucket": aad.bucket,
+        "key": aad.object_key,
+        "frame_index": aad.frame_index,
+        "frame_total": aad.frame_total,
+        "frame_offset_bytes": aad.frame_offset_bytes,
+        "frame_size_bytes": aad.frame_size_bytes,
+        "relative_frame_path": aad.relative_frame_path,
+        "plaintext_sha256": aad.plaintext_sha256
+    }))
     .into_bytes()
 }
 

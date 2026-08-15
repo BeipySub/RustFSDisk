@@ -63,67 +63,64 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_export_job_business_id ON export_job(export
 
 CREATE TABLE IF NOT EXISTS export_object (
   id BIGSERIAL PRIMARY KEY,
+  object_id UUID NOT NULL,
   export_job_id UUID NOT NULL,
   disk_id UUID,
   bucket VARCHAR(255) NOT NULL,
   object_key TEXT NOT NULL,
+  storage_mode VARCHAR(16) NOT NULL,
   etag VARCHAR(255) NOT NULL,
   size_bytes BIGINT NOT NULL,
+  estimated_landing_bytes BIGINT NOT NULL DEFAULT 0,
   last_modified TIMESTAMP NOT NULL,
   plaintext_sha256 VARCHAR(64),
-  ciphertext_sha256 VARCHAR(64),
-  ciphertext_size_bytes BIGINT,
-  encrypted BOOLEAN NOT NULL DEFAULT TRUE,
-  encryption_alg VARCHAR(64),
   data_key_id UUID,
-  nonce VARCHAR(255),
-  tag VARCHAR(255),
-  aad TEXT,
-  chunked BOOLEAN NOT NULL DEFAULT FALSE,
-  chunk_group_id UUID,
-  chunk_index INTEGER NOT NULL DEFAULT 0,
-  chunk_total INTEGER NOT NULL DEFAULT 1,
-  chunk_offset_bytes BIGINT NOT NULL DEFAULT 0,
-  chunk_size_bytes BIGINT NOT NULL,
-  chunk_sha256 VARCHAR(64),
+  pack_path TEXT,
+  pack_index_path TEXT,
+  pack_offset_bytes BIGINT,
+  pack_ciphertext_size_bytes BIGINT,
+  pack_nonce VARCHAR(255),
+  pack_tag VARCHAR(255),
+  pack_aad TEXT,
+  pack_ciphertext_sha256 VARCHAR(64),
+  frame_total INTEGER NOT NULL DEFAULT 0,
   partial_path TEXT,
-  relative_data_path TEXT,
   relative_meta_path TEXT,
   status VARCHAR(32) NOT NULL,
   error_code VARCHAR(64),
   error_message TEXT,
   CONSTRAINT ck_export_object_status CHECK (status IN ('PENDING', 'ASSIGNED', 'COPYING', 'EXPORTED', 'FAILED', 'SOURCE_CHANGED', 'SKIPPED')),
-  CONSTRAINT ck_export_object_chunk_total CHECK (chunk_total >= 1 AND chunk_total <= 1000000),
-  CONSTRAINT ck_export_object_chunk_index CHECK (chunk_index >= 0 AND chunk_index < chunk_total)
+  CONSTRAINT ck_export_object_storage_mode CHECK (storage_mode IN ('PACK', 'FRAMES')),
+  CONSTRAINT ck_export_object_frame_total CHECK (
+    (storage_mode = 'PACK' AND frame_total = 0)
+    OR (storage_mode = 'FRAMES' AND frame_total > 0)
+  )
 );
 
 COMMENT ON TABLE export_object IS '边缘端导出对象任务表；多盘并行对象分配锁、对象状态和断点恢复核心表。';
 COMMENT ON COLUMN export_object.id IS '数据库自增主键。';
+COMMENT ON COLUMN export_object.object_id IS '导出对象业务 ID；PACK 和 FRAMES 明细均使用该 ID 聚合。';
 COMMENT ON COLUMN export_object.export_job_id IS '所属导出任务业务 ID。';
-COMMENT ON COLUMN export_object.disk_id IS '当前分配写入的运输盘逻辑 ID；PENDING 阶段可为空。';
+COMMENT ON COLUMN export_object.disk_id IS 'PACK 对象当前分配写入的运输盘逻辑 ID；FRAMES 对象目标盘记录在 export_object_frame.disk_id。';
 COMMENT ON COLUMN export_object.bucket IS '源 RustFS bucket 名称。';
 COMMENT ON COLUMN export_object.object_key IS '源 RustFS object key；写 manifest 时映射为 objects[].key。';
+COMMENT ON COLUMN export_object.storage_mode IS 'v2 存储模式；PACK 表示小对象进入 pack 文件，FRAMES 表示对象按 frame 文件写盘。';
 COMMENT ON COLUMN export_object.etag IS '源对象 ETag，用于对象身份和导出前后稳定性校验。';
 COMMENT ON COLUMN export_object.size_bytes IS '源对象明文总字节数。';
+COMMENT ON COLUMN export_object.estimated_landing_bytes IS '该对象预计落盘总量；容量分配必须按该字段，不得按 size_bytes。';
 COMMENT ON COLUMN export_object.last_modified IS '源对象 last_modified，归一化为 UTC。';
-COMMENT ON COLUMN export_object.plaintext_sha256 IS '源对象或分块明文 SHA256。';
-COMMENT ON COLUMN export_object.ciphertext_sha256 IS '落盘密文 SHA256。';
-COMMENT ON COLUMN export_object.ciphertext_size_bytes IS '落盘密文字节数。';
-COMMENT ON COLUMN export_object.encrypted IS '对象是否已加密落盘；v1.0 默认 true。';
-COMMENT ON COLUMN export_object.encryption_alg IS '对象加密算法；与 disk_info.json.security.encryption_alg 和 manifest 保持一致。';
+COMMENT ON COLUMN export_object.plaintext_sha256 IS '源对象整体明文 SHA256。';
 COMMENT ON COLUMN export_object.data_key_id IS '本对象使用的数据密钥编号；运输盘和 manifest 只保存该编号，不保存明文密钥。';
-COMMENT ON COLUMN export_object.nonce IS 'AES-GCM nonce；同一 data_key_id 下必须唯一。';
-COMMENT ON COLUMN export_object.tag IS 'AES-GCM 认证标签。';
-COMMENT ON COLUMN export_object.aad IS 'AES-GCM 附加认证数据。';
-COMMENT ON COLUMN export_object.chunked IS '是否为跨盘分块对象。';
-COMMENT ON COLUMN export_object.chunk_group_id IS '跨盘分块对象聚合组 ID。';
-COMMENT ON COLUMN export_object.chunk_index IS '当前分块序号，从 0 开始。';
-COMMENT ON COLUMN export_object.chunk_total IS '该源对象分块总数，最大 1,000,000。';
-COMMENT ON COLUMN export_object.chunk_offset_bytes IS '当前分块在源对象中的起始偏移字节数。';
-COMMENT ON COLUMN export_object.chunk_size_bytes IS '当前任务行对应的明文字节数；普通对象等于 size_bytes。';
-COMMENT ON COLUMN export_object.chunk_sha256 IS '当前分块密文 SHA256；与 ciphertext_sha256 语义一致，供 manifest 分块字段使用。';
+COMMENT ON COLUMN export_object.pack_path IS 'PACK 文件相对 /rustfs-transfer/ 的路径；FRAMES 对象为空。';
+COMMENT ON COLUMN export_object.pack_index_path IS 'PACK 索引文件相对 /rustfs-transfer/ 的路径；FRAMES 对象为空。';
+COMMENT ON COLUMN export_object.pack_offset_bytes IS '对象密文在 PACK 文件内的起始偏移。';
+COMMENT ON COLUMN export_object.pack_ciphertext_size_bytes IS 'PACK 对象密文字节数，不包含 AES-GCM tag。';
+COMMENT ON COLUMN export_object.pack_nonce IS 'PACK 对象 AES-GCM nonce；同一 data_key_id 下必须唯一。';
+COMMENT ON COLUMN export_object.pack_tag IS 'PACK 对象 AES-GCM 认证标签。';
+COMMENT ON COLUMN export_object.pack_aad IS 'PACK 对象 Common canonical_json AAD。';
+COMMENT ON COLUMN export_object.pack_ciphertext_sha256 IS 'PACK 对象密文 SHA256。';
+COMMENT ON COLUMN export_object.frame_total IS 'FRAMES 对象 frame 总数；PACK 固定为 0。';
 COMMENT ON COLUMN export_object.partial_path IS '.partial 临时密文路径；不得写入 manifest。';
-COMMENT ON COLUMN export_object.relative_data_path IS '最终密文文件相对 /rustfs-transfer/ 的路径，必须位于 data/ 下。';
 COMMENT ON COLUMN export_object.relative_meta_path IS 'metadata sidecar 相对 /rustfs-transfer/ 的路径，必须位于 meta/ 下。';
 COMMENT ON COLUMN export_object.status IS '对象任务状态；PENDING 表示待分配，ASSIGNED 表示已分配到运输盘，COPYING 表示复制/加密写盘中，EXPORTED 表示已导出且可进入 manifest，FAILED 表示失败，SOURCE_CHANGED 表示源对象导出前后变化，SKIPPED 表示已跳过；不包含 IMPORTED，序列化为 object_status。';
 COMMENT ON COLUMN export_object.error_code IS '对象任务失败、源变化或跳过时的标准错误码。';
@@ -131,24 +128,68 @@ COMMENT ON COLUMN export_object.error_message IS '对象任务失败、源变化
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_export_object_plain_active_source
   ON export_object(export_job_id, bucket, object_key, etag, size_bytes, last_modified)
-  WHERE chunked = FALSE
-    AND status IN ('PENDING', 'ASSIGNED', 'COPYING', 'EXPORTED');
-
-CREATE UNIQUE INDEX IF NOT EXISTS uq_export_object_chunk_active_source
-  ON export_object(export_job_id, bucket, object_key, etag, size_bytes, last_modified, chunk_index)
-  WHERE chunked = TRUE
-    AND status IN ('PENDING', 'ASSIGNED', 'COPYING', 'EXPORTED');
+  WHERE status IN ('PENDING', 'ASSIGNED', 'COPYING', 'EXPORTED');
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_export_object_data_key_nonce
-  ON export_object(data_key_id, nonce)
-  WHERE data_key_id IS NOT NULL AND nonce IS NOT NULL;
-
-CREATE UNIQUE INDEX IF NOT EXISTS uq_export_object_chunk_group_index
-  ON export_object(chunk_group_id, chunk_index)
-  WHERE chunked = TRUE AND chunk_group_id IS NOT NULL;
+  ON export_object(data_key_id, pack_nonce)
+  WHERE data_key_id IS NOT NULL AND pack_nonce IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_export_object_assignment
   ON export_object(export_job_id, status, disk_id, id);
+
+CREATE TABLE IF NOT EXISTS export_object_frame (
+  id BIGSERIAL PRIMARY KEY,
+  object_id UUID NOT NULL,
+  export_job_id UUID NOT NULL,
+  disk_id UUID,
+  frame_index INTEGER NOT NULL,
+  frame_total INTEGER NOT NULL,
+  frame_offset_bytes BIGINT NOT NULL,
+  frame_size_bytes BIGINT NOT NULL,
+  estimated_landing_bytes BIGINT NOT NULL DEFAULT 0,
+  relative_frame_path TEXT,
+  ciphertext_size_bytes BIGINT,
+  ciphertext_sha256 VARCHAR(64),
+  data_key_id UUID,
+  nonce VARCHAR(255),
+  tag VARCHAR(255),
+  aad TEXT,
+  partial_path TEXT,
+  status VARCHAR(32) NOT NULL,
+  error_code VARCHAR(64),
+  error_message TEXT,
+  CONSTRAINT ck_export_object_frame_status CHECK (status IN ('PENDING', 'ASSIGNED', 'COPYING', 'EXPORTED', 'FAILED', 'SKIPPED')),
+  CONSTRAINT ck_export_object_frame_index CHECK (frame_index >= 0 AND frame_index < frame_total)
+);
+
+COMMENT ON TABLE export_object_frame IS '边缘端 FRAMES 存储模式的 frame 明细表；frame 是跨盘容量分配单元。';
+COMMENT ON COLUMN export_object_frame.object_id IS '所属导出对象业务 ID。';
+COMMENT ON COLUMN export_object_frame.disk_id IS '该 frame 分配写入的运输盘逻辑 ID。';
+COMMENT ON COLUMN export_object_frame.estimated_landing_bytes IS '该 frame 预计落盘总量；容量分配必须按该字段。';
+COMMENT ON COLUMN export_object_frame.relative_frame_path IS 'frame 密文文件相对 /rustfs-transfer/ 的路径，必须位于 frames/ 下。';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_export_object_frame_object_index
+  ON export_object_frame(export_job_id, object_id, frame_index);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_export_object_frame_data_key_nonce
+  ON export_object_frame(data_key_id, nonce)
+  WHERE data_key_id IS NOT NULL AND nonce IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_export_object_frame_assignment
+  ON export_object_frame(export_job_id, status, disk_id, id);
+
+CREATE TABLE IF NOT EXISTS export_nonce_ledger (
+  id BIGSERIAL PRIMARY KEY,
+  data_key_id UUID NOT NULL,
+  nonce VARCHAR(255) NOT NULL,
+  export_job_id UUID NOT NULL,
+  disk_id UUID NOT NULL,
+  object_id UUID NOT NULL,
+  storage_mode VARCHAR(16) NOT NULL,
+  frame_index INTEGER,
+  created_at TIMESTAMP NOT NULL DEFAULT (NOW() AT TIME ZONE 'UTC')
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_export_nonce_ledger_data_key_nonce
+  ON export_nonce_ledger(data_key_id, nonce);
 
 CREATE TABLE IF NOT EXISTS disk_runtime (
   id BIGSERIAL PRIMARY KEY,

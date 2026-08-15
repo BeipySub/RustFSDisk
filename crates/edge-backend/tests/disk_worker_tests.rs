@@ -116,7 +116,7 @@ impl ExportObjectRepository for MemoryRepo {
             .assigned
             .borrow()
             .iter()
-            .filter(|object| object.id > 0 && object.chunk_total > 0)
+            .filter(|object| object.id > 0)
             .filter(|_| disk_id != Uuid::nil())
             .cloned()
             .collect())
@@ -202,17 +202,12 @@ fn worker_encrypts_writes_manifest_and_seals_disk() {
     let repo = MemoryRepo::default();
     repo.assigned.borrow_mut().push(ExportObjectTask {
         id: 7,
+        object_id: Uuid::new_v4(),
         bucket: "bucket-a".to_string(),
         object_key: "folder/object.txt".to_string(),
         etag: head.etag.clone(),
         size_bytes: head.size_bytes,
         last_modified: head.last_modified,
-        chunked: false,
-        chunk_group_id: None,
-        chunk_index: 0,
-        chunk_total: 1,
-        chunk_offset_bytes: 0,
-        chunk_size_bytes: head.size_bytes,
     });
 
     let key = [9_u8; 32];
@@ -242,8 +237,13 @@ fn worker_encrypts_writes_manifest_and_seals_disk() {
     );
     assert_eq!(manifest.objects[0].object_status, "EXPORTED");
     assert_eq!(
-        manifest.objects[0].relative_data_path,
-        format!("data/{export_job_id}/7.bin")
+        manifest.objects[0].storage_mode,
+        rustfs_transfer_common::protocol::StorageMode::Pack
+    );
+    assert_eq!(manifest.objects[0].frame_total, 0);
+    assert_eq!(
+        manifest.objects[0].pack_ref.pack_path,
+        format!("packs/{export_job_id}/pack-7.pack")
     );
 
     let manifest_bytes = fs::read(protocol_root.join("manifests/export_manifest.json")).unwrap();
@@ -258,20 +258,15 @@ fn worker_encrypts_writes_manifest_and_seals_disk() {
     assert_eq!(disk_info["manifest"]["manifest_sha256"], manifest_sha);
 
     let object = &manifest.objects[0];
-    assert_eq!(
-        object.aad,
-        format!(
-            "disk_id={disk_id};seal_id={seal_id};export_job_id={export_job_id};bucket=bucket-a;key=folder/object.txt;chunk_group_id=;chunk_index=0;chunk_total=1;chunk_offset_bytes=0"
-        )
-    );
-    let mut ciphertext = fs::read(protocol_root.join(&object.relative_data_path)).unwrap();
-    let nonce = BASE64.decode(&object.nonce).unwrap();
-    let tag = BASE64.decode(&object.tag).unwrap();
+    assert!(object.pack_ref.aad.contains("PACK_OBJECT"));
+    let mut ciphertext = fs::read(protocol_root.join(&object.pack_ref.pack_path)).unwrap();
+    let nonce = BASE64.decode(&object.pack_ref.nonce).unwrap();
+    let tag = BASE64.decode(&object.pack_ref.tag).unwrap();
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
     cipher
         .decrypt_in_place_detached(
             Nonce::from_slice(&nonce),
-            object.aad.as_bytes(),
+            object.pack_ref.aad.as_bytes(),
             &mut ciphertext,
             Tag::from_slice(&tag),
         )

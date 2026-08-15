@@ -5,11 +5,8 @@ use uuid::Uuid;
 pub const GIB: u64 = 1_073_741_824;
 pub const MIN_RESERVE_BYTES: u64 = GIB;
 pub const MAX_RESERVE_BYTES: u64 = 8 * GIB;
-// DiskWorker authenticates one protocol chunk with AES-GCM in memory. Keep a
-// chunk comfortably below the Edge VM memory budget, independent of disk size.
-pub const DEFAULT_CHUNK_SIZE_BYTES: u64 = 64 * 1024 * 1024;
-pub const MAX_CHUNK_TOTAL: u64 = 1_000_000;
-pub const CHUNK_INDEX_OVERFLOW: &str = "CHUNK_INDEX_OVERFLOW";
+pub const PACK_OBJECT_OVERHEAD_BYTES: u64 = 4096;
+pub const OBJECT_EXCEEDS_DISK_BUDGET: &str = "OBJECT_EXCEEDS_DISK_BUDGET";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CapacityOverhead {
@@ -27,21 +24,10 @@ pub struct CapacityBudget {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChunkSpec {
-    pub chunk_index: i32,
-    pub chunk_total: i32,
-    pub chunk_offset_bytes: i64,
-    pub chunk_size_bytes: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlannedObject {
-    Plain {
-        chunk_size_bytes: i64,
-    },
-    Chunked {
-        chunk_group_id: Uuid,
-        chunks: Vec<ChunkSpec>,
+    Pack {
+        size_bytes: i64,
+        estimated_landing_bytes: i64,
     },
     Failed {
         error_code: &'static str,
@@ -57,12 +43,6 @@ pub struct AssignedExportObject {
     pub etag: String,
     pub size_bytes: i64,
     pub last_modified: NaiveDateTime,
-    pub chunked: bool,
-    pub chunk_group_id: Option<Uuid>,
-    pub chunk_index: i32,
-    pub chunk_total: i32,
-    pub chunk_offset_bytes: i64,
-    pub chunk_size_bytes: i64,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -93,46 +73,21 @@ pub fn calculate_capacity_budget(free_bytes: u64, overhead: CapacityOverhead) ->
 }
 
 pub fn plan_object(size_bytes: u64, max_single_disk_object_budget_bytes: u64) -> PlannedObject {
-    let chunk_size_limit = max_single_disk_object_budget_bytes.min(DEFAULT_CHUNK_SIZE_BYTES);
-    if chunk_size_limit == 0 {
+    let estimated_landing_bytes = size_bytes.saturating_add(PACK_OBJECT_OVERHEAD_BYTES);
+    if max_single_disk_object_budget_bytes == 0
+        || estimated_landing_bytes > max_single_disk_object_budget_bytes
+    {
         return PlannedObject::Failed {
-            error_code: CHUNK_INDEX_OVERFLOW,
-            error_message: "transport disk object budget must be greater than zero".to_string(),
-        };
-    }
-    if size_bytes <= chunk_size_limit {
-        return PlannedObject::Plain {
-            chunk_size_bytes: saturating_i64(size_bytes),
-        };
-    }
-
-    let chunk_total = size_bytes.div_ceil(chunk_size_limit);
-    if chunk_total > MAX_CHUNK_TOTAL {
-        return PlannedObject::Failed {
-            error_code: CHUNK_INDEX_OVERFLOW,
+            error_code: OBJECT_EXCEEDS_DISK_BUDGET,
             error_message: format!(
-                "object requires {chunk_total} chunks, exceeding limit {MAX_CHUNK_TOTAL}"
+                "object estimated landing bytes {estimated_landing_bytes} exceed max disk object budget {max_single_disk_object_budget_bytes}"
             ),
         };
     }
 
-    let chunk_group_id = Uuid::new_v4();
-    let mut chunks = Vec::with_capacity(chunk_total as usize);
-    for chunk_index in 0..chunk_total {
-        let offset = chunk_index * chunk_size_limit;
-        let remaining = size_bytes - offset;
-        let chunk_size = remaining.min(chunk_size_limit);
-        chunks.push(ChunkSpec {
-            chunk_index: chunk_index as i32,
-            chunk_total: chunk_total as i32,
-            chunk_offset_bytes: saturating_i64(offset),
-            chunk_size_bytes: saturating_i64(chunk_size),
-        });
-    }
-
-    PlannedObject::Chunked {
-        chunk_group_id,
-        chunks,
+    PlannedObject::Pack {
+        size_bytes: saturating_i64(size_bytes),
+        estimated_landing_bytes: saturating_i64(estimated_landing_bytes),
     }
 }
 
@@ -214,21 +169,14 @@ pub async fn create_export_plan_from_stable_snapshots(
             max_single_disk_object_budget_bytes,
         );
         match planned {
-            PlannedObject::Plain { chunk_size_bytes } => {
-                insert_plain_object(&mut tx, export_job_id, &snapshot, chunk_size_bytes).await?;
-                planned_count += 1;
-                planned_bytes = planned_bytes.saturating_add(chunk_size_bytes);
-            }
-            PlannedObject::Chunked {
-                chunk_group_id,
-                chunks,
+            PlannedObject::Pack {
+                size_bytes,
+                estimated_landing_bytes,
             } => {
-                for chunk in chunks {
-                    insert_chunk_object(&mut tx, export_job_id, &snapshot, chunk_group_id, &chunk)
-                        .await?;
-                    planned_count += 1;
-                    planned_bytes = planned_bytes.saturating_add(chunk.chunk_size_bytes);
-                }
+                insert_pack_object(&mut tx, export_job_id, &snapshot, estimated_landing_bytes)
+                    .await?;
+                planned_count += 1;
+                planned_bytes = planned_bytes.saturating_add(size_bytes);
             }
             PlannedObject::Failed {
                 error_code,
@@ -265,12 +213,12 @@ pub async fn create_export_plan_from_stable_snapshots(
 
 pub const ASSIGNMENT_SQL: &str = r#"
 WITH candidate AS (
-  SELECT id, chunk_size_bytes
+  SELECT id, estimated_landing_bytes
   FROM export_object
   WHERE export_job_id = $1
     AND status = 'PENDING'
     AND disk_id IS NULL
-    AND chunk_size_bytes <= $3
+    AND estimated_landing_bytes <= $3
   ORDER BY id ASC
   FOR UPDATE SKIP LOCKED
   LIMIT $4
@@ -279,7 +227,7 @@ picked AS (
   SELECT id
   FROM (
     SELECT id,
-           SUM(chunk_size_bytes) OVER (ORDER BY id ASC) AS running_bytes
+           SUM(estimated_landing_bytes) OVER (ORDER BY id ASC) AS running_bytes
     FROM candidate
   ) AS ranked
   WHERE running_bytes <= $3
@@ -295,13 +243,7 @@ RETURNING eo.id,
           eo.object_key,
           eo.etag,
           eo.size_bytes,
-          eo.last_modified,
-          eo.chunked,
-          eo.chunk_group_id,
-          eo.chunk_index,
-          eo.chunk_total,
-          eo.chunk_offset_bytes,
-          eo.chunk_size_bytes
+          eo.last_modified
 "#;
 
 pub async fn assign_export_objects(
@@ -330,63 +272,30 @@ pub async fn assign_export_objects(
     Ok(assigned)
 }
 
-async fn insert_plain_object(
+async fn insert_pack_object(
     tx: &mut Transaction<'_, Postgres>,
     export_job_id: Uuid,
     snapshot: &StableSnapshot,
-    chunk_size_bytes: i64,
+    estimated_landing_bytes: i64,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
         INSERT INTO export_object(
-            export_job_id, bucket, object_key, etag, size_bytes, last_modified,
-            chunked, chunk_index, chunk_total, chunk_offset_bytes, chunk_size_bytes, status
+            object_id, export_job_id, bucket, object_key, storage_mode, etag, size_bytes,
+            estimated_landing_bytes, last_modified, frame_total, status
         )
-        VALUES ($1, $2, $3, $4, $5, $6, FALSE, 0, 1, 0, $7, 'PENDING')
+        VALUES ($1, $2, $3, $4, 'PACK', $5, $6, $7, $8, 0, 'PENDING')
         ON CONFLICT DO NOTHING
         "#,
     )
+    .bind(Uuid::new_v4())
     .bind(export_job_id)
     .bind(&snapshot.bucket)
     .bind(&snapshot.object_key)
     .bind(&snapshot.etag)
     .bind(snapshot.size_bytes)
+    .bind(estimated_landing_bytes)
     .bind(snapshot.last_modified)
-    .bind(chunk_size_bytes)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
-}
-
-async fn insert_chunk_object(
-    tx: &mut Transaction<'_, Postgres>,
-    export_job_id: Uuid,
-    snapshot: &StableSnapshot,
-    chunk_group_id: Uuid,
-    chunk: &ChunkSpec,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        r#"
-        INSERT INTO export_object(
-            export_job_id, bucket, object_key, etag, size_bytes, last_modified,
-            chunked, chunk_group_id, chunk_index, chunk_total, chunk_offset_bytes,
-            chunk_size_bytes, status
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7, $8, $9, $10, $11, 'PENDING')
-        ON CONFLICT DO NOTHING
-        "#,
-    )
-    .bind(export_job_id)
-    .bind(&snapshot.bucket)
-    .bind(&snapshot.object_key)
-    .bind(&snapshot.etag)
-    .bind(snapshot.size_bytes)
-    .bind(snapshot.last_modified)
-    .bind(chunk_group_id)
-    .bind(chunk.chunk_index)
-    .bind(chunk.chunk_total)
-    .bind(chunk.chunk_offset_bytes)
-    .bind(chunk.chunk_size_bytes)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -402,13 +311,13 @@ async fn insert_failed_object(
     sqlx::query(
         r#"
         INSERT INTO export_object(
-            export_job_id, bucket, object_key, etag, size_bytes, last_modified,
-            chunked, chunk_index, chunk_total, chunk_offset_bytes, chunk_size_bytes,
-            status, error_code, error_message
+            object_id, export_job_id, bucket, object_key, storage_mode, etag, size_bytes,
+            estimated_landing_bytes, last_modified, frame_total, status, error_code, error_message
         )
-        VALUES ($1, $2, $3, $4, $5, $6, FALSE, 0, 1, 0, $5, 'FAILED', $7, $8)
+        VALUES ($1, $2, $3, $4, 'PACK', $5, $6, 0, $7, 0, 'FAILED', $8, $9)
         "#,
     )
+    .bind(Uuid::new_v4())
     .bind(export_job_id)
     .bind(&snapshot.bucket)
     .bind(&snapshot.object_key)
@@ -453,47 +362,26 @@ mod tests {
     }
 
     #[test]
-    fn large_object_is_split_into_contiguous_memory_safe_chunks() {
-        let planned = plan_object(DEFAULT_CHUNK_SIZE_BYTES * 2 + 7, GIB);
-        let PlannedObject::Chunked { chunks, .. } = planned else {
-            panic!("expected chunked object");
+    fn object_within_disk_budget_is_planned_as_pack() {
+        let planned = plan_object(128 * 1024 * 1024, GIB);
+        let PlannedObject::Pack {
+            size_bytes,
+            estimated_landing_bytes,
+        } = planned
+        else {
+            panic!("expected pack object");
         };
 
-        assert_eq!(chunks.len(), 3);
-        assert_eq!(chunks[0].chunk_index, 0);
-        assert_eq!(chunks[0].chunk_offset_bytes, 0);
-        assert_eq!(chunks[0].chunk_size_bytes, DEFAULT_CHUNK_SIZE_BYTES as i64);
+        assert_eq!(size_bytes, 128 * 1024 * 1024);
         assert_eq!(
-            chunks[1].chunk_offset_bytes,
-            DEFAULT_CHUNK_SIZE_BYTES as i64
+            estimated_landing_bytes,
+            (128 * 1024 * 1024 + PACK_OBJECT_OVERHEAD_BYTES) as i64
         );
-        assert_eq!(
-            chunks[2].chunk_offset_bytes,
-            (DEFAULT_CHUNK_SIZE_BYTES * 2) as i64
-        );
-        assert_eq!(chunks[2].chunk_size_bytes, 7);
-        assert!(chunks.iter().all(|chunk| chunk.chunk_total == 3));
     }
 
     #[test]
-    fn object_larger_than_memory_safe_chunk_is_split_even_when_one_disk_can_hold_it() {
-        let planned = plan_object(DEFAULT_CHUNK_SIZE_BYTES + 1, DEFAULT_CHUNK_SIZE_BYTES * 100);
-        let PlannedObject::Chunked { chunks, .. } = planned else {
-            panic!("expected a memory-safe chunked object");
-        };
-
-        assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0].chunk_size_bytes, DEFAULT_CHUNK_SIZE_BYTES as i64);
-        assert_eq!(
-            chunks[1].chunk_offset_bytes,
-            DEFAULT_CHUNK_SIZE_BYTES as i64
-        );
-        assert_eq!(chunks[1].chunk_size_bytes, 1);
-    }
-
-    #[test]
-    fn chunk_count_overflow_is_marked_failed() {
-        let planned = plan_object(DEFAULT_CHUNK_SIZE_BYTES * MAX_CHUNK_TOTAL + 1, GIB);
+    fn object_exceeding_disk_budget_is_marked_failed() {
+        let planned = plan_object(GIB, GIB);
         let PlannedObject::Failed {
             error_code,
             error_message,
@@ -502,8 +390,8 @@ mod tests {
             panic!("expected failed object");
         };
 
-        assert_eq!(error_code, CHUNK_INDEX_OVERFLOW);
-        assert!(error_message.contains("exceeding limit"));
+        assert_eq!(error_code, OBJECT_EXCEEDS_DISK_BUDGET);
+        assert!(error_message.contains("exceed max disk object budget"));
     }
 
     #[test]

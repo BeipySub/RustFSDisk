@@ -409,8 +409,7 @@ impl ExportObjectRepository for PgExportObjectRepository {
         self.handle.block_on(async {
             let rows = sqlx::query(
                 r#"
-                SELECT id, bucket, object_key, etag, size_bytes, last_modified, chunked,
-                       chunk_group_id, chunk_index, chunk_total, chunk_offset_bytes, chunk_size_bytes
+                SELECT id, object_id, bucket, object_key, etag, size_bytes, last_modified
                 FROM export_object
                 WHERE export_job_id = $1 AND disk_id = $2 AND status = 'ASSIGNED'
                 ORDER BY id ASC
@@ -426,17 +425,12 @@ impl ExportObjectRepository for PgExportObjectRepository {
                 .map(|row| {
                     Ok(ExportObjectTask {
                         id: row.get("id"),
+                        object_id: row.get("object_id"),
                         bucket: row.get("bucket"),
                         object_key: row.get("object_key"),
                         etag: row.get("etag"),
                         size_bytes: row.get::<i64, _>("size_bytes").max(0) as u64,
                         last_modified: naive_utc(row.get("last_modified")),
-                        chunked: row.get("chunked"),
-                        chunk_group_id: row.get("chunk_group_id"),
-                        chunk_index: row.get("chunk_index"),
-                        chunk_total: row.get("chunk_total"),
-                        chunk_offset_bytes: row.get::<i64, _>("chunk_offset_bytes").max(0) as u64,
-                        chunk_size_bytes: row.get::<i64, _>("chunk_size_bytes").max(0) as u64,
                     })
                 })
                 .collect()
@@ -468,16 +462,16 @@ impl ExportObjectRepository for PgExportObjectRepository {
                 UPDATE export_object
                 SET status = 'EXPORTED',
                     plaintext_sha256 = $2,
-                    ciphertext_sha256 = $3,
-                    ciphertext_size_bytes = $4,
-                    encrypted = TRUE,
-                    encryption_alg = $5,
-                    data_key_id = $6,
-                    nonce = $7,
-                    tag = $8,
-                    aad = $9,
-                    chunk_sha256 = $10,
-                    relative_data_path = $11,
+                    data_key_id = $3,
+                    pack_path = $4,
+                    pack_index_path = $5,
+                    pack_offset_bytes = $6,
+                    pack_ciphertext_size_bytes = $7,
+                    pack_nonce = $8,
+                    pack_tag = $9,
+                    pack_aad = $10,
+                    pack_ciphertext_sha256 = $11,
+                    frame_total = 0,
                     relative_meta_path = $12,
                     partial_path = NULL,
                     error_code = NULL,
@@ -487,15 +481,15 @@ impl ExportObjectRepository for PgExportObjectRepository {
             )
             .bind(object_id)
             .bind(&exported.plaintext_sha256)
-            .bind(&exported.ciphertext_sha256)
-            .bind(exported.ciphertext_size_bytes as i64)
-            .bind(&exported.encryption_alg)
             .bind(exported.data_key_id)
-            .bind(&exported.nonce)
-            .bind(&exported.tag)
-            .bind(&exported.aad)
-            .bind(&exported.chunk_sha256)
-            .bind(&exported.relative_data_path)
+            .bind(&exported.pack_path)
+            .bind(&exported.pack_index_path)
+            .bind(exported.pack_offset_bytes as i64)
+            .bind(exported.pack_ciphertext_size_bytes as i64)
+            .bind(&exported.pack_nonce)
+            .bind(&exported.pack_tag)
+            .bind(&exported.pack_aad)
+            .bind(&exported.pack_ciphertext_sha256)
             .bind(&exported.relative_meta_path)
             .execute(&self.pool)
             .await
@@ -538,10 +532,10 @@ impl ExportObjectRepository for PgExportObjectRepository {
         self.handle.block_on(async {
             let rows = sqlx::query(
                 r#"
-                SELECT id, bucket, object_key, relative_data_path, relative_meta_path,
-                       plaintext_sha256, ciphertext_sha256, ciphertext_size_bytes, encrypted,
-                       encryption_alg, data_key_id, nonce, tag, aad, chunked, chunk_group_id,
-                       chunk_index, chunk_total, chunk_offset_bytes, chunk_size_bytes, chunk_sha256,
+                SELECT id, object_id, bucket, object_key, storage_mode, relative_meta_path,
+                       plaintext_sha256, data_key_id, pack_path, pack_index_path,
+                       pack_offset_bytes, pack_ciphertext_size_bytes, pack_nonce, pack_tag,
+                       pack_aad, pack_ciphertext_sha256, frame_total, estimated_landing_bytes,
                        size_bytes, etag, last_modified, status
                 FROM export_object
                 WHERE export_job_id = $1 AND disk_id = $2 AND status = 'EXPORTED'
@@ -557,28 +551,30 @@ impl ExportObjectRepository for PgExportObjectRepository {
             rows.into_iter()
                 .map(|row| {
                     Ok(ExportedObjectUpdate {
-                        object_id: row.get("id"),
+                        row_id: row.get("id"),
+                        object_id: row.get("object_id"),
                         bucket: row.get("bucket"),
                         key: row.get("object_key"),
-                        relative_data_path: row.get("relative_data_path"),
+                        storage_mode: match row.get::<String, _>("storage_mode").as_str() {
+                            "FRAMES" => rustfs_transfer_common::protocol::StorageMode::Frames,
+                            _ => rustfs_transfer_common::protocol::StorageMode::Pack,
+                        },
                         relative_meta_path: row.get("relative_meta_path"),
                         plaintext_sha256: row.get("plaintext_sha256"),
-                        ciphertext_sha256: row.get("ciphertext_sha256"),
-                        ciphertext_size_bytes: row.get::<i64, _>("ciphertext_size_bytes").max(0)
-                            as u64,
-                        encrypted: row.get("encrypted"),
-                        encryption_alg: row.get("encryption_alg"),
                         data_key_id: row.get("data_key_id"),
-                        nonce: row.get("nonce"),
-                        tag: row.get("tag"),
-                        aad: row.get("aad"),
-                        chunked: row.get("chunked"),
-                        chunk_group_id: row.get("chunk_group_id"),
-                        chunk_index: row.get("chunk_index"),
-                        chunk_total: row.get("chunk_total"),
-                        chunk_offset_bytes: row.get::<i64, _>("chunk_offset_bytes").max(0) as u64,
-                        chunk_size_bytes: row.get::<i64, _>("chunk_size_bytes").max(0) as u64,
-                        chunk_sha256: row.get("chunk_sha256"),
+                        pack_path: row.get("pack_path"),
+                        pack_index_path: row.get("pack_index_path"),
+                        pack_offset_bytes: row.get::<i64, _>("pack_offset_bytes").max(0) as u64,
+                        pack_ciphertext_size_bytes: row
+                            .get::<i64, _>("pack_ciphertext_size_bytes")
+                            .max(0) as u64,
+                        pack_nonce: row.get("pack_nonce"),
+                        pack_tag: row.get("pack_tag"),
+                        pack_aad: row.get("pack_aad"),
+                        pack_ciphertext_sha256: row.get("pack_ciphertext_sha256"),
+                        frame_total: row.get::<i32, _>("frame_total").max(0) as u32,
+                        estimated_landing_bytes: row.get::<i64, _>("estimated_landing_bytes").max(0)
+                            as u64,
                         size_bytes: row.get::<i64, _>("size_bytes").max(0) as u64,
                         etag: row.get("etag"),
                         last_modified: naive_utc(row.get("last_modified")),
@@ -645,7 +641,7 @@ impl ExportObjectRepository for PgExportObjectRepository {
                           AND status = 'EXPORTED'
                     ),
                     copied_bytes = COALESCE((
-                        SELECT SUM(chunk_size_bytes)
+                        SELECT SUM(size_bytes)
                         FROM export_object
                         WHERE export_job_id = $1
                           AND status = 'EXPORTED'
@@ -753,7 +749,16 @@ mod tests {
             1,
             50,
         );
-        worker_progress.start_object("disk-a", "source", "objects/a.bin", "data/a.bin", 100);
+        worker_progress.start_object(
+            "disk-a",
+            Uuid::new_v4().to_string(),
+            "source",
+            "objects/a.bin",
+            "PACK",
+            0,
+            0,
+            100,
+        );
         worker_progress.add_bytes("disk-a", 40);
 
         let websocket_snapshot = slot
@@ -798,7 +803,7 @@ mod tests {
         assert_eq!(key.len(), 32);
         assert_eq!(
             hex::encode(key),
-            "691765633e6b8fdd0d5a8c0911da21ce4516eba1bec5e200217064a3a86702aa"
+            "58961baf139e4fcf657dbc1ffff395aacb9986f1b5e864ec90d5016b51fe5775"
         );
     }
 
