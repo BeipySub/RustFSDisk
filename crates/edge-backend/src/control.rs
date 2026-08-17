@@ -1590,10 +1590,15 @@ fn disk_runtime_filesystem_metadata(
 ) -> DiskRuntimeFilesystemMetadata {
     DiskRuntimeFilesystemMetadata {
         filesystem_type: mount_path
+            .filter(|path| path_is_real_mountpoint(path, device_path))
             .and_then(filesystem_type_from_mount)
             .or_else(|| blkid_value(device_path, "TYPE")),
         fs_uuid: blkid_value(device_path, "UUID"),
     }
+}
+
+fn path_is_real_mountpoint(mount_path: &str, device_path: &str) -> bool {
+    mount_path != device_path && Path::new(mount_path).is_dir()
 }
 
 fn filesystem_type_from_mount(mount_path: &str) -> Option<String> {
@@ -2334,6 +2339,11 @@ mod tests {
     #[test]
     fn rejected_runtime_without_disk_info_uses_unregistered_disk_status_code() {
         assert_eq!(disk_status_code_from_runtime("REJECTED"), "UNREGISTERED");
+    }
+
+    #[test]
+    fn device_path_is_not_treated_as_real_mountpoint_for_filesystem_metadata() {
+        assert!(!path_is_real_mountpoint("/dev/sdb1", "/dev/sdb1"));
     }
 
     #[test]

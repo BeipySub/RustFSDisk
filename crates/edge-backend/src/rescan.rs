@@ -5,6 +5,14 @@ use crate::disk_detection::{
 use serde::Serialize;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio::time::Duration;
+
+#[cfg(not(test))]
+const UDEV_SETTLE_RESCAN_DELAYS: &[Duration] =
+    &[Duration::from_millis(300), Duration::from_secs(2)];
+#[cfg(test)]
+const UDEV_SETTLE_RESCAN_DELAYS: &[Duration] =
+    &[Duration::from_millis(5), Duration::from_millis(5)];
 
 pub trait DiskRescanRunner: Send + Sync + 'static {
     fn run_disk_rescan<'a>(
@@ -160,6 +168,7 @@ impl DiskRescanCoordinator {
     }
 
     async fn run_until_idle(&self, mut trigger: DiskRescanTrigger) {
+        let mut udev_settle_rescan_index = 0;
         loop {
             tracing::info!(
                 source = ?trigger.source,
@@ -184,6 +193,22 @@ impl DiskRescanCoordinator {
                 state.pending = false;
                 drop(state);
                 trigger = DiskRescanTrigger::queued();
+                udev_settle_rescan_index = 0;
+                continue;
+            }
+
+            if trigger.source == DiskRescanSource::Udev
+                && udev_settle_rescan_index < UDEV_SETTLE_RESCAN_DELAYS.len()
+            {
+                let delay = UDEV_SETTLE_RESCAN_DELAYS[udev_settle_rescan_index];
+                udev_settle_rescan_index += 1;
+                drop(state);
+                tracing::info!(
+                    device = trigger.device.as_deref(),
+                    delay_ms = delay.as_millis() as u64,
+                    "scheduling follow-up edge disk rescan after udev settle delay"
+                );
+                tokio::time::sleep(delay).await;
                 continue;
             }
 
@@ -241,6 +266,25 @@ mod tests {
         assert!(second.queued);
         tokio::time::sleep(Duration::from_millis(80)).await;
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn udev_rescan_runs_follow_up_scans_after_settle_delays() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let coordinator = DiskRescanCoordinator::new(Arc::new(SlowRunner {
+            calls: calls.clone(),
+        }));
+
+        let accepted = coordinator
+            .request_rescan(DiskRescanTrigger::udev(Some("/dev/sdb1".to_owned())))
+            .await;
+
+        assert!(!accepted.queued);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1 + UDEV_SETTLE_RESCAN_DELAYS.len()
+        );
     }
 
     #[tokio::test]

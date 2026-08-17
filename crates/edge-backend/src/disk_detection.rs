@@ -350,7 +350,8 @@ impl DiskProbe for ConfiguredMountProbe {
                 } else {
                     filesystem
                 };
-                if !has_protocol_info && filesystem != SUPPORTED_FILESYSTEM {
+                if !should_include_mount_candidate(has_protocol_info, &filesystem, &device_metadata)
+                {
                     continue;
                 }
 
@@ -367,6 +368,7 @@ impl DiskProbe for ConfiguredMountProbe {
                     free_bytes,
                 });
             }
+            disks.extend(discover_unmounted_unsupported_usb_partitions());
             Ok(disks)
         })
     }
@@ -1084,6 +1086,7 @@ struct DeviceMetadata {
     fs_uuid: Option<String>,
     label: Option<String>,
     filesystem: Option<String>,
+    bus: Option<String>,
 }
 
 impl DeviceMetadata {
@@ -1095,6 +1098,18 @@ impl DeviceMetadata {
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned)
     }
+}
+
+fn is_usb_block_device(metadata: &DeviceMetadata) -> bool {
+    metadata.bus.as_deref() == Some("usb")
+}
+
+fn should_include_mount_candidate(
+    has_protocol_info: bool,
+    filesystem: &str,
+    metadata: &DeviceMetadata,
+) -> bool {
+    has_protocol_info || filesystem == SUPPORTED_FILESYSTEM || is_usb_block_device(metadata)
 }
 
 fn device_metadata(device_path: &str) -> DeviceMetadata {
@@ -1109,6 +1124,7 @@ fn device_metadata(device_path: &str) -> DeviceMetadata {
         metadata.fs_uuid = property(&udev, "ID_FS_UUID");
         metadata.label = property(&udev, "ID_FS_LABEL");
         metadata.filesystem = property(&udev, "ID_FS_TYPE");
+        metadata.bus = property(&udev, "ID_BUS");
     }
 
     if let Some(blkid) = blkid_properties(device_path) {
@@ -1118,6 +1134,109 @@ fn device_metadata(device_path: &str) -> DeviceMetadata {
     }
 
     metadata
+}
+
+fn discover_unmounted_unsupported_usb_partitions() -> Vec<DetectedDisk> {
+    let output = Command::new("lsblk")
+        .args(["-P", "-p", "-n", "-o", "NAME,TYPE,MOUNTPOINT,FSTYPE"])
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(parse_unmounted_unsupported_usb_partition)
+        .collect()
+}
+
+fn parse_unmounted_unsupported_usb_partition(line: &str) -> Option<DetectedDisk> {
+    let fields = parse_lsblk_pairs(line);
+    if fields.get("TYPE").map(String::as_str) != Some("part") {
+        return None;
+    }
+    if fields
+        .get("MOUNTPOINT")
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return None;
+    }
+
+    let filesystem = fields.get("FSTYPE")?.trim().to_string();
+    if filesystem.is_empty() || filesystem == SUPPORTED_FILESYSTEM {
+        return None;
+    }
+
+    let device_path = fields.get("NAME")?.trim().to_string();
+    let device_metadata = device_metadata(&device_path);
+    if device_metadata.bus.as_deref() != Some("usb") {
+        return None;
+    }
+
+    let capacity_bytes = block_device_size(&device_path).unwrap_or_default();
+    Some(DetectedDisk {
+        sn: device_metadata.hardware_sn().unwrap_or_default(),
+        device_path: device_path.clone(),
+        mount_path: PathBuf::from(device_path),
+        filesystem,
+        fs_uuid: device_metadata.fs_uuid,
+        label: device_metadata.label,
+        id_serial: device_metadata.id_serial,
+        id_serial_short: device_metadata.id_serial_short,
+        capacity_bytes,
+        free_bytes: 0,
+    })
+}
+
+fn parse_lsblk_pairs(line: &str) -> HashMap<String, String> {
+    let mut fields = HashMap::new();
+    let mut rest = line.trim();
+    while let Some((key, after_key)) = rest.split_once('=') {
+        let key = key
+            .rsplit_once(char::is_whitespace)
+            .map(|(_, key)| key)
+            .unwrap_or(key)
+            .trim();
+        let mut chars = after_key.chars();
+        if chars.next() != Some('"') {
+            break;
+        }
+
+        let mut value = String::new();
+        let mut escaped = false;
+        let mut consumed = key.len() + 2;
+        for ch in chars {
+            consumed += ch.len_utf8();
+            if escaped {
+                value.push(ch);
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '"' => break,
+                _ => value.push(ch),
+            }
+        }
+        fields.insert(key.to_string(), value);
+        rest = rest.get(consumed..).unwrap_or_default().trim_start();
+    }
+    fields
+}
+
+fn block_device_size(device_path: &str) -> Option<u64> {
+    let output = Command::new("blockdev")
+        .arg("--getsize64")
+        .arg(device_path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
 }
 
 fn udev_properties(device_path: &str) -> Option<String> {
@@ -1818,6 +1937,7 @@ ID_FS_TYPE=ext4
             fs_uuid: property(udev, "ID_FS_UUID"),
             label: property(udev, "ID_FS_LABEL"),
             filesystem: property(udev, "ID_FS_TYPE"),
+            bus: property(udev, "ID_BUS"),
         };
 
         assert_eq!(
@@ -1834,6 +1954,36 @@ ID_FS_TYPE=ext4
             Some("0878ee5b-3e86-4ae0-8d0f-461c2732ee42")
         );
         assert_eq!(metadata.filesystem.as_deref(), Some("ext4"));
+    }
+
+    #[test]
+    fn parses_lsblk_pairs_for_unmounted_usb_partition_candidates() {
+        let fields =
+            parse_lsblk_pairs(r#"NAME="/dev/sdb1" TYPE="part" MOUNTPOINT="" FSTYPE="ntfs""#);
+
+        assert_eq!(fields.get("NAME").map(String::as_str), Some("/dev/sdb1"));
+        assert_eq!(fields.get("TYPE").map(String::as_str), Some("part"));
+        assert_eq!(fields.get("MOUNTPOINT").map(String::as_str), Some(""));
+        assert_eq!(fields.get("FSTYPE").map(String::as_str), Some("ntfs"));
+    }
+
+    #[test]
+    fn mounted_usb_partition_without_protocol_is_kept_for_rejection() {
+        let usb_ntfs = DeviceMetadata {
+            bus: Some("usb".to_string()),
+            filesystem: Some("ntfs".to_string()),
+            ..DeviceMetadata::default()
+        };
+        let local_ntfs = DeviceMetadata {
+            bus: None,
+            filesystem: Some("ntfs".to_string()),
+            ..DeviceMetadata::default()
+        };
+
+        assert!(should_include_mount_candidate(false, "ntfs", &usb_ntfs));
+        assert!(!should_include_mount_candidate(false, "ntfs", &local_ntfs));
+        assert!(should_include_mount_candidate(false, "ext4", &local_ntfs));
+        assert!(should_include_mount_candidate(true, "ntfs", &local_ntfs));
     }
 
     #[tokio::test]

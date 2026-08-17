@@ -1,0 +1,13 @@
+[Unit]
+Description=RustFS Transfer dev disk rescan notification for /dev/%I
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/rustfs-transfer/edge.env
+Environment=RUSTFS_TRANSFER__DEV_REPO_DIR=/home/edge/RustFSDisk-dev
+ExecStart=/bin/sh -lc 'exec /bin/sh "$RUSTFS_TRANSFER__DEV_REPO_DIR/scripts/dev-rescan-helper.sh" --device /dev/%I --trigger udev'
+User=edge
+Group=edge
+NoNewPrivileges=true
+PrivateTmp=true

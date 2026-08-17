@@ -54,6 +54,37 @@ struct StableSnapshot {
     last_modified: NaiveDateTime,
 }
 
+const SELECT_EXPORTABLE_STABLE_SNAPSHOTS_SQL: &str = r#"
+WITH latest_scan AS (
+  SELECT scan_started_at, scan_finished_at
+  FROM edge_scan_run
+  WHERE scan_status = 'DONE'
+    AND scan_finished_at IS NOT NULL
+  ORDER BY scan_finished_at DESC
+  LIMIT 1
+)
+SELECT los.bucket, los.object_key, los.etag, los.size_bytes, los.last_modified
+FROM local_object_snapshot AS los
+CROSS JOIN latest_scan
+WHERE los.stable_status = 'STABLE'
+  AND los.scanned_at >= latest_scan.scan_started_at
+  AND los.scanned_at <= latest_scan.scan_finished_at
+  AND NOT EXISTS (
+    SELECT 1
+    FROM export_object AS exported
+    JOIN export_job AS exported_job
+      ON exported_job.export_job_id = exported.export_job_id
+    WHERE exported.bucket = los.bucket
+      AND exported.object_key = los.object_key
+      AND exported.etag = los.etag
+      AND exported.size_bytes = los.size_bytes
+      AND exported.last_modified = los.last_modified
+      AND exported.status = 'EXPORTED'
+      AND exported_job.status = 'SEALED'
+  )
+ORDER BY los.id ASC
+"#;
+
 pub fn calculate_capacity_budget(free_bytes: u64, overhead: CapacityOverhead) -> CapacityBudget {
     let reserve_bytes = (free_bytes / 50).clamp(MIN_RESERVE_BYTES, MAX_RESERVE_BYTES);
     let overhead_bytes = overhead
@@ -138,27 +169,9 @@ pub async fn create_export_plan_from_stable_snapshots(
     .execute(&mut *tx)
     .await?;
 
-    let snapshots = sqlx::query_as::<_, StableSnapshot>(
-        r#"
-        WITH latest_scan AS (
-          SELECT scan_started_at, scan_finished_at
-          FROM edge_scan_run
-          WHERE scan_status = 'DONE'
-            AND scan_finished_at IS NOT NULL
-          ORDER BY scan_finished_at DESC
-          LIMIT 1
-        )
-        SELECT bucket, object_key, etag, size_bytes, last_modified
-        FROM local_object_snapshot
-        CROSS JOIN latest_scan
-        WHERE stable_status = 'STABLE'
-          AND scanned_at >= latest_scan.scan_started_at
-          AND scanned_at <= latest_scan.scan_finished_at
-        ORDER BY id ASC
-        "#,
-    )
-    .fetch_all(&mut *tx)
-    .await?;
+    let snapshots = sqlx::query_as::<_, StableSnapshot>(SELECT_EXPORTABLE_STABLE_SNAPSHOTS_SQL)
+        .fetch_all(&mut *tx)
+        .await?;
 
     let mut planned_count = 0_i64;
     let mut planned_bytes = 0_i64;
@@ -400,5 +413,24 @@ mod tests {
         assert!(ASSIGNMENT_SQL.contains("UPDATE export_object AS eo"));
         assert!(ASSIGNMENT_SQL.contains("RETURNING eo.id"));
         assert!(ASSIGNMENT_SQL.contains("running_bytes <= $3"));
+    }
+
+    #[test]
+    fn export_plan_skips_source_versions_already_exported_by_edge() {
+        assert!(SELECT_EXPORTABLE_STABLE_SNAPSHOTS_SQL.contains("NOT EXISTS"));
+        assert!(SELECT_EXPORTABLE_STABLE_SNAPSHOTS_SQL.contains("FROM export_object AS exported"));
+        assert!(SELECT_EXPORTABLE_STABLE_SNAPSHOTS_SQL.contains("JOIN export_job AS exported_job"));
+        assert!(SELECT_EXPORTABLE_STABLE_SNAPSHOTS_SQL.contains("exported.status = 'EXPORTED'"));
+        assert!(SELECT_EXPORTABLE_STABLE_SNAPSHOTS_SQL.contains("exported_job.status = 'SEALED'"));
+        assert!(SELECT_EXPORTABLE_STABLE_SNAPSHOTS_SQL.contains("exported.bucket = los.bucket"));
+        assert!(
+            SELECT_EXPORTABLE_STABLE_SNAPSHOTS_SQL.contains("exported.object_key = los.object_key")
+        );
+        assert!(SELECT_EXPORTABLE_STABLE_SNAPSHOTS_SQL.contains("exported.etag = los.etag"));
+        assert!(
+            SELECT_EXPORTABLE_STABLE_SNAPSHOTS_SQL.contains("exported.size_bytes = los.size_bytes")
+        );
+        assert!(SELECT_EXPORTABLE_STABLE_SNAPSHOTS_SQL
+            .contains("exported.last_modified = los.last_modified"));
     }
 }

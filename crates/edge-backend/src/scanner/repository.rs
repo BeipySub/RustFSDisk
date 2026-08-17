@@ -105,7 +105,20 @@ impl ObjectSnapshotRepository for PgObjectSnapshotRepository {
                     error_code,
                     error_message
                 )
-                VALUES ($1, $2, $3, $4, 'PACK', $5, $6, $7, $8, 0, $9, $10, $11)
+                SELECT $1, $2, $3, $4, 'PACK', $5, $6, $7, $8, 0, $9, $10, $11
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM export_object AS exported
+                    JOIN export_job AS exported_job
+                      ON exported_job.export_job_id = exported.export_job_id
+                    WHERE exported.bucket = $3
+                      AND exported.object_key = $4
+                      AND exported.etag = $5
+                      AND exported.size_bytes = $6
+                      AND exported.last_modified = $8
+                      AND exported.status = 'EXPORTED'
+                      AND exported_job.status = 'SEALED'
+                )
                 ON CONFLICT DO NOTHING
                 "#,
             )

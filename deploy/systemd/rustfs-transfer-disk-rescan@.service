@@ -5,7 +5,6 @@ After=network-online.target
 [Service]
 Type=oneshot
 EnvironmentFile=-/etc/rustfs-transfer/edge.env
-ExecStartPre=/bin/sleep 2
 ExecStart=/opt/rustfs-transfer/bin/rustfs-transfer-rescan --device /dev/%I --trigger udev
 User=root
 Group=root

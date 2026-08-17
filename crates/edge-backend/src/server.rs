@@ -357,7 +357,7 @@ async fn publish_edge_copy_progress(
                     }
                 };
                 let scan_event = match control.scan_progress_snapshot().await {
-                    Ok(snapshot) if snapshot.scan_phase != "IDLE" => {
+                    Ok(snapshot) if should_publish_scan_progress_snapshot(&snapshot) => {
                         Some(scan_progress_event(&edge_code, snapshot))
                     }
                     Ok(_) => None,
@@ -383,6 +383,10 @@ async fn publish_edge_copy_progress(
             break;
         }
     }
+}
+
+fn should_publish_scan_progress_snapshot(snapshot: &ScanProgressSnapshot) -> bool {
+    matches!(snapshot.scan_phase, "SCANNING" | "ERROR")
 }
 
 fn scan_progress_event(edge_code: &str, snapshot: ScanProgressSnapshot) -> CopyProgressEvent {
@@ -1412,6 +1416,21 @@ mod tests {
         assert!(value.get("disk_status_code").is_none());
         assert!(value["disks"].as_array().unwrap().is_empty());
         assert!(value.get("status").is_none());
+    }
+
+    #[test]
+    fn websocket_scan_ticker_does_not_repeat_terminal_done_snapshots() {
+        let mut snapshot = ScanProgressSnapshot {
+            scan_phase: "SCANNING",
+            ..ScanProgressSnapshot::default()
+        };
+        assert!(should_publish_scan_progress_snapshot(&snapshot));
+
+        snapshot.scan_phase = "DONE";
+        assert!(!should_publish_scan_progress_snapshot(&snapshot));
+
+        snapshot.scan_phase = "IDLE";
+        assert!(!should_publish_scan_progress_snapshot(&snapshot));
     }
 
     #[test]
