@@ -1,0 +1,23 @@
+# EDGE 边缘端配置信息
+hostname=edge-VMware-Virtual-Platform
+username=edge
+IP_ADDRESS=192.168.128.130
+POSTGRES_IMAGE=postgres@sha256:33f923b05f64ca54ac4401c01126a6b92afe839a0aa0a52bc5aeb5cc958e5f20
+RUSTFS_IMAGE=rustfs/rustfs@sha256:84ce557a0245a06a9aae5516f55ee0f007fca78d41df356f419306fdc0cb168c
+POSTGRES_DB=rustfs_transfer_edge_dev
+POSTGRES_USER=fustfs_a_app
+POSTGRES_PASSWORD=cde4b0bfbd2847d032610399ab495f2f6d79ab691eb4703cc987cebbc869bb61
+POSTGRES_PORT=5432
+RUSTFS_API_PORT=9000
+RUSTFS_CONSOLE_PORT=9001
+POSTGRES_DATA_DIR=/srv/fustfs/a/postgres
+RUSTFS_DATA_DIR=/srv/fustfs/a/rustfs
+# RustFS credentials are private VM configuration; never commit actual values.
+RUSTFS_ACCESS_KEY=fustfsadc1491218121b7c4fada074f
+RUSTFS_SECRET_KEY=e1c9d5e910deb39b9620f7b9d6c02aab2e81816ee3694a434ab60df658aa22c1
+RUSTFS_RPC_SECRET=41bf8c1efcedbd363ec4ef82f888cdc2672e9c9eedbc83d039bd42d299775a29
+RUSTFS_CONSOLE_ENABLE=true
+RUST_LOG=error
+beijing
+
+nSl1oPLElL5y6JyOX7zycMklWlAm8PT8XQ6Co8PJ/Cc=
