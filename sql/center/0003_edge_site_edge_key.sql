@@ -3,10 +3,21 @@
 ALTER TABLE edge_site
     ADD COLUMN IF NOT EXISTS edge_key_ciphertext TEXT;
 
-UPDATE edge_site
-SET edge_key_ciphertext = auth_secret_ciphertext
-WHERE edge_key_ciphertext IS NULL
-  AND auth_secret_ciphertext IS NOT NULL;
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'edge_site'
+          AND column_name = 'auth_secret_ciphertext'
+    ) THEN
+        UPDATE edge_site
+        SET edge_key_ciphertext = auth_secret_ciphertext
+        WHERE edge_key_ciphertext IS NULL
+          AND auth_secret_ciphertext IS NOT NULL;
+    END IF;
+END $$;
 
 ALTER TABLE edge_site
     ALTER COLUMN edge_key_ciphertext SET NOT NULL;
