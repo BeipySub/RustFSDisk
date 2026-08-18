@@ -96,7 +96,7 @@ if ($edgeEnv -notmatch "RUSTFS_TRANSFER__RUSTFS__ACCESS_KEY_ID=CHANGE_ME_ACCESS_
 if ($edgeEnv -notmatch "RUSTFS_TRANSFER__RUSTFS__SECRET_ACCESS_KEY=CHANGE_ME_SECRET_KEY") {
     Add-Failure "edge.env.example must include RustFS secret key placeholder"
 }
-if ($edgeEnv -notmatch "RUSTFS_TRANSFER__PATHS__DISK_MOUNT_ROOTS=/mnt/rustfs-transfer,/media/rustfs-transfer") {
+if ($edgeEnv -notmatch "RUSTFS_TRANSFER__PATHS__DISK_MOUNT_ROOTS=/mnt/rustfs-transfer,/media,/run/media") {
     Add-Failure "edge.env.example must include explicit Edge disk mount roots"
 }
 if ($edgeEnv -match "RUSTFS_TRANSFER__CENTER__|RUSTFS_TRANSFER__SERVER__CONTROL_API_TOKEN|EDGE_AUTH_SECRET|AUTH_KEY_ID") {

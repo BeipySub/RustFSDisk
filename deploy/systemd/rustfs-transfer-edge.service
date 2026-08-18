@@ -19,7 +19,7 @@ RuntimeDirectory=rustfs-transfer-edge
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
-ReadWritePaths=/var/lib/rustfs-transfer /var/log/rustfs-transfer /mnt /media /run
+ReadWritePaths=/var/lib/rustfs-transfer /var/log/rustfs-transfer /mnt /media /run /run/media
 
 [Install]
 WantedBy=multi-user.target

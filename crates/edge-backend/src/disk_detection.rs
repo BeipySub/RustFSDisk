@@ -368,6 +368,7 @@ impl DiskProbe for ConfiguredMountProbe {
                     free_bytes,
                 });
             }
+            append_unique_disks(&mut disks, discover_mounted_usb_partitions());
             disks.extend(discover_unmounted_unsupported_usb_partitions());
             Ok(disks)
         })
@@ -1136,9 +1137,86 @@ fn device_metadata(device_path: &str) -> DeviceMetadata {
     metadata
 }
 
+fn discover_mounted_usb_partitions() -> Vec<DetectedDisk> {
+    let output = Command::new("lsblk")
+        .args([
+            "-P",
+            "-p",
+            "-n",
+            "-o",
+            "NAME,PKNAME,TYPE,MOUNTPOINT,FSTYPE,TRAN",
+        ])
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(parse_mounted_usb_partition)
+        .collect()
+}
+
+fn parse_mounted_usb_partition(line: &str) -> Option<DetectedDisk> {
+    let fields = parse_lsblk_pairs(line);
+    if fields.get("TYPE").map(String::as_str) != Some("part") {
+        return None;
+    }
+
+    let mount_path = fields.get("MOUNTPOINT")?.trim();
+    if mount_path.is_empty() {
+        return None;
+    }
+
+    let filesystem = fields.get("FSTYPE")?.trim().to_string();
+    if filesystem.is_empty() {
+        return None;
+    }
+
+    let device_path = fields.get("NAME")?.trim().to_string();
+    let parent_device_path = fields
+        .get("PKNAME")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let transport = fields
+        .get("TRAN")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let device_metadata = device_metadata_with_parent(&device_path, parent_device_path);
+    if !is_usb_lsblk_candidate(&device_metadata, transport) {
+        return None;
+    }
+
+    let mount_path = PathBuf::from(mount_path);
+    let (capacity_bytes, free_bytes) = disk_space_for_mount(&mount_path).unwrap_or((0, 0));
+    Some(DetectedDisk {
+        sn: device_metadata.hardware_sn().unwrap_or_default(),
+        device_path,
+        mount_path,
+        filesystem,
+        fs_uuid: device_metadata.fs_uuid,
+        label: device_metadata.label,
+        id_serial: device_metadata.id_serial,
+        id_serial_short: device_metadata.id_serial_short,
+        capacity_bytes,
+        free_bytes,
+    })
+}
+
 fn discover_unmounted_unsupported_usb_partitions() -> Vec<DetectedDisk> {
     let output = Command::new("lsblk")
-        .args(["-P", "-p", "-n", "-o", "NAME,TYPE,MOUNTPOINT,FSTYPE"])
+        .args([
+            "-P",
+            "-p",
+            "-n",
+            "-o",
+            "NAME,PKNAME,TYPE,MOUNTPOINT,FSTYPE,TRAN",
+        ])
         .output();
     let Ok(output) = output else {
         return Vec::new();
@@ -1171,8 +1249,18 @@ fn parse_unmounted_unsupported_usb_partition(line: &str) -> Option<DetectedDisk>
     }
 
     let device_path = fields.get("NAME")?.trim().to_string();
-    let device_metadata = device_metadata(&device_path);
-    if device_metadata.bus.as_deref() != Some("usb") {
+    let parent_device_path = fields
+        .get("PKNAME")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let transport = fields
+        .get("TRAN")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let device_metadata = device_metadata_with_parent(&device_path, parent_device_path);
+    if !is_usb_lsblk_candidate(&device_metadata, transport) {
         return None;
     }
 
@@ -1189,6 +1277,28 @@ fn parse_unmounted_unsupported_usb_partition(line: &str) -> Option<DetectedDisk>
         capacity_bytes,
         free_bytes: 0,
     })
+}
+
+fn device_metadata_with_parent(
+    device_path: &str,
+    parent_device_path: Option<&str>,
+) -> DeviceMetadata {
+    let mut metadata = device_metadata(device_path);
+    if metadata.bus.as_deref() == Some("usb") {
+        return metadata;
+    }
+
+    if let Some(parent_device_path) = parent_device_path {
+        let parent = device_metadata(parent_device_path);
+        metadata.id_serial_short = metadata.id_serial_short.or(parent.id_serial_short);
+        metadata.id_serial = metadata.id_serial.or(parent.id_serial);
+        metadata.bus = metadata.bus.or(parent.bus);
+    }
+    metadata
+}
+
+fn is_usb_lsblk_candidate(metadata: &DeviceMetadata, transport: Option<&str>) -> bool {
+    is_usb_block_device(metadata) || transport == Some("usb")
 }
 
 fn parse_lsblk_pairs(line: &str) -> HashMap<String, String> {
@@ -1225,6 +1335,19 @@ fn parse_lsblk_pairs(line: &str) -> HashMap<String, String> {
         rest = rest.get(consumed..).unwrap_or_default().trim_start();
     }
     fields
+}
+
+fn append_unique_disks(disks: &mut Vec<DetectedDisk>, candidates: Vec<DetectedDisk>) {
+    let mut seen = disks
+        .iter()
+        .map(|disk| (disk.device_path.clone(), disk.mount_path.clone()))
+        .collect::<HashSet<_>>();
+    for candidate in candidates {
+        let key = (candidate.device_path.clone(), candidate.mount_path.clone());
+        if seen.insert(key) {
+            disks.push(candidate);
+        }
+    }
 }
 
 fn block_device_size(device_path: &str) -> Option<u64> {
@@ -1294,23 +1417,32 @@ fn disk_space_for_mount(mount_path: &Path) -> Option<(u64, u64)> {
 fn discover_transport_mounts(mount_roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut mounts = Vec::new();
     for root in mount_roots {
-        if root.is_dir() {
-            mounts.push(root.clone());
-        }
-
-        let Ok(entries) = std::fs::read_dir(root) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                mounts.push(path);
-            }
-        }
+        discover_transport_mounts_inner(root, 0, &mut mounts);
     }
     mounts.sort();
     mounts.dedup();
     mounts
+}
+
+fn discover_transport_mounts_inner(path: &Path, depth: usize, mounts: &mut Vec<PathBuf>) {
+    if !path.is_dir() {
+        return;
+    }
+    mounts.push(path.to_path_buf());
+    if depth >= 2 {
+        return;
+    }
+
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let child = entry.path();
+        if child.is_dir() && child.file_name().and_then(|name| name.to_str()) != Some(PROTOCOL_ROOT)
+        {
+            discover_transport_mounts_inner(&child, depth + 1, mounts);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1923,6 +2055,22 @@ mod tests {
     }
 
     #[test]
+    fn configured_probe_discovers_desktop_user_mounts_two_levels_deep() {
+        let root = std::env::temp_dir().join(format!(
+            "rustfs-transfer-edge-test-root-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let user = root.join("alice");
+        let disk = user.join("RFS-A");
+        fs::create_dir_all(&disk).unwrap();
+
+        let mounts = discover_transport_mounts(&[root.clone()]);
+
+        assert_eq!(mounts, vec![root.clone(), user, disk]);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn device_metadata_prefers_short_serial_and_preserves_fs_identity() {
         let udev = r#"
 ID_SERIAL=USB_DISK_VENDOR_MODEL_LONG_SERIAL
@@ -1958,13 +2106,16 @@ ID_FS_TYPE=ext4
 
     #[test]
     fn parses_lsblk_pairs_for_unmounted_usb_partition_candidates() {
-        let fields =
-            parse_lsblk_pairs(r#"NAME="/dev/sdb1" TYPE="part" MOUNTPOINT="" FSTYPE="ntfs""#);
+        let fields = parse_lsblk_pairs(
+            r#"NAME="/dev/sdb1" PKNAME="/dev/sdb" TYPE="part" MOUNTPOINT="" FSTYPE="ntfs" TRAN="usb""#,
+        );
 
         assert_eq!(fields.get("NAME").map(String::as_str), Some("/dev/sdb1"));
+        assert_eq!(fields.get("PKNAME").map(String::as_str), Some("/dev/sdb"));
         assert_eq!(fields.get("TYPE").map(String::as_str), Some("part"));
         assert_eq!(fields.get("MOUNTPOINT").map(String::as_str), Some(""));
         assert_eq!(fields.get("FSTYPE").map(String::as_str), Some("ntfs"));
+        assert_eq!(fields.get("TRAN").map(String::as_str), Some("usb"));
     }
 
     #[test]
@@ -1984,6 +2135,27 @@ ID_FS_TYPE=ext4
         assert!(!should_include_mount_candidate(false, "ntfs", &local_ntfs));
         assert!(should_include_mount_candidate(false, "ext4", &local_ntfs));
         assert!(should_include_mount_candidate(true, "ntfs", &local_ntfs));
+    }
+
+    #[test]
+    fn mounted_usb_partition_is_discovered_outside_configured_roots() {
+        let candidate = parse_mounted_usb_partition(
+            r#"NAME="/dev/sdb1" PKNAME="/dev/sdb" TYPE="part" MOUNTPOINT="/media/alice/RFS-A" FSTYPE="ext4" TRAN="usb""#,
+        )
+        .expect("mounted usb partition should be detected");
+
+        assert_eq!(candidate.device_path, "/dev/sdb1");
+        assert_eq!(candidate.mount_path, PathBuf::from("/media/alice/RFS-A"));
+        assert_eq!(candidate.filesystem, "ext4");
+    }
+
+    #[test]
+    fn mounted_non_usb_partition_is_not_discovered_from_system_mount_table() {
+        let candidate = parse_mounted_usb_partition(
+            r#"NAME="/dev/sda2" PKNAME="/dev/sda" TYPE="part" MOUNTPOINT="/" FSTYPE="ext4" TRAN="sata""#,
+        );
+
+        assert!(candidate.is_none());
     }
 
     #[tokio::test]

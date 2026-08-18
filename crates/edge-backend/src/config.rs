@@ -405,7 +405,11 @@ fn default_log_dir() -> String {
 }
 
 fn default_disk_mount_roots() -> Vec<String> {
-    vec!["/mnt/rustfs-transfer".to_owned()]
+    vec![
+        "/mnt/rustfs-transfer".to_owned(),
+        "/media".to_owned(),
+        "/run/media".to_owned(),
+    ]
 }
 
 fn default_auto_export_min_ready_disk_count() -> usize {
@@ -451,7 +455,10 @@ mod tests {
         assert_eq!(config.edge.edge_code, "edge-a");
         assert_eq!(config.edge.edge_key, "example-dev-key");
         assert_eq!(config.rustfs.region, "us-east-1");
-        assert_eq!(config.paths.disk_mount_roots, vec!["/mnt/rustfs-transfer"]);
+        assert_eq!(
+            config.paths.disk_mount_roots,
+            vec!["/mnt/rustfs-transfer", "/media", "/run/media"]
+        );
         assert!(!config.auto_export.enabled);
         assert!(!config.auto_export.start_on_ready);
         assert_eq!(config.scan.reuse_window_minutes, 24 * 60);

@@ -14,9 +14,10 @@ The rescan template is intentionally a notification shim. It must only tell the 
 
 `rustfs-transfer-disk-rescan@.service` notifies Edge immediately after udev
 reports a block-device change. The service does not mount disks and does not add
-a fixed settle delay. Deployment must provide a real mount strategy and include
-that mount path in `RUSTFS_TRANSFER__PATHS__DISK_MOUNT_ROOTS`; Edge handles
-early notifications by rescanning current device state.
+a fixed settle delay. Deployment must provide a real mount strategy. Edge scans
+configured roots and the Linux block-device table; the default roots cover
+`/mnt/rustfs-transfer`, `/media/<user>/<label>`, and
+`/run/media/<user>/<label>`.
 
 Edge runtime configuration is loaded from `/etc/rustfs-transfer/edge.env`.
 Keep both
