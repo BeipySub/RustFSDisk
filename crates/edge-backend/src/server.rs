@@ -214,6 +214,7 @@ async fn readiness(State(state): State<AppState>) -> (StatusCode, Json<Readiness
 struct HealthResponse {
     ok: bool,
     service: &'static str,
+    export_dedup_version: &'static str,
     edge_code: String,
 }
 
@@ -222,6 +223,7 @@ impl HealthResponse {
         Self {
             ok: true,
             service: "rustfs-transfer-edge",
+            export_dedup_version: "source-identity-v2",
             edge_code: state.config.edge.edge_code.clone(),
         }
     }
@@ -1459,12 +1461,17 @@ mod tests {
             0,
             99,
         );
+        progress.set_disk_filesystem_type(
+            "11111111-1111-1111-1111-111111111111",
+            Some("ext4".to_string()),
+        );
         progress.complete_object("11111111-1111-1111-1111-111111111111");
         let copy_done = progress.snapshot("COPY_PROGRESS", "copy done");
         assert_eq!(copy_done.event_type, "COPY_DONE");
+        assert_eq!(copy_done.disks[0].filesystem_type.as_deref(), Some("ext4"));
         assert_eq!(
             copy_done.export_job.as_ref().unwrap().export_job_status,
-            "COPYING"
+            "SEALING"
         );
 
         progress.mark_disk_done("11111111-1111-1111-1111-111111111111");

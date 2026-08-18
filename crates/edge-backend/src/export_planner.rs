@@ -55,20 +55,9 @@ struct StableSnapshot {
 }
 
 const SELECT_EXPORTABLE_STABLE_SNAPSHOTS_SQL: &str = r#"
-WITH latest_scan AS (
-  SELECT scan_started_at, scan_finished_at
-  FROM edge_scan_run
-  WHERE scan_status = 'DONE'
-    AND scan_finished_at IS NOT NULL
-  ORDER BY scan_finished_at DESC
-  LIMIT 1
-)
 SELECT los.bucket, los.object_key, los.etag, los.size_bytes, los.last_modified
 FROM local_object_snapshot AS los
-CROSS JOIN latest_scan
 WHERE los.stable_status = 'STABLE'
-  AND los.scanned_at >= latest_scan.scan_started_at
-  AND los.scanned_at <= latest_scan.scan_finished_at
   AND NOT EXISTS (
     SELECT 1
     FROM export_object AS exported
@@ -78,11 +67,10 @@ WHERE los.stable_status = 'STABLE'
       AND exported.object_key = los.object_key
       AND exported.etag = los.etag
       AND exported.size_bytes = los.size_bytes
-      AND exported.last_modified = los.last_modified
       AND exported.status = 'EXPORTED'
       AND exported_job.status = 'SEALED'
   )
-ORDER BY los.id ASC
+ORDER BY los.bucket, los.object_key, los.etag, los.size_bytes
 "#;
 
 pub fn calculate_capacity_budget(free_bytes: u64, overhead: CapacityOverhead) -> CapacityBudget {
@@ -211,7 +199,16 @@ pub async fn create_export_plan_from_stable_snapshots(
         r#"
         UPDATE export_job
         SET object_count = $2,
-            total_bytes = $3
+            total_bytes = $3,
+            status = CASE WHEN $2 = 0 THEN 'CANCELLED' ELSE status END,
+            finish_time = CASE
+                WHEN $2 = 0 THEN NOW() AT TIME ZONE 'UTC'
+                ELSE finish_time
+            END,
+            error_message = CASE
+                WHEN $2 = 0 THEN 'no exportable object remains after historical deduplication'
+                ELSE error_message
+            END
         WHERE export_job_id = $1
         "#,
     )
@@ -417,6 +414,11 @@ mod tests {
 
     #[test]
     fn export_plan_skips_source_versions_already_exported_by_edge() {
+        assert!(
+            SELECT_EXPORTABLE_STABLE_SNAPSHOTS_SQL.contains("FROM local_object_snapshot AS los")
+        );
+        assert!(SELECT_EXPORTABLE_STABLE_SNAPSHOTS_SQL.contains("los.stable_status = 'STABLE'"));
+        assert!(!SELECT_EXPORTABLE_STABLE_SNAPSHOTS_SQL.contains("latest_scan"));
         assert!(SELECT_EXPORTABLE_STABLE_SNAPSHOTS_SQL.contains("NOT EXISTS"));
         assert!(SELECT_EXPORTABLE_STABLE_SNAPSHOTS_SQL.contains("FROM export_object AS exported"));
         assert!(SELECT_EXPORTABLE_STABLE_SNAPSHOTS_SQL.contains("JOIN export_job AS exported_job"));
@@ -430,7 +432,15 @@ mod tests {
         assert!(
             SELECT_EXPORTABLE_STABLE_SNAPSHOTS_SQL.contains("exported.size_bytes = los.size_bytes")
         );
-        assert!(SELECT_EXPORTABLE_STABLE_SNAPSHOTS_SQL
+        assert!(!SELECT_EXPORTABLE_STABLE_SNAPSHOTS_SQL
             .contains("exported.last_modified = los.last_modified"));
+    }
+
+    #[test]
+    fn empty_export_plan_is_terminal_and_does_not_block_later_exports() {
+        let planner_source = include_str!("export_planner.rs");
+
+        assert!(planner_source.contains("WHEN $2 = 0 THEN 'CANCELLED'"));
+        assert!(planner_source.contains("WHEN $2 = 0 THEN NOW() AT TIME ZONE 'UTC'"));
     }
 }

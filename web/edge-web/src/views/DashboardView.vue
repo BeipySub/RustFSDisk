@@ -129,8 +129,12 @@ const objectInventory = computed(() => {
 });
 const rustFsObjectTotal = computed(() => objectInventory.value.total_count);
 const rustFsTotalBytesLabel = computed(() => formatBytes(objectInventory.value.total_bytes));
-const exportedInventoryObjectCount = computed(() => objectInventory.value.exported_count);
-const exportedInventoryBytesLabel = computed(() => formatBytes(objectInventory.value.exported_bytes));
+const currentObjectOrdinalLabel = computed(() => {
+  const { object_done: objectDone, object_total: objectTotal } = viewSummary.value.global_progress;
+  if (objectTotal === 0) return "暂无";
+  if (objectDone >= objectTotal) return `已完成 ${objectTotal} / ${objectTotal}`;
+  return `第 ${objectDone + 1} / ${objectTotal} 个`;
+});
 const selectedProgressPercent = computed(() =>
   progressPercent(
     selectedDisk.value?.progress?.done_bytes ?? selectedDisk.value?.done_bytes ?? 0,
@@ -175,6 +179,12 @@ const hasCurrentExport = computed(() => {
   if (currentExportStatus.value === "PENDING" || currentExportStatus.value === "SCANNING") return true;
   return hasCurrentExportDisk.value;
 });
+const exportedInventoryObjectCount = computed(() =>
+  objectInventory.value.exported_count,
+);
+const exportedInventoryBytesLabel = computed(() =>
+  formatBytes(objectInventory.value.exported_bytes),
+);
 const exportStatusTitle = computed(() => {
   if (httpError.value) return "只读接口不可用";
   if (hasCurrentExport.value) return "当前导出进度";
@@ -472,9 +482,8 @@ onBeforeUnmount(() => {
         <img ref="sourceRackRef" alt="" class="source-rack" src="/assets/fustfs-baseline/source-rack-cutout-v3.webp"
           @load="updateParticlePathAnchors" />
       </button>
-      <ParticleAetherField v-if="showParticleStream" :end-x="particlePathAnchors.endX"
-        :end-y="particlePathAnchors.endY" :start-x="particlePathAnchors.startX"
-        :start-y="particlePathAnchors.startY" />
+      <ParticleAetherField v-if="showParticleStream" :end-x="particlePathAnchors.endX" :end-y="particlePathAnchors.endY"
+        :start-x="particlePathAnchors.startX" :start-y="particlePathAnchors.startY" />
       <div class="transport-array">
         <div ref="nasShellRef" class="nas-shell">
           <img alt="" src="/assets/fustfs-baseline/transport-bay-inner-black-clean-alpha.png"
@@ -523,8 +532,8 @@ onBeforeUnmount(() => {
             <dd>{{ rustFsObjectTotal.toLocaleString() }}</dd>
           </div>
           <div>
-            <dt>对象</dt>
-            <dd>{{ exportedInventoryObjectCount.toLocaleString() }}</dd>
+            <dt>当前序号</dt>
+            <dd>{{ currentObjectOrdinalLabel }}</dd>
           </div>
           <div>
             <dt>批次</dt>
@@ -622,7 +631,7 @@ onBeforeUnmount(() => {
             <dd>{{ rustFsTotalBytesLabel }}</dd>
           </div>
           <div>
-            <dt>已导出对象</dt>
+            <dt>已导出数量</dt>
             <dd>{{ exportedInventoryObjectCount.toLocaleString() }}</dd>
           </div>
           <div>
@@ -650,14 +659,15 @@ onBeforeUnmount(() => {
               <dd>{{ formatSpeed(selectedDisk.speed_bytes_per_sec ?? 0) }}</dd>
               <dt>对象标识</dt>
               <dd>{{ selectedDisk.current_object?.key ?? "未返回" }}</dd>
+              <dt>校验状态</dt>
+              <dd>{{ diskLifecycleStatusLabel(selectedDisk) }}</dd>
             </dl>
             <dl>
               <dt>加密状态</dt>
               <dd>{{ selectedDisk.current_object ? "已加密" : "未返回" }}</dd>
               <dt>写入阶段</dt>
               <dd>{{ selectedDisk.runtime_status }}</dd>
-              <dt>校验状态</dt>
-              <dd>{{ diskLifecycleStatusLabel(selectedDisk) }}</dd>
+
             </dl>
           </div>
           <p v-else class="object-empty">

@@ -27,11 +27,12 @@ pub trait ObjectSnapshotRepository: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct PgObjectSnapshotRepository {
     pool: PgPool,
+    scan_run_id: Uuid,
 }
 
 impl PgObjectSnapshotRepository {
-    pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+    pub fn new(pool: PgPool, scan_run_id: Uuid) -> Self {
+        Self { pool, scan_run_id }
     }
 }
 
@@ -48,7 +49,8 @@ impl ObjectSnapshotRepository for PgObjectSnapshotRepository {
 
             sqlx::query(
                 r#"
-                INSERT INTO local_object_snapshot (
+                INSERT INTO local_object_scan_stage (
+                    scan_run_id,
                     bucket,
                     object_key,
                     etag,
@@ -58,9 +60,17 @@ impl ObjectSnapshotRepository for PgObjectSnapshotRepository {
                     scanned_at,
                     stable_status
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                ON CONFLICT (scan_run_id, bucket, object_key) DO UPDATE
+                SET etag = EXCLUDED.etag,
+                    size_bytes = EXCLUDED.size_bytes,
+                    last_modified = EXCLUDED.last_modified,
+                    metadata_json = EXCLUDED.metadata_json,
+                    scanned_at = EXCLUDED.scanned_at,
+                    stable_status = EXCLUDED.stable_status
                 "#,
             )
+            .bind(self.scan_run_id)
             .bind(&object.bucket)
             .bind(&object.object_key)
             .bind(&object.etag)
@@ -115,7 +125,6 @@ impl ObjectSnapshotRepository for PgObjectSnapshotRepository {
                       AND exported.object_key = $4
                       AND exported.etag = $5
                       AND exported.size_bytes = $6
-                      AND exported.last_modified = $8
                       AND exported.status = 'EXPORTED'
                       AND exported_job.status = 'SEALED'
                 )

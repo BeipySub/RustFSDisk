@@ -35,6 +35,13 @@ const MARK_DISK_RUNTIME_DONE_AFTER_SEAL_SQL: &str = r#"
     WHERE disk_id = $1
     "#;
 
+const LOCAL_OBJECT_INVENTORY_SQL: &str = r#"
+    SELECT COUNT(*)::bigint AS total_count,
+           COALESCE(SUM(size_bytes), 0)::bigint AS total_bytes
+    FROM local_object_snapshot
+    WHERE stable_status = 'STABLE'
+    "#;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExportWorkerReport {
     pub disk_count: u64,
@@ -181,31 +188,40 @@ async fn install_copy_progress(
     edge_code: &str,
     export_job_id: Uuid,
 ) -> ProgressAggregator {
+    let mut slot = slot.write().await;
+    if let Some(progress) = slot.as_ref() {
+        if progress.matches_export_job(&export_job_id.to_string()) {
+            return progress.clone();
+        }
+    }
+
     let progress = ProgressAggregator::new(edge_code, export_job_id);
-    *slot.write().await = Some(progress.clone());
+    *slot = Some(progress.clone());
     progress
 }
 
 async fn load_object_inventory(pool: &PgPool) -> anyhow::Result<ObjectInventorySnapshot> {
-    let local = sqlx::query(
-        r#"
-        SELECT COUNT(*)::bigint AS total_count,
-               COALESCE(SUM(size_bytes), 0)::bigint AS total_bytes
-        FROM local_object_snapshot
-        "#,
-    )
-    .fetch_one(pool)
-    .await?;
+    let local = sqlx::query(LOCAL_OBJECT_INVENTORY_SQL)
+        .fetch_one(pool)
+        .await?;
     let exported = sqlx::query(
         r#"
         SELECT COUNT(*)::bigint AS exported_count,
                COALESCE(SUM(size_bytes), 0)::bigint AS exported_bytes
-        FROM (
-            SELECT bucket, object_key, MAX(size_bytes) AS size_bytes
-            FROM export_object
-            WHERE status = 'EXPORTED'
-            GROUP BY bucket, object_key
-        ) AS exported_source
+        FROM local_object_snapshot AS current_snapshot
+        WHERE current_snapshot.stable_status = 'STABLE'
+          AND EXISTS (
+              SELECT 1
+              FROM export_object AS exported
+              JOIN export_job AS exported_job
+                ON exported_job.export_job_id = exported.export_job_id
+              WHERE exported.bucket = current_snapshot.bucket
+                AND exported.object_key = current_snapshot.object_key
+                AND exported.etag = current_snapshot.etag
+                AND exported.size_bytes = current_snapshot.size_bytes
+                AND exported.status = 'EXPORTED'
+                AND exported_job.status = 'SEALED'
+          )
         "#,
     )
     .fetch_one(pool)
@@ -749,6 +765,9 @@ mod tests {
             1,
             50,
         );
+        worker_progress.set_disk_filesystem_type("disk-a", Some("ext4".to_string()));
+        let reused_worker_progress = install_copy_progress(&slot, "edge-a", export_job_id).await;
+        assert!(reused_worker_progress.matches_export_job(&export_job_id.to_string()));
         worker_progress.start_object(
             "disk-a",
             Uuid::new_v4().to_string(),
@@ -759,7 +778,8 @@ mod tests {
             0,
             100,
         );
-        worker_progress.add_bytes("disk-a", 40);
+        worker_progress.add_bytes("disk-a", 100);
+        worker_progress.complete_object("disk-a");
 
         let websocket_snapshot = slot
             .read()
@@ -772,11 +792,17 @@ mod tests {
             websocket_snapshot.export_job.unwrap().export_job_id,
             export_job_id.to_string()
         );
-        assert_eq!(websocket_snapshot.disks[0].done_bytes, 40);
+        assert_eq!(websocket_snapshot.disks[0].done_bytes, 100);
         assert_eq!(websocket_snapshot.disks[0].disk_presence_id, "presence-a");
         assert_eq!(websocket_snapshot.disks[0].capacity_bytes, 200);
+        assert_eq!(
+            websocket_snapshot.disks[0].filesystem_type.as_deref(),
+            Some("ext4")
+        );
         assert_eq!(websocket_snapshot.object_inventory.total_count, 3);
         assert_eq!(websocket_snapshot.object_inventory.total_bytes, 500);
+        assert_eq!(websocket_snapshot.object_inventory.exported_count, 1);
+        assert_eq!(websocket_snapshot.object_inventory.exported_bytes, 100);
         assert_eq!(
             websocket_snapshot.disks[0].current_file.as_deref(),
             Some("a.bin")
@@ -857,5 +883,12 @@ mod tests {
         assert!(!MARK_DISK_RUNTIME_DONE_AFTER_SEAL_SQL.contains("export_job"));
         assert!(!MARK_DISK_RUNTIME_DONE_AFTER_SEAL_SQL.contains("export_object"));
         assert!(!MARK_DISK_RUNTIME_DONE_AFTER_SEAL_SQL.contains("manifest"));
+    }
+
+    #[test]
+    fn copy_progress_inventory_uses_current_stable_snapshot() {
+        assert!(LOCAL_OBJECT_INVENTORY_SQL.contains("FROM local_object_snapshot"));
+        assert!(LOCAL_OBJECT_INVENTORY_SQL.contains("stable_status = 'STABLE'"));
+        assert!(!LOCAL_OBJECT_INVENTORY_SQL.contains("latest_scan"));
     }
 }

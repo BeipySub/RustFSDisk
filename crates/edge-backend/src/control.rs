@@ -35,6 +35,12 @@ const READY_DISKS_SQL: &str = r#"
       AND object_budget_bytes > 0
     ORDER BY id ASC
     "#;
+const LOCAL_OBJECT_INVENTORY_SQL: &str = r#"
+        SELECT COUNT(*)::bigint AS total_count,
+               COALESCE(SUM(size_bytes), 0)::bigint AS total_bytes
+        FROM local_object_snapshot
+        WHERE stable_status = 'STABLE'
+        "#;
 const LOAD_DISK_RUNTIME_SQL: &str = r#"
     WITH latest AS (
         SELECT DISTINCT ON (
@@ -504,7 +510,7 @@ impl ProductionEdgeControlService {
 
         let scanner = ObjectScanner::new(
             AwsS3RustFsReadClient::new(self.s3_client.clone()),
-            PgObjectSnapshotRepository::new(self.pool.clone()),
+            PgObjectSnapshotRepository::new(self.pool.clone(), scan_run_id),
             self.scan_progress.clone(),
         );
 
@@ -771,7 +777,7 @@ impl EdgeControlService for ProductionEdgeControlService {
 
     fn summary<'a>(&'a self) -> ControlFuture<'a, EdgeControlSummary> {
         Box::pin(async move {
-            let latest_export_job_id: Option<Uuid> = sqlx::query_scalar(
+            let active_export_job_id: Option<Uuid> = sqlx::query_scalar(
                 "SELECT export_job_id FROM export_job \
                      WHERE status IN ('PENDING', 'SCANNING', 'COPYING', 'SEALING') \
                      ORDER BY id DESC LIMIT 1",
@@ -780,12 +786,22 @@ impl EdgeControlService for ProductionEdgeControlService {
             .await
             .context("query latest active export job")?
             .flatten();
+            let latest_export_job_id = match active_export_job_id {
+                Some(export_job_id) => Some(export_job_id),
+                None => sqlx::query_scalar(
+                    "SELECT export_job_id FROM export_job ORDER BY id DESC LIMIT 1",
+                )
+                .fetch_optional(&self.pool)
+                .await
+                .context("query latest export job")?
+                .flatten(),
+            };
             let latest_export_job = match latest_export_job_id {
                 Some(export_job_id) => Some(load_export_job(&self.pool, export_job_id).await?),
                 None => None,
             };
             let object_inventory = load_object_inventory(&self.pool).await?;
-            let copy_progress = if let Some(active_job) = latest_export_job.as_ref() {
+            let copy_progress = if let Some(active_export_job_id) = active_export_job_id {
                 self.copy_progress
                     .read()
                     .await
@@ -796,7 +812,7 @@ impl EdgeControlService for ProductionEdgeControlService {
                     .filter(|snapshot| {
                         copy_progress_matches_export_job(
                             snapshot.export_job.as_ref(),
-                            active_job.export_job_id,
+                            active_export_job_id,
                         )
                     })
             } else {
@@ -857,7 +873,10 @@ impl EdgeControlService for ProductionEdgeControlService {
             .context("check copy progress export job activity")?;
             if !is_active {
                 *self.copy_progress.write().await = None;
-                return Ok(None);
+                return Ok(
+                    (snapshot.event_type == "SEAL_DONE" || snapshot.event_type == "ERROR")
+                        .then_some(snapshot),
+                );
             }
             Ok(Some(snapshot))
         })
@@ -994,6 +1013,10 @@ async fn finish_scan_run(
     scan_run_id: Uuid,
     report: &ScanReport,
 ) -> Result<(), ControlError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .context("begin successful scan promotion")?;
     sqlx::query(
         r#"
         UPDATE edge_scan_run
@@ -1013,9 +1036,38 @@ async fn finish_scan_run(
     .bind(saturating_i64(report.stable_object_count))
     .bind(saturating_i64(report.source_changed_count))
     .bind(saturating_i64(report.total_bytes))
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .context("mark RustFS scan run DONE")?;
+
+    sqlx::query("DELETE FROM local_object_snapshot")
+        .execute(&mut *tx)
+        .await
+        .context("clear previous current RustFS object snapshot")?;
+    sqlx::query(
+        r#"
+        INSERT INTO local_object_snapshot (
+            bucket, object_key, etag, size_bytes, last_modified,
+            metadata_json, scanned_at, stable_status
+        )
+        SELECT bucket, object_key, etag, size_bytes, last_modified,
+               metadata_json, scanned_at, stable_status
+        FROM local_object_scan_stage
+        WHERE scan_run_id = $1
+        "#,
+    )
+    .bind(scan_run_id)
+    .execute(&mut *tx)
+    .await
+    .context("promote successful RustFS object scan snapshot")?;
+    sqlx::query("DELETE FROM local_object_scan_stage WHERE scan_run_id = $1")
+        .bind(scan_run_id)
+        .execute(&mut *tx)
+        .await
+        .context("clear promoted RustFS object scan stage")?;
+    tx.commit()
+        .await
+        .context("commit successful scan promotion")?;
 
     Ok(())
 }
@@ -1026,6 +1078,7 @@ async fn fail_scan_run(
     error_code: &str,
     error_message: &str,
 ) -> Result<(), ControlError> {
+    let mut tx = pool.begin().await.context("begin failed scan cleanup")?;
     sqlx::query(
         r#"
         UPDATE edge_scan_run
@@ -1039,9 +1092,15 @@ async fn fail_scan_run(
     .bind(scan_run_id)
     .bind(error_code)
     .bind(error_message)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .context("mark RustFS scan run FAILED")?;
+    sqlx::query("DELETE FROM local_object_scan_stage WHERE scan_run_id = $1")
+        .bind(scan_run_id)
+        .execute(&mut *tx)
+        .await
+        .context("clear failed RustFS object scan stage")?;
+    tx.commit().await.context("commit failed scan cleanup")?;
 
     Ok(())
 }
@@ -1404,6 +1463,12 @@ async fn assigned_copy_progress_disk(
             batch.len() as u64,
             disk.free_bytes,
         );
+        progress.set_disk_filesystem_type(
+            &disk.disk_id.to_string(),
+            disk.mount_path
+                .as_deref()
+                .and_then(filesystem_type_from_mount),
+        );
     }
 }
 
@@ -1454,26 +1519,28 @@ fn copy_progress_matches_export_job(
 }
 
 async fn load_object_inventory(pool: &PgPool) -> Result<ObjectInventorySnapshot, ControlError> {
-    let local = sqlx::query(
-        r#"
-        SELECT COUNT(*)::bigint AS total_count,
-               COALESCE(SUM(size_bytes), 0)::bigint AS total_bytes
-        FROM local_object_snapshot
-        "#,
-    )
-    .fetch_one(pool)
-    .await
-    .context("load local object inventory")?;
+    let local = sqlx::query(LOCAL_OBJECT_INVENTORY_SQL)
+        .fetch_one(pool)
+        .await
+        .context("load local object inventory")?;
     let exported = sqlx::query(
         r#"
         SELECT COUNT(*)::bigint AS exported_count,
                COALESCE(SUM(size_bytes), 0)::bigint AS exported_bytes
-        FROM (
-            SELECT bucket, object_key, MAX(size_bytes) AS size_bytes
-            FROM export_object
-            WHERE status = 'EXPORTED'
-            GROUP BY bucket, object_key
-        ) AS exported_source
+        FROM local_object_snapshot AS current_snapshot
+        WHERE current_snapshot.stable_status = 'STABLE'
+          AND EXISTS (
+              SELECT 1
+              FROM export_object AS exported
+              JOIN export_job AS exported_job
+                ON exported_job.export_job_id = exported.export_job_id
+              WHERE exported.bucket = current_snapshot.bucket
+                AND exported.object_key = current_snapshot.object_key
+                AND exported.etag = current_snapshot.etag
+                AND exported.size_bytes = current_snapshot.size_bytes
+                AND exported.status = 'EXPORTED'
+                AND exported_job.status = 'SEALED'
+          )
         "#,
     )
     .fetch_one(pool)
@@ -2464,6 +2531,14 @@ mod tests {
         assert!(LOAD_DISK_RUNTIME_SQL.contains("ORDER BY id ASC"));
         assert!(!LOAD_DISK_RUNTIME_SQL.contains("DELETE FROM export_job"));
         assert!(!LOAD_DISK_RUNTIME_SQL.contains("DELETE FROM export_object"));
+    }
+
+    #[test]
+    fn local_object_inventory_counts_current_stable_snapshot_only() {
+        assert!(LOCAL_OBJECT_INVENTORY_SQL.contains("stable_status = 'STABLE'"));
+        assert!(LOCAL_OBJECT_INVENTORY_SQL.contains("FROM local_object_snapshot"));
+        assert!(!LOCAL_OBJECT_INVENTORY_SQL.contains("latest_scan"));
+        assert!(!LOCAL_OBJECT_INVENTORY_SQL.contains("DISTINCT ON"));
     }
 
     fn test_mount(case: &str, disk_id: Uuid) -> std::path::PathBuf {

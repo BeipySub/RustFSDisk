@@ -185,6 +185,7 @@ struct DiskProgress {
     disk_presence_id: String,
     disk_sn: String,
     mount_path: String,
+    filesystem_type: Option<String>,
     runtime_status: String,
     capacity_bytes: u64,
     total_bytes: u64,
@@ -253,6 +254,7 @@ impl ProgressAggregator {
                 disk_presence_id,
                 disk_sn,
                 mount_path,
+                filesystem_type: None,
                 runtime_status: "COPYING".to_string(),
                 capacity_bytes,
                 total_bytes,
@@ -264,6 +266,29 @@ impl ProgressAggregator {
                 message: "copying".to_string(),
             },
         );
+    }
+
+    pub fn set_disk_filesystem_type(&self, disk_id: &str, filesystem_type: Option<String>) {
+        let Some(filesystem_type) = filesystem_type.filter(|value| !value.is_empty()) else {
+            return;
+        };
+        if let Some(disk) = self
+            .inner
+            .lock()
+            .expect("progress mutex poisoned")
+            .disks
+            .get_mut(disk_id)
+        {
+            disk.filesystem_type = Some(filesystem_type);
+        }
+    }
+
+    pub fn matches_export_job(&self, export_job_id: &str) -> bool {
+        self.inner
+            .lock()
+            .expect("progress mutex poisoned")
+            .export_job_id
+            == export_job_id
     }
 
     pub fn start_object(
@@ -318,13 +343,29 @@ impl ProgressAggregator {
 
     pub fn complete_object(&self, disk_id: &str) {
         let mut state = self.inner.lock().expect("progress mutex poisoned");
+        let mut completed_size = None;
         if let Some(disk) = state.disks.get_mut(disk_id) {
-            disk.object_done = disk.object_done.saturating_add(1).min(disk.object_total);
             if let Some(current) = disk.current_object.as_mut() {
+                if current.object_status != "EXPORTED" {
+                    completed_size = Some(current.size_bytes);
+                    disk.object_done = disk.object_done.saturating_add(1).min(disk.object_total);
+                }
                 current.object_status = "EXPORTED".to_string();
                 current.done_bytes = current.size_bytes;
                 current.remaining_bytes = 0;
             }
+        }
+        if let Some(size_bytes) = completed_size {
+            state.object_inventory.exported_count = state
+                .object_inventory
+                .exported_count
+                .saturating_add(1)
+                .min(state.object_inventory.total_count);
+            state.object_inventory.exported_bytes = state
+                .object_inventory
+                .exported_bytes
+                .saturating_add(size_bytes)
+                .min(state.object_inventory.total_bytes);
         }
         if !state.disks.is_empty()
             && state
@@ -333,6 +374,7 @@ impl ProgressAggregator {
                 .all(|disk| disk.object_done >= disk.object_total)
         {
             state.event_type = "COPY_DONE".to_string();
+            state.export_job_status = "SEALING".to_string();
         }
     }
 
@@ -414,8 +456,8 @@ impl ProgressAggregator {
                     stable_hardware_id: disk.disk_sn.clone(),
                     device_path: String::new(),
                     mount_path: disk.mount_path.clone(),
-                    filesystem_type: None,
-                    filesystem: None,
+                    filesystem_type: disk.filesystem_type.clone(),
+                    filesystem: disk.filesystem_type.clone(),
                     fs_uuid: None,
                     filesystem_uuid: None,
                     capacity_bytes: disk.capacity_bytes,
