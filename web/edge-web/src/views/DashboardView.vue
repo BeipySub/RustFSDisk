@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import {
   DashboardHttpError,
+  diskFilesystemDisplay,
   edgeDiskPrimaryStatusLabel,
   diskStatusDisplay,
   fetchEdgeDashboardSummary,
@@ -578,7 +579,7 @@ onBeforeUnmount(() => {
           </div>
           <div>
             <dt>系统格式</dt>
-            <dd>{{ selectedDisk?.filesystem ?? selectedDisk?.filesystem_uuid ?? "未返回" }}</dd>
+            <dd>{{ diskFilesystemDisplay(selectedDisk) }}</dd>
           </div>
           <div>
             <dt>运行状态</dt>

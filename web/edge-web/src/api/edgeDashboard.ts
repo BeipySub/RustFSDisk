@@ -138,6 +138,12 @@ export interface EdgeDashboardSummary {
   message: string;
 }
 
+export function diskFilesystemDisplay(
+  disk: Pick<EdgeDiskProgress, "filesystem" | "filesystem_type"> | null | undefined,
+): string {
+  return disk?.filesystem_type ?? disk?.filesystem ?? "未返回";
+}
+
 export interface EdgeExportJobRecord {
   export_job_id: string;
   edge_code: string;

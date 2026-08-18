@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   buildExportJobsUrl,
+  diskFilesystemDisplay,
   edgeDiskPrimaryStatusLabel,
   diskStatusDisplay,
   isActiveExportJobStatus,
@@ -1066,6 +1067,54 @@ test("keeps imported lifecycle when websocket updates rejected runtime", () => {
   assert.equal(merged.disks[0]?.filesystem, "ext4");
   assert.equal(merged.disks[0]?.total_bytes, 100);
   assert.equal(edgeDiskPrimaryStatusLabel(merged.disks[0]!), "已导入");
+});
+
+test("does not display filesystem uuid as filesystem type", () => {
+  const summary = normalizeEdgeDashboardSummary({
+    source: "edge",
+    edge_code: "edge-demo",
+    edge_name: "edge-demo",
+    export_job: null,
+    global_progress: {
+      total_bytes: 0,
+      done_bytes: 0,
+      remaining_bytes: 0,
+      speed_bytes_per_sec: 0,
+      object_total: 0,
+      object_done: 0,
+      object_remaining: 0,
+    },
+    disks: [
+      {
+        disk_id: "",
+        disk_sn: "SN-1",
+        mount_path: "/media/edge/1418CE8F18CE6EF4",
+        runtime_status: "REJECTED",
+        capacity_bytes: 0,
+        reserve_bytes: 0,
+        object_budget_bytes: 0,
+        total_bytes: 0,
+        done_bytes: 0,
+        remaining_bytes: 0,
+        free_bytes: 0,
+        speed_bytes_per_sec: 0,
+        object_total: 0,
+        object_done: 0,
+        object_remaining: 0,
+        current_object: null,
+        fs_uuid: "1418CE8F18CE6EF4",
+        filesystem_uuid: "1418CE8F18CE6EF4",
+        message: "rejected",
+      },
+    ],
+    ws_connected: false,
+    last_http_refresh_at: "2026-08-18T10:00:00Z",
+    message: "summary",
+  });
+
+  assert.equal(summary.disks[0]?.filesystem, undefined);
+  assert.equal(summary.disks[0]?.filesystem_uuid, "1418CE8F18CE6EF4");
+  assert.equal(diskFilesystemDisplay(summary.disks[0]), "未返回");
 });
 
 test("keeps sealed lifecycle when websocket updates rejected runtime", () => {
