@@ -45,6 +45,21 @@ const LOCAL_OBJECT_INVENTORY_SQL: &str = r#"
       AND exported_job.status = 'SEALED'
     "#;
 
+const INSERT_ASSIGNED_OBJECT_SQL: &str = r#"
+    INSERT INTO export_object (
+        object_id, export_job_id, disk_id, bucket, object_key, storage_mode,
+        etag, size_bytes, estimated_landing_bytes, last_modified, frame_total, status
+    )
+    VALUES ($1, $2, $3, $4, $5, 'PACK', $6, $7, $8, $9, 0, 'ASSIGNED')
+    ON CONFLICT (export_job_id, bucket, object_key, etag, size_bytes, last_modified)
+    WHERE status IN ('PENDING', 'ASSIGNED', 'COPYING', 'EXPORTED')
+    DO UPDATE SET disk_id = EXCLUDED.disk_id,
+                  status = 'ASSIGNED',
+                  error_code = NULL,
+                  error_message = NULL
+    RETURNING id, object_id, bucket, object_key, etag, size_bytes, last_modified
+    "#;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExportWorkerReport {
     pub disk_count: u64,
@@ -643,33 +658,19 @@ impl PgExportObjectRepository {
         object: &ListedObject,
     ) -> Result<ExportObjectTask, DiskWorkerError> {
         self.handle.block_on(async {
-            let row = sqlx::query(
-                r#"
-                INSERT INTO export_object (
-                    object_id, export_job_id, disk_id, bucket, object_key, storage_mode,
-                    etag, size_bytes, estimated_landing_bytes, last_modified, frame_total, status
-                )
-                VALUES ($1, $2, $3, $4, $5, 'PACK', $6, $7, $8, $9, 0, 'ASSIGNED')
-                ON CONFLICT (export_job_id, bucket, object_key, etag, size_bytes, last_modified)
-                DO UPDATE SET disk_id = EXCLUDED.disk_id,
-                              status = 'ASSIGNED',
-                              error_code = NULL,
-                              error_message = NULL
-                RETURNING id, object_id, bucket, object_key, etag, size_bytes, last_modified
-                "#,
-            )
-            .bind(Uuid::new_v4())
-            .bind(export_job_id)
-            .bind(disk_id)
-            .bind(&object.bucket)
-            .bind(&object.object_key)
-            .bind(&object.etag)
-            .bind(object.size_bytes.min(i64::MAX as u64) as i64)
-            .bind(object.size_bytes.saturating_add(4096).min(i64::MAX as u64) as i64)
-            .bind(object.last_modified.naive_utc())
-            .fetch_one(&self.pool)
-            .await
-            .map_err(sqlx_err)?;
+            let row = sqlx::query(INSERT_ASSIGNED_OBJECT_SQL)
+                .bind(Uuid::new_v4())
+                .bind(export_job_id)
+                .bind(disk_id)
+                .bind(&object.bucket)
+                .bind(&object.object_key)
+                .bind(&object.etag)
+                .bind(object.size_bytes.min(i64::MAX as u64) as i64)
+                .bind(object.size_bytes.saturating_add(4096).min(i64::MAX as u64) as i64)
+                .bind(object.last_modified.naive_utc())
+                .fetch_one(&self.pool)
+                .await
+                .map_err(sqlx_err)?;
 
             Ok(ExportObjectTask {
                 id: row.get("id"),
@@ -1159,5 +1160,14 @@ mod tests {
         assert!(LOCAL_OBJECT_INVENTORY_SQL.contains("FROM export_object AS exported"));
         assert!(LOCAL_OBJECT_INVENTORY_SQL.contains("exported.status = 'EXPORTED'"));
         assert!(LOCAL_OBJECT_INVENTORY_SQL.contains("exported_job.status = 'SEALED'"));
+    }
+
+    #[test]
+    fn assigned_object_upsert_matches_partial_unique_index_predicate() {
+        assert!(INSERT_ASSIGNED_OBJECT_SQL.contains(
+            "ON CONFLICT (export_job_id, bucket, object_key, etag, size_bytes, last_modified)"
+        ));
+        assert!(INSERT_ASSIGNED_OBJECT_SQL
+            .contains("WHERE status IN ('PENDING', 'ASSIGNED', 'COPYING', 'EXPORTED')"));
     }
 }

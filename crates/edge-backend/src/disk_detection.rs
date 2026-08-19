@@ -318,7 +318,7 @@ impl ConfiguredMountProbe {
     }
 
     pub fn from_env() -> Self {
-        let mount_paths = std::env::var("RUSTFS_TRANSFER__TRANSPORT_MOUNT_PATHS")
+        let mount_paths = std::env::var("TRANSPORT_MOUNT_PATHS")
             .unwrap_or_default()
             .split(';')
             .map(str::trim)

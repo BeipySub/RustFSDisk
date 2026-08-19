@@ -207,7 +207,7 @@ fn worker_encrypts_writes_manifest_and_seals_disk() {
         object_key: "folder/object.txt".to_string(),
         etag: head.etag.clone(),
         size_bytes: head.size_bytes,
-        last_modified: head.last_modified,
+        last_modified: head.last_modified + chrono::Duration::milliseconds(494),
     });
 
     let key = [9_u8; 32];

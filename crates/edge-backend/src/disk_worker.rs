@@ -712,10 +712,7 @@ impl From<ExportedObjectUpdate> for ManifestObject {
 }
 
 fn ensure_head_matches_task(object: &ExportObjectTask, head: &SourceObjectHead) -> Result<()> {
-    if object.etag != head.etag
-        || object.size_bytes != head.size_bytes
-        || object.last_modified != head.last_modified
-    {
+    if object.etag != head.etag || object.size_bytes != head.size_bytes {
         return Err(DiskWorkerError::SourceChanged(format!(
             "{}/{} no longer matches assigned snapshot",
             object.bucket, object.object_key

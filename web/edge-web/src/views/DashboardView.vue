@@ -10,7 +10,6 @@ import {
   isEdgeUninitializedDiskIssue,
   isEdgeUnregisteredDiskIssue,
   isEdgeUnsupportedDiskIssue,
-  isActiveExportJobStatus,
   type EdgeDashboardSummary,
   type EdgeDiskProgress,
   type EdgeReadiness,
@@ -95,27 +94,13 @@ const transportSlots = computed(() =>
 );
 const selectedDisk = computed(() => disks.value.find((disk) => disk.disk_id === selectedDiskId.value) ?? null);
 const currentExportJob = computed(() => viewSummary.value.export_job);
-const currentExportStatus = computed(() => currentExportJob.value?.export_job_status);
 const currentExportJobId = computed(() => currentExportJob.value?.export_job_id ?? "");
-const hasCurrentExportDisk = computed(
-  () =>
-    Boolean(currentExportJobId.value) &&
-    disks.value.some(
-      (disk) =>
-        disk.export_job_id === currentExportJobId.value &&
-        disk.runtime_status !== "DONE" &&
-        disk.runtime_status !== "REMOVED",
-    ),
-);
 const showParticleStream = computed(
   () =>
     Boolean(currentExportJobId.value) &&
     disks.value.some(
       (disk) => disk.export_job_id === currentExportJobId.value && disk.runtime_status === "COPYING",
     ),
-);
-const globalProgressPercent = computed(() =>
-  progressPercent(viewSummary.value.global_progress.done_bytes, viewSummary.value.global_progress.total_bytes),
 );
 const objectInventory = computed(() => {
   return (
@@ -127,14 +112,12 @@ const objectInventory = computed(() => {
     }
   );
 });
-const rustFsObjectTotal = computed(() => objectInventory.value.total_count);
-const rustFsTotalBytesLabel = computed(() => formatBytes(objectInventory.value.total_bytes));
-const currentObjectOrdinalLabel = computed(() => {
-  const { object_done: objectDone, object_total: objectTotal } = viewSummary.value.global_progress;
-  if (objectTotal === 0) return "暂无";
-  if (objectDone >= objectTotal) return `已完成 ${objectTotal} / ${objectTotal}`;
-  return `第 ${objectDone + 1} / ${objectTotal} 个`;
-});
+const currentExportObjectDone = computed(() =>
+  currentExportJob.value?.object_done ?? viewSummary.value.global_progress.object_done,
+);
+const currentExportDoneBytes = computed(() =>
+  currentExportJob.value?.done_bytes ?? viewSummary.value.global_progress.done_bytes,
+);
 const selectedProgressPercent = computed(() =>
   progressPercent(
     selectedDisk.value?.progress?.done_bytes ?? selectedDisk.value?.done_bytes ?? 0,
@@ -168,33 +151,19 @@ const selectedDiskShortName = computed(() => {
   const serial = disk.disk_sn ? `SN...${disk.disk_sn.slice(-4)}` : "SN 未返回";
   return `盘位 ${selectedSlotLabel.value}（${serial}）`;
 });
-const estimatedDone = computed(() => {
-  const speed = viewSummary.value.global_progress.speed_bytes_per_sec;
-  if (speed <= 0) return "等待速度";
-  return formatDuration(Math.ceil(viewSummary.value.global_progress.remaining_bytes / speed));
-});
-const isEmpty = computed(() => !isRefreshing.value && !httpError.value && disks.value.length === 0);
-const hasCurrentExport = computed(() => {
-  if (!isActiveExportJobStatus(currentExportStatus.value)) return false;
-  if (currentExportStatus.value === "PENDING") return true;
-  return hasCurrentExportDisk.value;
-});
 const exportedInventoryObjectCount = computed(() =>
   objectInventory.value.exported_count,
 );
 const exportedInventoryBytesLabel = computed(() =>
   formatBytes(objectInventory.value.exported_bytes),
 );
-const exportStatusTitle = computed(() => {
-  if (httpError.value) return "只读接口不可用";
-  if (hasCurrentExport.value) return "当前导出进度";
-  return "当前无导出任务";
-});
-const exportStatusNotice = computed(() => {
-  if (httpError.value) return `Edge Dashboard 只读接口不可用：${httpError.value.error_code}。当前不展示模拟数据。`;
-  if (hasCurrentExport.value) return `WS：${wsMessage.value}`;
-  if (isEmpty.value) return "未检测到运输盘；插入未注册盘或异常盘后会显示在盘位区。";
-  return "运输盘已被探测，但当前没有运行中的导出任务。";
+const currentExportBytesLabel = computed(() => formatBytes(currentExportDoneBytes.value));
+const objectPanelEmptyText = computed(() => {
+  const disk = selectedDisk.value;
+  if (!disk) return "未选中运输盘。未注册或异常盘只有在 Edge 后端检测并返回后才会显示。";
+  if (disk.disk_status_code === "SEALED" || disk.runtime_status === "DONE") return "当前盘已封盘，无活动对象。";
+  if (disk.runtime_status === "READY") return "当前盘可用，等待单盘导出开始。";
+  return "当前没有活动对象。";
 });
 
 watch(
@@ -372,26 +341,13 @@ function decodeHexAscii(value: string): string | undefined {
 }
 
 function slotUsedBytes(disk: EdgeDiskProgress): number {
-  const capacityBytes = disk.capacity_bytes ?? 0;
-  if (capacityBytes > 0) {
-    return Math.max(0, capacityBytes - Math.min(disk.free_bytes, capacityBytes));
-  }
   const total = slotTotalBytes(disk);
-  const doneBytes = disk.progress?.done_bytes ?? disk.done_bytes;
-  if (doneBytes > 0) return Math.min(total, doneBytes);
   if (total > 0 && disk.free_bytes > 0) return Math.max(0, total - disk.free_bytes);
   return 0;
 }
 
 function slotTotalBytes(disk: EdgeDiskProgress): number {
-  return (
-    disk.capacity_bytes ||
-    disk.object_budget_bytes ||
-    disk.total_bytes ||
-    (disk.progress?.done_bytes ?? disk.done_bytes) + (disk.progress?.remaining_bytes ?? disk.remaining_bytes) ||
-    disk.free_bytes ||
-    0
-  );
+  return disk.capacity_bytes || disk.object_budget_bytes || disk.free_bytes || 0;
 }
 
 function slotProgressPercent(disk: EdgeDiskProgress): number {
@@ -429,13 +385,6 @@ function progressPercent(doneBytes: number, totalBytes: number): number {
 
 function formatPercent(doneBytes: number, totalBytes: number): string {
   return `${progressPercent(doneBytes, totalBytes).toFixed(1)}%`;
-}
-
-function formatDuration(totalSeconds: number): string {
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = totalSeconds % 60;
-  return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
 }
 
 onMounted(() => {
@@ -511,64 +460,6 @@ onBeforeUnmount(() => {
       </div>
     </section>
 
-    <section :class="['global-progress', 'glass-panel', { idle: !hasCurrentExport }]">
-      <div>
-        <span>{{ exportStatusTitle }}</span>
-        <strong v-if="hasCurrentExport">{{ globalProgressPercent.toFixed(0) }}<small>%</small></strong>
-        <strong v-else>--<small></small></strong>
-        <em>{{ hasCurrentExport ? currentExportStatus : "IDLE" }}</em>
-      </div>
-      <div v-if="hasCurrentExport" class="progress-main">
-        <p>
-          <span>已完成 <b>{{ formatBytes(viewSummary.global_progress.done_bytes) }}</b> / {{
-            formatBytes(viewSummary.global_progress.total_bytes) }}</span>
-          <span>剩余 <b>{{ formatBytes(viewSummary.global_progress.remaining_bytes) }}</b></span>
-          <span>速度 <b>{{ formatSpeed(viewSummary.global_progress.speed_bytes_per_sec) }}</b></span>
-        </p>
-        <div class="progress-track"><b :style="{ width: `${globalProgressPercent}%` }"></b></div>
-        <dl>
-          <div>
-            <dt>文件</dt>
-            <dd>{{ rustFsObjectTotal.toLocaleString() }}</dd>
-          </div>
-          <div>
-            <dt>当前序号</dt>
-            <dd>{{ currentObjectOrdinalLabel }}</dd>
-          </div>
-          <div>
-            <dt>批次</dt>
-            <dd>{{ currentExportJobId || "暂无" }}</dd>
-          </div>
-          <div>
-            <dt>预计完成</dt>
-            <dd>{{ estimatedDone }}</dd>
-          </div>
-        </dl>
-      </div>
-      <div v-else class="progress-main idle-copy">
-        <p>{{ exportStatusNotice }}</p>
-        <dl>
-          <div>
-            <dt>现场盘位</dt>
-            <dd>{{ disks.length }} 盘位</dd>
-          </div>
-          <div>
-            <dt>未注册盘</dt>
-            <dd>会展示</dd>
-          </div>
-          <div>
-            <dt>历史批次</dt>
-            <dd>同步记录</dd>
-          </div>
-          <div>
-            <dt>浏览器权限</dt>
-            <dd>只读</dd>
-          </div>
-        </dl>
-      </div>
-    </section>
-
-
     <section v-if="selectedDisk && selectedDiskDetailVisible" class="selected-disk-strip glass-panel"
       aria-label="选中磁盘详情">
       <div class="selected-disk-content">
@@ -618,24 +509,24 @@ onBeforeUnmount(() => {
       </button>
     </section>
 
-    <section v-if="!httpError" :class="['dashboard-lower-grid', { compact: !hasCurrentExport }]">
+    <section v-if="!httpError" class="dashboard-lower-grid compact">
       <article class="overview-panel glass-panel">
         <h2>导出概览</h2>
         <dl class="overview-metrics">
           <div>
-            <dt>对象总数</dt>
-            <dd>{{ rustFsObjectTotal.toLocaleString() }}</dd>
+            <dt>本次导出对象</dt>
+            <dd>{{ currentExportObjectDone.toLocaleString() }}</dd>
           </div>
           <div>
-            <dt>总数据量</dt>
-            <dd>{{ rustFsTotalBytesLabel }}</dd>
+            <dt>本次导出数据量</dt>
+            <dd>{{ currentExportBytesLabel }}</dd>
           </div>
           <div>
-            <dt>已导出数量</dt>
+            <dt>累计已导出对象</dt>
             <dd>{{ exportedInventoryObjectCount.toLocaleString() }}</dd>
           </div>
           <div>
-            <dt>已导出数据量</dt>
+            <dt>累计已导出数据量</dt>
             <dd>{{ exportedInventoryBytesLabel }}</dd>
           </div>
         </dl>
@@ -644,35 +535,33 @@ onBeforeUnmount(() => {
       <article class="object-panel object-wide-panel glass-panel">
         <div class="object-current-block">
           <h2>当前对象与异常处理</h2>
-          <div v-if="selectedDisk" class="object-detail-grid">
+          <div v-if="selectedDisk && selectedDisk.current_object" class="object-detail-grid">
             <dl>
               <dt>对象路径</dt>
-              <dd>{{ selectedDisk.current_object?.key ?? "暂无" }}</dd>
+              <dd>{{ selectedDisk.current_object.key }}</dd>
               <dt>对象状态</dt>
-              <dd class="tone-running">{{ selectedDisk.current_object?.object_status ?? "等待对象" }}</dd>
+              <dd class="tone-running">{{ selectedDisk.current_object.object_status }}</dd>
               <dt>剩余大小</dt>
-              <dd>{{ formatBytes(selectedDisk.current_object?.remaining_bytes ?? 0) }} / {{
-                formatBytes(selectedDisk.current_object?.size_bytes ?? 0) }}</dd>
+              <dd>{{ formatBytes(selectedDisk.current_object.remaining_bytes) }} / {{
+                formatBytes(selectedDisk.current_object.size_bytes) }}</dd>
             </dl>
             <dl>
               <dt>传输速度</dt>
               <dd>{{ formatSpeed(selectedDisk.speed_bytes_per_sec ?? 0) }}</dd>
               <dt>对象标识</dt>
-              <dd>{{ selectedDisk.current_object?.key ?? "未返回" }}</dd>
+              <dd>{{ selectedDisk.current_object.key }}</dd>
               <dt>校验状态</dt>
               <dd>{{ diskLifecycleStatusLabel(selectedDisk) }}</dd>
             </dl>
             <dl>
               <dt>加密状态</dt>
-              <dd>{{ selectedDisk.current_object ? "已加密" : "未返回" }}</dd>
+              <dd>已加密</dd>
               <dt>写入阶段</dt>
               <dd>{{ selectedDisk.runtime_status }}</dd>
 
             </dl>
           </div>
-          <p v-else class="object-empty">
-            未选中运输盘。未注册或异常盘只有在 Edge 后端检测并返回后才会显示。
-          </p>
+          <p v-else class="object-empty">{{ objectPanelEmptyText }}</p>
           <div class="object-progress-row">
             <div class="progress-track object-progress"><b :style="{ width: `${currentObjectProgressPercent}%` }"></b>
             </div>
