@@ -12,7 +12,7 @@ use crate::{
     },
     progress::{CopyProgressEvent, GlobalProgressSnapshot},
     realtime::EdgeRealtimeHub,
-    rescan::{DiskRescanAccepted, DiskRescanCoordinator, DiskRescanTrigger},
+    rescan::{DiskRescanCoordinator, DiskRescanTrigger},
     scanner::ScanProgressSnapshot,
 };
 use axum::response::IntoResponse;
@@ -24,7 +24,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::sync::Arc;
 use tokio::time::{self, Duration};
 use tower_http::trace::TraceLayer;
@@ -94,13 +94,32 @@ impl AppState {
             .request_rescan(DiskRescanTrigger::startup())
             .await;
     }
+
+    pub fn spawn_disk_polling(&self) {
+        if !self.config.disk_polling.enabled {
+            tracing::info!("edge disk polling disabled");
+            return;
+        }
+
+        let interval_seconds = self.config.disk_polling.interval_seconds.max(1);
+        let disk_rescan = self.disk_rescan.clone();
+        tokio::spawn(async move {
+            let mut interval = time::interval(Duration::from_secs(interval_seconds));
+            loop {
+                interval.tick().await;
+                disk_rescan
+                    .request_rescan(DiskRescanTrigger::polling())
+                    .await;
+            }
+        });
+        tracing::info!(interval_seconds, "edge disk polling enabled");
+    }
 }
 
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(liveness))
         .route("/readyz", get(readiness))
-        .route("/internal/disk/rescan", post(request_disk_rescan))
         .route("/api/edge/dashboard/summary", get(edge_dashboard_summary))
         .route(
             "/api/edge/dashboard/export-jobs",
@@ -130,54 +149,6 @@ pub fn app(state: AppState) -> Router {
 
 async fn liveness(State(state): State<AppState>) -> Json<HealthResponse> {
     Json(HealthResponse::alive(&state))
-}
-
-async fn request_disk_rescan(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(request): Json<DiskRescanRequest>,
-) -> (StatusCode, Json<DiskRescanApiResponse>) {
-    let Some(expected_token) = state.config.rescan_token() else {
-        tracing::error!("edge disk rescan endpoint is disabled because no token is configured");
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(DiskRescanApiResponse::error(
-                "RESCAN_TOKEN_MISSING",
-                "rescan token is not configured",
-            )),
-        );
-    };
-
-    let provided_token = headers
-        .get("X-Rescan-Token")
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim);
-    if provided_token != Some(expected_token) {
-        tracing::warn!(
-            trigger = request.trigger.as_deref(),
-            device = request.device.as_deref(),
-            "rejected unauthorized edge disk rescan request"
-        );
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(DiskRescanApiResponse::error(
-                "UNAUTHORIZED",
-                "invalid rescan token",
-            )),
-        );
-    }
-
-    let trigger = if request.trigger.as_deref() == Some("udev") {
-        DiskRescanTrigger::udev(request.device)
-    } else {
-        DiskRescanTrigger::manual(request.device)
-    };
-    let accepted = state.disk_rescan.request_rescan(trigger).await;
-
-    (
-        StatusCode::ACCEPTED,
-        Json(DiskRescanApiResponse::accepted(accepted)),
-    )
 }
 
 async fn readiness(State(state): State<AppState>) -> (StatusCode, Json<ReadinessResponse>) {
@@ -567,40 +538,6 @@ fn authorize_control_api(_state: &AppState, _headers: &HeaderMap) -> Result<(), 
         message: "edge manual control API has been removed from the delivery configuration"
             .to_string(),
     }))
-}
-
-#[derive(Debug, Deserialize)]
-struct DiskRescanRequest {
-    trigger: Option<String>,
-    device: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct DiskRescanApiResponse {
-    accepted: bool,
-    queued: bool,
-    error_code: Option<&'static str>,
-    message: String,
-}
-
-impl DiskRescanApiResponse {
-    fn accepted(accepted: DiskRescanAccepted) -> Self {
-        Self {
-            accepted: accepted.accepted,
-            queued: accepted.queued,
-            error_code: None,
-            message: accepted.message,
-        }
-    }
-
-    fn error(error_code: &'static str, message: impl Into<String>) -> Self {
-        Self {
-            accepted: false,
-            queued: false,
-            error_code: Some(error_code),
-            message: message.into(),
-        }
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1510,9 +1447,6 @@ mod tests {
             endpoint = "http://127.0.0.1:9000"
             access_key_id = "edge-access-key"
             secret_access_key = "edge-secret-key"
-
-            [rescan]
-            token = "local-rescan-token"
         "#;
         let config = EdgeConfig::from_toml(raw).unwrap();
         let fake = Arc::new(FakeHealth);

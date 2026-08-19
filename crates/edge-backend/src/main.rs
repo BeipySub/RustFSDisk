@@ -14,6 +14,7 @@ async fn main() -> anyhow::Result<()> {
     let edge_code = config.edge.edge_code.clone();
     let state = AppState::from_config(config).await?;
     state.request_startup_disk_scan().await;
+    state.spawn_disk_polling();
     let listener = TcpListener::bind(bind)
         .await
         .with_context(|| format!("bind edge HTTP listener on {bind}"))?;

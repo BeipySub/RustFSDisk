@@ -44,7 +44,7 @@ rustfs-transfer/
 │           ├── db/               # PostgreSQL/sqlx 本地运行账本
 │           ├── scanner/          # 边缘 RustFS S3 流式扫描器
 │           ├── exporter/         # 分块、AES 加密写入、fsync 与封盘引擎
-│           ├── udev/             # udev 事件处理与防抖
+│           ├── rescan/           # 运输盘轮询、变化识别与防抖
 │           └── main.rs
 │
 ├── web/                          # 前端项目
@@ -73,10 +73,7 @@ rustfs-transfer/
 ├── deploy/                       # 部署与系统配置文件
 │   ├── systemd/                  # 服务守护配置
 │   │   ├── rustfs-transfer-center.service
-│   │   ├── rustfs-transfer-edge.service
-│   │   └── rustfs-transfer-disk-rescan@.service
-│   ├── udev/                     # 硬盘热插拔规则
-│   │   └── 99-rustfs-transfer-disk.rules
+│   │   └── rustfs-transfer-edge.service
 │   └── config/                   # 示例配置文件
 │       ├── center.example.toml
 │       ├── center.env.example
@@ -92,8 +89,8 @@ rustfs-transfer/
 - 不引入 ORM、复杂任务队列或额外消息中间件。
 - `center-backend` 和 `edge-backend` 不直接互相依赖；共享类型和工具放入 `crates/common/`。
 - 中控端和边缘端前端独立部署。
-- systemd 文件放在 `deploy/systemd/`，udev 规则放在 `deploy/udev/`。
-- udev 只触发 rescan 通知服务，不直接执行导出或导入业务逻辑。
+- systemd 文件放在 `deploy/systemd/`；运输盘热插拔由 Edge 后端内置轮询识别。
+- 不再部署 udev 规则、rescan helper 或 rescan oneshot 服务。
 - Center 结构化示例配置放在 `deploy/config/center.example.toml`；Edge 运行配置只使用 `deploy/config/edge.env.example`。
 - 真实 KEY、数据库密码、RustFS secret 和部署密钥不得提交。
 - `Cargo.lock` 需要提交，用于锁定 Rust 依赖版本。

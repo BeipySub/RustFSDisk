@@ -78,7 +78,7 @@
 - 插盘/扫描/导出事件统一从后端权威状态发布，前端只消费，不本地推断完成态。
 - 浏览器仍只读，不接触控制 token、`disk_data_key`、`edge_auth_secret`、nonce、tag 或 `data_key_id`。
 - 自动导出必须可配置关闭；默认上线可灰度启用，失败时能回退到现有受控 API。
-- udev 仍只触发 rescan，不直接导出；自动编排由 Edge 常驻服务在准入通过后启动。
+- Edge 后端内置轮询只触发 rescan，不直接导出；自动编排由 Edge 常驻服务在准入通过后启动。
 - RustFS 成功扫描快照复用窗口由 Edge 配置 `scan.reuse_window_minutes` 控制，单位分钟；设为 `0` 时每次自动编排都扫描 RustFS。
 - 导出计划只允许使用最近一次成功扫描窗口内确认上传完成的 `STABLE` 对象；正在上传、覆盖或扫描期间变化的对象不得计入统计和导出队列。
 
@@ -88,7 +88,7 @@
 | Edge Event Stream | Agent D4 | TASK-S1-EDGE-WS-BOOT-001 | 可与自动编排并行 | 插盘、校验、扫描、导出、封盘统一 WS 事件 |
 | Edge Web Production | Agent E3 | TASK-S1-WEB-EDGE-PROD-001 | 可先基于 fixture/contract 并行 | 去预览兜底、去写操作入口、真实空态/错误态 |
 | Edge Web Timeline | Agent E4 | TASK-S1-WEB-EDGE-TIMELINE-001 | 等 WS 字段冻结后对接 | 每盘时间线、插盘即时反馈、多盘进度 |
-| Deploy / Toggle | Agent F1 | TASK-S1-EDGE-AUTO-DEPLOY-001 | 跟自动编排并行 | 配置开关、systemd/udev 静态检查、回滚说明 |
+| Deploy / Toggle | Agent F1 | TASK-S1-EDGE-AUTO-DEPLOY-001 | 跟自动编排并行 | 配置开关、轮询部署检查、回滚说明 |
 | QA / Integration | Agent F2 | TASK-S1-EDGE-REALTIME-QA-001 | 依赖前四项可用 | 浏览器真实联调、插盘 1 秒反馈、端到端验收记录 |
 
 ## 不可降级底线
@@ -151,7 +151,7 @@
 | TASK-S1-WEB-CENTER-001 | 中控端 DashboardView、HTTP 汇总和 WS 进度展示 | P2 交付增强 | Web / Center | [x] | Day 1-2 | TASK-S1-TEST-001 |
 | TASK-S1-DASHBOARD-REALTIME-001 | 双端真实 Dashboard HTTP summary 与本端 WebSocket 推送 | P0 解阻塞 | Center / Edge / Web | [x] | Day 2 联调修补 | TASK-S1-WEB-EDGE-001, TASK-S1-WEB-CENTER-001 |
 | TASK-S1-P1-EDGE-WEB-CONTRACT-001 | Edge Web 浏览器安全只读契约补齐 | P1 主闭环 | Edge / Web contract | [x] | Day 2 审计修补 | TASK-S1-DASHBOARD-REALTIME-001, TASK-S1-WEB-EDGE-001 |
-| TASK-S1-DEPLOY-001 | systemd、udev、配置示例和本地联调脚本 | P2 交付增强 | Deploy | [x] | Day 1-2 | TASK-S1-CENTER-001, TASK-S1-EDGE-001 |
+| TASK-S1-DEPLOY-001 | systemd、轮询配置示例和本地联调脚本 | P2 交付增强 | Deploy | [x] | Day 1-2 | TASK-S1-CENTER-001, TASK-S1-EDGE-001 |
 | TASK-S1-EDGE-AUTO-001 | Edge 插盘后自动扫描、自动建任务和自动启动导出编排 | P0 解阻塞 | Edge | [x] | Day 3 上午 | TASK-S1-EDGE-002, TASK-S1-EDGE-003, TASK-S1-EDGE-004, TASK-S1-EDGE-005 |
 | TASK-S1-EDGE-WS-BOOT-001 | Edge 插盘、校验、扫描和封盘阶段 WebSocket 事件补齐 | P0 解阻塞 | Edge / Web contract | [x] | Day 3 上午 | TASK-S1-DASHBOARD-REALTIME-001, TASK-S1-EDGE-002 |
 | TASK-S1-WEB-EDGE-PROD-001 | Edge Dashboard 生产态清理与浏览器只读收口 | P1 主闭环 | Web / Edge | [x] | Day 3 上午 | TASK-S1-P1-EDGE-WEB-CONTRACT-001 |
@@ -822,7 +822,7 @@ disk_data_key = HMAC-SHA256(
 
 ### 安全与状态机边界
 
-- 服务启动扫描、udev rescan 和 READY 运行态不得自动写盘、自动导出或自动导入。
+- 服务启动扫描、轮询 rescan 和 READY 运行态不得自动写盘、自动导出或自动导入。
 - 明文 `disk_data_key` 不得来自配置、请求或数据库，不得写入日志、数据库或运输盘。
 - Center/Edge 在线交互仍只走 HTTP HMAC API；WebSocket 只用于本端前端进度推送。
 - ImportWorker 失败路径不得写 `IMPORTED`，不得写入 `object_ledger`。
@@ -950,7 +950,7 @@ disk_data_key = HMAC-SHA256(
 
 ### 任务目标与范围
 
-- **核心目标**：服务启动扫描已有运输盘，接入 udev 变化入口，读取 SN、容量、挂载点、文件系统、`disk_info.json`，调用中控 `/api/disk/verify`。
+- **核心目标**：服务启动扫描已有运输盘，接入内置轮询变化入口，读取 SN、容量、挂载点、文件系统、`disk_info.json`，调用中控 `/api/disk/verify`。
 - **对应代码位置**：`crates/edge-backend/src/`
 
 ### 协议与数据结构约束
@@ -1959,7 +1959,7 @@ disk_data_key = HMAC-SHA256(
 ### 任务基本信息
 
 - **任务 ID**：TASK-S1-DEPLOY-001
-- **任务名称**：systemd、udev、配置示例和本地联调脚本
+- **任务名称**：systemd、轮询配置示例和本地联调脚本
 - **所属 Track / 模块**：
   - [ ] Track 1: Common
   - [x] Track 2: Edge (`deploy/`, `scripts/`)
@@ -1972,8 +1972,8 @@ disk_data_key = HMAC-SHA256(
 
 ### 任务目标与范围
 
-- **核心目标**：完善 systemd、udev、配置示例和本地联调脚本，支持快速启动双端、执行迁移和模拟运输盘目录。
-- **对应代码位置**：`deploy/systemd/`、`deploy/udev/`、`deploy/config/`、`scripts/`
+- **核心目标**：完善 systemd、轮询配置示例和本地联调脚本，支持快速启动双端、执行迁移和模拟运输盘目录。
+- **对应代码位置**：`deploy/systemd/`、`deploy/config/`、`scripts/`
 
 ### 协议与数据结构约束
 
@@ -1982,13 +1982,13 @@ disk_data_key = HMAC-SHA256(
 
 ### 安全与状态机边界
 
-- udev 只触发磁盘变化识别，不直接执行业务导出或导入。
+- 轮询只触发磁盘变化识别，不直接执行业务导出或导入。
 - 示例配置不得包含真实密钥。
 
 ### 验收与检查清单
 
 - [ ] systemd 服务文件能启动 center 和 edge。
-- [ ] udev 规则不会直接执行导出或导入业务。
+- [ ] 已删除 udev 规则，磁盘变化由 Edge 后端内置轮询识别。
 - [ ] 脚本能创建本地联调用模拟运输盘目录。
 
 ---
@@ -2146,7 +2146,7 @@ disk_data_key = HMAC-SHA256(
 
 ### 任务目标与范围
 
-- **核心目标**：新增 Edge 自动编排模块，在运输盘准入为 `READY` 后自动串起扫描 RustFS、创建导出任务、启动导出 Worker，并保证重复 udev / 启动扫描不会重复创建同一轮导出。
+- **核心目标**：新增 Edge 自动编排模块，在运输盘准入为 `READY` 后自动串起扫描 RustFS、创建导出任务、启动导出 Worker，并保证重复轮询 / 启动扫描不会重复创建同一轮导出。
 - **建议代码位置**：`crates/edge-backend/src/auto_export.rs`、`crates/edge-backend/src/server.rs`、`crates/edge-backend/src/rescan.rs`、`crates/edge-backend/src/control.rs`。
 
 ### Interface 设计
@@ -2167,7 +2167,7 @@ disk_data_key = HMAC-SHA256(
 
 ### 安全与状态机边界
 
-- udev 仍只触发 rescan；自动导出由 Edge 常驻服务执行。
+- 轮询只触发 rescan；自动导出由 Edge 常驻服务执行。
 - 自动编排不得绕过本地 ext4、`disk_info.json`、`center_signature`、`disk_status_code = INITIALIZED`、`.partial` 恢复检查和活动任务门禁。
 - 自动编排不得依赖 Center `/api/disk/verify` 或 `/api/disk/export-key`；本次封盘 `disk_data_key` 必须由部署阶段 `edge_auth_secret` 本地派生。
 - 缺少 `center.edge_auth_secret` 或派生失败时不得开始加密导出；中控不可达不得阻塞 Edge 离线导出主流程。
@@ -2181,7 +2181,7 @@ disk_data_key = HMAC-SHA256(
 - [x] 服务启动时已有 READY 盘也能自动进入流程。
 - [x] 扫描复用按 `scan.reuse_window_minutes` 执行；设为 `0` 时重复自动流程会重新扫描 RustFS。
 - [x] 自动导出只包含最近一次成功扫描确认上传完成的 `STABLE` 对象。
-- [x] 连续 udev 重复事件不会重复创建多个活动 export_job。
+- [x] 连续轮询重复事件不会重复创建多个活动 export_job。
 - [x] 已存在活动 export_job 时不会启动第二个自动任务。
 - [x] 缺少本地 `edge_auth_secret` 或密钥派生失败时不启动导出，并留下可机读错误。
 - [x] `cargo fmt --all -- --check` 通过。
@@ -2360,13 +2360,13 @@ disk_data_key = HMAC-SHA256(
 ### 任务目标与范围
 
 - **核心目标**：让 Edge 自动流程可部署、可灰度、可回滚，并把上线检查写进静态验证和运行手册。
-- **对应代码位置**：`deploy/config/edge.example.toml`、`deploy/systemd/`、`deploy/udev/`、`scripts/check-deploy.ps1`、`docs/上线要求.md`。
+- **对应代码位置**：`deploy/config/edge.example.toml`、`deploy/systemd/`、`scripts/check-deploy.ps1`、`docs/上线要求.md`。
 
 ### 协议与数据结构约束
 
 - 新增配置只能控制是否自动触发 scan/export，不改变协议字段、状态码或数据库语义。
 - 默认值必须保守；如默认不开启，部署说明必须写清如何开启。
-- udev 规则不得直接包含 export、import、cleanup、reinitialize、mkfs 或 format 业务动作。
+- 已删除 udev 规则；轮询路径不得直接包含 export、import、cleanup、reinitialize、mkfs 或 format 业务动作。
 
 ### 安全与状态机边界
 
@@ -2377,7 +2377,7 @@ disk_data_key = HMAC-SHA256(
 ### 验收与检查清单
 
 - [x] 示例配置包含自动流程开关和说明。
-- [x] 静态检查能确认 udev 仍只触发 rescan。
+- [x] 静态检查能确认 udev/rescan helper 已删除，Edge 使用内置轮询。
 - [x] 部署说明包含开启、关闭、回滚和排障步骤。
 - [x] `scripts/check-deploy.ps1` 通过。
 - [x] 自动流程关闭后原受控 scan/export/start 仍可用。

@@ -6,18 +6,14 @@ Install the binaries under `/opt/rustfs-transfer/`:
 
 - `/opt/rustfs-transfer/rustfs-transfer-center`
 - `/opt/rustfs-transfer/rustfs-transfer-edge`
-- `/opt/rustfs-transfer/bin/rustfs-transfer-rescan`
 
 Install configuration under `/etc/rustfs-transfer/` and runtime data under `/var/lib/rustfs-transfer/`.
 
-The rescan template is intentionally a notification shim. It must only tell the local daemon that block devices changed; export, import, cleanup, and reinitialization work stay inside the long-running center or edge service.
-
-`rustfs-transfer-disk-rescan@.service` notifies Edge immediately after udev
-reports a block-device change. The service does not mount disks and does not add
-a fixed settle delay. Deployment must provide a real mount strategy. Edge scans
-configured roots and the Linux block-device table; the default roots cover
-`/mnt/rustfs-transfer`, `/media/<user>/<label>`, and
-`/run/media/<user>/<label>`.
+Edge detects transport disk changes through its built-in polling loop. No udev
+rule, rescan helper, or rescan oneshot service is installed. Deployment must
+still provide a real mount strategy. Edge scans configured roots and the Linux
+block-device table; the default roots cover `/mnt/rustfs-transfer`,
+`/media/<user>/<label>`, and `/run/media/<user>/<label>`.
 
 Edge runtime configuration is loaded from `/etc/rustfs-transfer/edge.env`.
 Keep both

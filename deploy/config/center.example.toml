@@ -5,7 +5,7 @@ protocol_version = "1.0"
 
 [server]
 bind = "0.0.0.0:8080"
-control_api_token_env = "RUSTFS_TRANSFER__SERVER__CONTROL_API_TOKEN"
+control_api_token_env = "CONTROL_API_TOKEN"
 
 [database]
 url = "postgres://rustfs_transfer_center:change-me@127.0.0.1:5432/rustfs_transfer_center"
@@ -22,6 +22,5 @@ log_dir = "/var/log/rustfs-transfer/center"
 transport_mount_root = "/mnt/rustfs-transfer"
 
 [security]
-local_master_key_env = "RUSTFS_TRANSFER__SECURITY__LOCAL_MASTER_KEY"
-center_signature_key_env = "RUSTFS_TRANSFER__SECURITY__CENTER_SIGNATURE_KEY"
-
+local_master_key_env = "LOCAL_MASTER_KEY"
+center_signature_key_env = "CENTER_SIGNATURE_KEY"

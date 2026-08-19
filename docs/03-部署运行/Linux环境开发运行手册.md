@@ -96,7 +96,7 @@ sqlx migrate run --source sql/edge
 开发环境推荐把运行文件放在项目目录下的 `.runtime/`，这样不用把配置和临时数据散到系统目录里，也方便清理。
 
 ```bash
-cd ~/RustFSDisk-dev
+cd ~/RustFSDisk
 mkdir -p .runtime/edge-data
 mkdir -p .runtime/edge-log
 mkdir -p .runtime/mnt
@@ -107,45 +107,62 @@ nano .runtime/edge.env
 `.runtime/edge.env` 至少要配置以下内容：
 
 ```bash
-RUSTFS_TRANSFER__SERVER__BIND=0.0.0.0:8081
+# Edge 服务监听地址
+EDGE_BIND=0.0.0.0:8081
 
-RUSTFS_TRANSFER__DATABASE__URL=postgres://用户名:密码@PostgreSQL地址:5432/edge库名
+# Edge 本地 PostgreSQL，保存扫描结果、导出任务和运输盘运行态
+DATABASE_URL=postgres://用户名:密码@PostgreSQL地址:5432/edge库名
 
-RUSTFS_TRANSFER__EDGE__EDGE_CODE=Center里创建的edge_code
-RUSTFS_TRANSFER__EDGE__EDGE_KEY=Center里创建站点后生成的KEY
+# Edge 站点编码和 Center 生成的 Edge KEY
+EDGE_CODE=Center里创建的edge_code
+EDGE_KEY=Center里创建站点后生成的KEY
 
-RUSTFS_TRANSFER__RESCAN__TOKEN=本机自定义重扫令牌
-RUSTFS_TRANSFER__SCAN__REUSE_WINDOW_MINUTES=5
+# RustFS 扫描结果复用窗口，单位分钟
+SCAN_REUSE_MINUTES=5
 
-RUSTFS_TRANSFER__RUSTFS__ENDPOINT=http://RustFS地址:9000
-RUSTFS_TRANSFER__RUSTFS__REGION=us-east-1
-RUSTFS_TRANSFER__RUSTFS__ACCESS_KEY_ID=RustFS访问KEY
-RUSTFS_TRANSFER__RUSTFS__SECRET_ACCESS_KEY=RustFS访问SECRET
+# 插拔盘识别轮询开关和间隔
+DISK_POLLING_ENABLED=true
+DISK_POLLING_INTERVAL_SECONDS=1
 
-RUSTFS_TRANSFER__PATHS__DATA_DIR=./.runtime/edge-data
-RUSTFS_TRANSFER__PATHS__LOG_DIR=./.runtime/edge-log
-RUSTFS_TRANSFER__PATHS__TRANSPORT_MOUNT_ROOT=./.runtime/mnt
-RUSTFS_TRANSFER__PATHS__DISK_MOUNT_ROOTS=./.runtime/mnt,/media/$USER
+# RustFS / S3 兼容服务配置
+RUSTFS_ENDPOINT=http://RustFS地址:9000
+RUSTFS_REGION=us-east-1
+RUSTFS_ACCESS_KEY=RustFS访问KEY
+RUSTFS_SECRET_KEY=RustFS访问SECRET
 
-RUSTFS_TRANSFER__AUTO_EXPORT__ENABLED=false
-RUSTFS_TRANSFER__AUTO_EXPORT__START_ON_READY=false
-RUSTFS_TRANSFER__AUTO_EXPORT__MIN_READY_DISK_COUNT=1
-RUSTFS_TRANSFER__AUTO_EXPORT__COOLDOWN_SECONDS=60
+# Edge 本地目录和运输盘扫描目录
+DATA_DIR=./.runtime/edge-data
+LOG_DIR=./.runtime/edge-log
+TRANSPORT_MOUNT_ROOT=./.runtime/mnt
+DISK_MOUNT_ROOTS=./.runtime/mnt,/media/$USER
+
+# 是否允许插盘后自动扫描 RustFS、创建导出任务并开始写盘
+AUTO_EXPORT_ENABLED=false
+
+# 服务启动或轮询发现 READY 盘后，是否自动启动导出
+AUTO_EXPORT_START_ON_READY=false
+
+# 至少有几块 READY 运输盘才允许自动导出
+AUTO_EXPORT_MIN_READY_DISK_COUNT=1
+
+# 自动导出冷却时间，单位秒，避免重复触发
+AUTO_EXPORT_COOLDOWN_SECONDS=60
 ```
 
 注意：
 
 - 不要再配置 `RUSTFS_TRANSFER__CONFIG_PATH`。
 - 不要再创建或维护 `edge.toml`。
-- `RUSTFS_TRANSFER__EDGE__EDGE_CODE` 和 `RUSTFS_TRANSFER__EDGE__EDGE_KEY` 必须来自 Center 的 Edge 站点管理。
-- `RUSTFS_TRANSFER__RESCAN__TOKEN` 是本机重扫接口令牌，可以自己随机写，但不要和 Edge KEY 混用。
-- 如果 Linux 桌面自动把 U 盘挂载到 `/media/用户名/...`，必须保留 `/media/$USER` 到 `RUSTFS_TRANSFER__PATHS__DISK_MOUNT_ROOTS`。
-- `.runtime/edge.env` 是通过 shell 的 `. .runtime/edge.env` 加载的，所以 `/media/$USER` 会展开成当前用户名。systemd 的 `EnvironmentFile` 不按这个方式展开变量，正式服务配置不要直接照搬 `/media/$USER`。
+- `EDGE_CODE` 和 `EDGE_KEY` 必须来自 Center 的 Edge 站点管理。
+- `DISK_POLLING_ENABLED=true` 后，Edge 后端会按间隔自动识别插拔盘。
+- 轮询只推最终状态，不再把 `DETECTED/CHECKING` 临时状态推给前端，避免页面在“未注册/已初始化”之间反复跳。
+- 如果 Linux 桌面自动把 U 盘挂载到 `/media/用户名/...`，必须保留 `/media/$USER` 到 `DISK_MOUNT_ROOTS`。
+- `.runtime/edge.env` 是通过 shell 的 `. .runtime/edge.env` 加载的，所以 `/media/$USER` 会展开成当前用户名。
 
 ## 5. 启动 Edge 后端
 
 ```bash
-cd ~/RustFSDisk-dev
+cd ~/RustFSDisk
 
 set -a
 . .runtime/edge.env
@@ -216,7 +233,7 @@ sudo mount /dev/sdX1 .runtime/mnt
 如果硬盘挂载在 `/media/$USER/...`，Edge 会通过：
 
 ```bash
-RUSTFS_TRANSFER__PATHS__DISK_MOUNT_ROOTS=./.runtime/mnt,/media/$USER
+DISK_MOUNT_ROOTS=./.runtime/mnt,/media/$USER
 ```
 
 一起扫描。
@@ -236,13 +253,7 @@ rm .runtime/mnt/.edge-write-test
 curl -s http://127.0.0.1:8081/api/edge/dashboard/summary
 ```
 
-如果已经安装了 `deploy/systemd/` 下的 udev/systemd 重扫服务，系统会在 udev 事件后短暂等待，再通知 Edge 重新扫描，用来降低“通知早于自动挂载完成”的概率。可以查看重扫日志：
-
-```bash
-journalctl -u 'rustfs-transfer-disk-rescan@*' -n 50 --no-pager
-```
-
-如果没有安装 systemd/udev 配套服务，插盘后不会自动触发 rescan。开发阶段可以先重启 Edge 进程，或者后续再安装 `deploy/systemd/` 下的服务文件。
+Edge 后端默认通过内置轮询识别插拔盘。`DISK_POLLING_INTERVAL_SECONDS=1` 时，正常情况下插盘或拔盘后最多 1 秒进入下一轮扫描。
 
 ## 8. 正式服务目录方式
 
@@ -270,7 +281,7 @@ sudo nano /etc/rustfs-transfer/edge.env
 正式服务模式下，如果也要扫描桌面自动挂载目录，不要写 `/media/$USER`，要写实际用户名路径，例如：
 
 ```bash
-RUSTFS_TRANSFER__PATHS__DISK_MOUNT_ROOTS=/mnt/rustfs-transfer,/media/edge
+DISK_MOUNT_ROOTS=/mnt/rustfs-transfer,/media/edge
 ```
 
 开发运行不强制使用这些目录。只有要接近正式部署、systemd 托管、统一日志和系统权限管理时，才推荐使用。
@@ -300,7 +311,7 @@ curl -s http://127.0.0.1:8081/api/edge/dashboard/summary
 如果 `lsblk` 能看到，确认挂载点是否包含在：
 
 ```bash
-echo "$RUSTFS_TRANSFER__PATHS__DISK_MOUNT_ROOTS"
+echo "$DISK_MOUNT_ROOTS"
 ```
 
 修改 `.runtime/edge.env` 后，必须重启 `cargo watch`，因为环境变量只在进程启动时读取一次。
@@ -321,7 +332,7 @@ sudo systemctl stop rustfs-transfer-edge.service
 
 ### 9.4 数据库连接失败
 
-确认 `RUSTFS_TRANSFER__DATABASE__URL` 指向外部 Edge 数据库，并且 Linux 电脑能访问数据库端口：
+确认 `DATABASE_URL` 指向外部 Edge 数据库，并且 Linux 电脑能访问数据库端口：
 
 ```bash
 nc -vz PostgreSQL地址 5432
@@ -346,8 +357,7 @@ curl -I http://RustFS地址:9000
 ## 10. 每次开发的常用命令
 
 ```bash
-cd ~/RustFSDisk-dev
-git pull
+cd ~/RustFSDisk
 
 set -a
 . .runtime/edge.env

@@ -38,7 +38,7 @@ pub struct AutoExportTrigger {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AutoExportTriggerSource {
     Startup,
-    Udev,
+    Polling,
     Manual,
     Queued,
 }
@@ -85,7 +85,7 @@ impl AutoExportOrchestrator {
         let decision = self.run_ready_flow(&trigger).await;
         let mut state = self.state.lock().await;
         state.running = false;
-        // A hot-plug notification can arrive before Linux finishes mounting the partition.
+        // A disk can appear in the mount table before its protocol files are readable.
         // Do not consume the cooldown until an initialized disk is actually ready.
         if decision.outcome == AutoExportOutcome::NoReadyDisk {
             state.last_attempt_at = None;
@@ -273,7 +273,7 @@ impl DiskRescanRunner for AutoExportRescanRunner {
 
             if !matches!(
                 trigger.source,
-                DiskRescanSource::Startup | DiskRescanSource::Udev
+                DiskRescanSource::Startup | DiskRescanSource::Polling
             ) {
                 return Ok(record_count);
             }
@@ -306,7 +306,7 @@ impl From<DiskRescanTrigger> for AutoExportTrigger {
         Self {
             source: match value.source {
                 DiskRescanSource::Startup => AutoExportTriggerSource::Startup,
-                DiskRescanSource::Udev => AutoExportTriggerSource::Udev,
+                DiskRescanSource::Polling => AutoExportTriggerSource::Polling,
                 DiskRescanSource::Manual => AutoExportTriggerSource::Manual,
                 DiskRescanSource::Queued => AutoExportTriggerSource::Queued,
                 DiskRescanSource::ControlRefresh => AutoExportTriggerSource::Manual,
@@ -639,7 +639,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn udev_rescan_rechecks_until_the_disk_is_ready_before_starting_auto_export() {
+    async fn polling_rescan_rechecks_until_the_disk_is_ready_before_starting_auto_export() {
         let control = Arc::new(FakeControl {
             ready_after_summary_calls: Some(2),
             ..FakeControl::default()
@@ -648,7 +648,7 @@ mod tests {
         let runner = AutoExportRescanRunner::new(Arc::new(NoopRescanRunner), orchestrator);
 
         runner
-            .run_disk_rescan(DiskRescanTrigger::udev(Some("/dev/sdb1".to_owned())))
+            .run_disk_rescan(DiskRescanTrigger::polling())
             .await
             .unwrap();
 
@@ -692,7 +692,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cooldown_blocks_repeated_udev_events_before_scan_or_export() {
+    async fn cooldown_blocks_repeated_polling_events_before_scan_or_export() {
         let control = Arc::new(FakeControl::default());
         let orchestrator = AutoExportOrchestrator::new(
             AutoExportConfig {
@@ -797,8 +797,8 @@ mod tests {
 
     fn trigger() -> AutoExportTrigger {
         AutoExportTrigger {
-            source: AutoExportTriggerSource::Udev,
-            device: Some("/dev/sdb".to_owned()),
+            source: AutoExportTriggerSource::Polling,
+            device: None,
         }
     }
 

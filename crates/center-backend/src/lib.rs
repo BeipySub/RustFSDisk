@@ -20,9 +20,11 @@ use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Postgres, QueryBuilder, Row};
 use tokio::{
     sync::RwLock,
+    task::JoinHandle,
     time::{self, Duration},
 };
 use tower_http::trace::TraceLayer;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 pub mod center_auth;
@@ -84,6 +86,28 @@ impl AppState {
     ) -> Self {
         self.reinitialize_control = Some(reinitialize_control);
         self
+    }
+
+    pub fn spawn_disk_polling(&self, interval_seconds: u64) -> JoinHandle<()> {
+        let service = self.service.clone();
+        let interval_seconds = interval_seconds.max(1);
+        tokio::spawn(async move {
+            let mut interval = time::interval(Duration::from_secs(interval_seconds));
+            loop {
+                interval.tick().await;
+                match service.dashboard_summary().await {
+                    Ok(summary) => {
+                        info!(
+                            disk_count = summary.disks.len(),
+                            "center disk polling completed"
+                        );
+                    }
+                    Err(error) => {
+                        warn!(%error, "center disk polling failed");
+                    }
+                }
+            }
+        })
     }
 }
 

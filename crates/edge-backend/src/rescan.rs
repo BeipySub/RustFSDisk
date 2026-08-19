@@ -5,14 +5,6 @@ use crate::disk_detection::{
 use serde::Serialize;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tokio::time::Duration;
-
-#[cfg(not(test))]
-const UDEV_SETTLE_RESCAN_DELAYS: &[Duration] =
-    &[Duration::from_millis(300), Duration::from_secs(2)];
-#[cfg(test)]
-const UDEV_SETTLE_RESCAN_DELAYS: &[Duration] =
-    &[Duration::from_millis(5), Duration::from_millis(5)];
 
 pub trait DiskRescanRunner: Send + Sync + 'static {
     fn run_disk_rescan<'a>(
@@ -34,10 +26,10 @@ where
         Box::pin(async move {
             let records = match trigger.source {
                 DiskRescanSource::Startup => self.scan_existing_transport_disks().await?,
-                DiskRescanSource::Udev
+                DiskRescanSource::Polling
                 | DiskRescanSource::Manual
                 | DiskRescanSource::Queued
-                | DiskRescanSource::ControlRefresh => self.handle_udev_disk_change().await?,
+                | DiskRescanSource::ControlRefresh => self.handle_disk_change().await?,
             };
             Ok(records.len())
         })
@@ -47,7 +39,7 @@ where
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiskRescanSource {
     Startup,
-    Udev,
+    Polling,
     Manual,
     Queued,
     ControlRefresh,
@@ -67,10 +59,10 @@ impl DiskRescanTrigger {
         }
     }
 
-    pub fn udev(device: Option<String>) -> Self {
+    pub fn polling() -> Self {
         Self {
-            source: DiskRescanSource::Udev,
-            device,
+            source: DiskRescanSource::Polling,
+            device: None,
         }
     }
 
@@ -168,7 +160,6 @@ impl DiskRescanCoordinator {
     }
 
     async fn run_until_idle(&self, mut trigger: DiskRescanTrigger) {
-        let mut udev_settle_rescan_index = 0;
         loop {
             tracing::info!(
                 source = ?trigger.source,
@@ -193,22 +184,6 @@ impl DiskRescanCoordinator {
                 state.pending = false;
                 drop(state);
                 trigger = DiskRescanTrigger::queued();
-                udev_settle_rescan_index = 0;
-                continue;
-            }
-
-            if trigger.source == DiskRescanSource::Udev
-                && udev_settle_rescan_index < UDEV_SETTLE_RESCAN_DELAYS.len()
-            {
-                let delay = UDEV_SETTLE_RESCAN_DELAYS[udev_settle_rescan_index];
-                udev_settle_rescan_index += 1;
-                drop(state);
-                tracing::info!(
-                    device = trigger.device.as_deref(),
-                    delay_ms = delay.as_millis() as u64,
-                    "scheduling follow-up edge disk rescan after udev settle delay"
-                );
-                tokio::time::sleep(delay).await;
                 continue;
             }
 
@@ -256,10 +231,10 @@ mod tests {
         }));
 
         let first = coordinator
-            .request_rescan(DiskRescanTrigger::udev(Some("/dev/sdb".to_owned())))
+            .request_rescan(DiskRescanTrigger::polling())
             .await;
         let second = coordinator
-            .request_rescan(DiskRescanTrigger::udev(Some("/dev/sdc".to_owned())))
+            .request_rescan(DiskRescanTrigger::polling())
             .await;
 
         assert!(!first.queued);
@@ -269,22 +244,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn udev_rescan_runs_follow_up_scans_after_settle_delays() {
+    async fn polling_rescan_runs_once_without_settle_retries() {
         let calls = Arc::new(AtomicUsize::new(0));
         let coordinator = DiskRescanCoordinator::new(Arc::new(SlowRunner {
             calls: calls.clone(),
         }));
 
         let accepted = coordinator
-            .request_rescan(DiskRescanTrigger::udev(Some("/dev/sdb1".to_owned())))
+            .request_rescan(DiskRescanTrigger::polling())
             .await;
 
         assert!(!accepted.queued);
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            1 + UDEV_SETTLE_RESCAN_DELAYS.len()
-        );
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

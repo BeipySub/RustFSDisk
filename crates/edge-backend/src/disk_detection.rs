@@ -696,7 +696,6 @@ where
 
         for disk in disks {
             let detected = self.base_record(&disk);
-            self.event_publisher.publish_disk_runtime(&detected);
             let record = self.evaluate_disk(disk, detected).await?;
             self.ledger.record_disk_runtime(record.clone()).await?;
             self.event_publisher.publish_disk_runtime(&record);
@@ -716,9 +715,7 @@ where
         Ok(records)
     }
 
-    pub async fn handle_udev_disk_change(
-        &self,
-    ) -> Result<Vec<DiskRuntimeRecord>, DiskDetectionError> {
+    pub async fn handle_disk_change(&self) -> Result<Vec<DiskRuntimeRecord>, DiskDetectionError> {
         self.scan_existing_transport_disks().await
     }
 
@@ -741,7 +738,6 @@ where
         }
 
         record.runtime_status = RuntimeStatus::Checking.as_db_value().to_string();
-        self.event_publisher.publish_disk_runtime(&record);
 
         let protocol_root = disk.mount_path.join(PROTOCOL_ROOT);
         let disk_info_path = protocol_root.join(DISK_INFO_FILE);
@@ -1781,7 +1777,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publishes_detected_checking_and_ready_runtime_events() {
+    async fn publishes_only_final_ready_runtime_event() {
         let mount = temp_mount("runtime-events-ready");
         write_disk_info(&mount, "INITIALIZED");
         let publisher = MockEventPublisher::default();
@@ -1799,13 +1795,41 @@ mod tests {
         assert_eq!(records[0].runtime_status, "READY");
         assert_eq!(
             publisher.runtime_statuses.lock().unwrap().as_slice(),
-            &["DETECTED", "CHECKING", "READY"]
+            &["READY"]
         );
         let disk_presence_ids = publisher.disk_presence_ids.lock().unwrap();
-        assert_eq!(disk_presence_ids.len(), 3);
+        assert_eq!(disk_presence_ids.len(), 1);
         assert!(disk_presence_ids
             .iter()
             .all(|value| value == &disk_presence_ids[0]));
+        fs::remove_dir_all(mount).ok();
+    }
+
+    #[tokio::test]
+    async fn publishes_only_final_rejected_runtime_event() {
+        let mount = temp_mount("runtime-events-rejected");
+        fs::remove_file(mount.join(PROTOCOL_ROOT).join(DISK_INFO_FILE)).ok();
+        let publisher = MockEventPublisher::default();
+        let detector = EdgeDiskDetector::new_with_event_publisher(
+            EdgeDiskDetectorConfig::new("edge-a"),
+            MockProbe {
+                disks: vec![disk(&mount, "ext4")],
+            },
+            MockLedger::default(),
+            publisher.clone(),
+        );
+
+        let records = detector.scan_existing_transport_disks().await.unwrap();
+
+        assert_eq!(records[0].runtime_status, "REJECTED");
+        assert_eq!(
+            records[0].status_code.as_deref(),
+            Some(DiskStatusCode::Unregistered.as_protocol_value())
+        );
+        assert_eq!(
+            publisher.runtime_statuses.lock().unwrap().as_slice(),
+            &["REJECTED"]
+        );
         fs::remove_dir_all(mount).ok();
     }
 

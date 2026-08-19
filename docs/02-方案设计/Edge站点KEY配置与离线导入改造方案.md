@@ -240,11 +240,12 @@ data_dir = "/var/lib/rustfs-transfer/edge"
 log_dir = "/var/log/rustfs-transfer/edge"
 transport_mount_root = "/mnt/rustfs-transfer"
 
-[rescan]
-token = "本机udev重扫令牌"
-
 [scan]
 reuse_window_minutes = 0
+
+[disk_polling]
+enabled = true
+interval_seconds = 1
 
 [auto_export]
 enabled = true

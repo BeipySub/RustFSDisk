@@ -15,16 +15,12 @@ use tokio::net::TcpListener;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-const DEFAULT_CONFIG_PATH: &str = "/etc/rustfs-transfer/center.toml";
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     configure_open_file_creation_permissions();
     init_tracing();
 
-    let config_path = config_path();
-    let config = CenterConfig::load(&config_path)
-        .with_context(|| format!("load center config from {}", config_path.display()))?;
+    let config = load_config().context("load center config")?;
     let security = CenterSecurity::from_config(&config.security)
         .context("load center security keys from configured environment variables")?;
 
@@ -60,12 +56,14 @@ async fn main() -> anyhow::Result<()> {
         security,
         center_identity,
     );
-    let app = router(
-        AppState::new(service)
-            .with_control_api_token(config.server.control_api_token.clone())
-            .with_import_control(std::sync::Arc::new(import_control))
-            .with_reinitialize_control(std::sync::Arc::new(reinitialize_control)),
-    );
+    let app_state = AppState::new(service)
+        .with_control_api_token(config.server.control_api_token.clone())
+        .with_import_control(std::sync::Arc::new(import_control))
+        .with_reinitialize_control(std::sync::Arc::new(reinitialize_control));
+    if config.disk_polling.enabled {
+        app_state.spawn_disk_polling(config.disk_polling.interval_seconds);
+    }
+    let app = router(app_state);
     let listener = TcpListener::bind(config.server.bind)
         .await
         .with_context(|| format!("bind center HTTP listener on {}", config.server.bind))?;
@@ -98,10 +96,11 @@ fn init_tracing() {
         .init();
 }
 
-fn config_path() -> PathBuf {
-    env::var("RUSTFS_TRANSFER__CONFIG_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_CONFIG_PATH))
+fn load_config() -> anyhow::Result<CenterConfig> {
+    match env::var("CENTER_CONFIG_PATH") {
+        Ok(path) if !path.trim().is_empty() => CenterConfig::load(PathBuf::from(path)),
+        _ => CenterConfig::from_env(),
+    }
 }
 
 fn rustfs_credentials(config: &RustfsConfig) -> anyhow::Result<Credentials> {

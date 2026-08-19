@@ -35,11 +35,11 @@ impl CenterSecurity {
         let local_master_key_env = config
             .local_master_key_env
             .as_deref()
-            .unwrap_or("RUSTFS_TRANSFER__SECURITY__LOCAL_MASTER_KEY");
+            .unwrap_or("LOCAL_MASTER_KEY");
         let center_signature_key_env = config
             .center_signature_key_env
             .as_deref()
-            .unwrap_or("RUSTFS_TRANSFER__SECURITY__CENTER_SIGNATURE_KEY");
+            .unwrap_or("CENTER_SIGNATURE_KEY");
 
         let local_master_key = read_key_from_env(local_master_key_env)
             .with_context(|| format!("load {local_master_key_env}"))?;

@@ -96,24 +96,37 @@ Copy-Item -Force (Join-Path $repo "deploy/config/center.example.toml") (Join-Pat
 "sha256-not-calculated-in-day1-fixture  export_manifest.json" | Set-Content -Encoding UTF8 (Join-Path $diskRoot "sealed/rustfs-transfer/manifests/export_manifest.sha256")
 
 @'
-RUSTFS_TRANSFER__CONFIG_PATH=.local/dev/config/center.toml
-RUSTFS_TRANSFER__DATABASE__URL=postgres://rustfs_transfer_center:CHANGE_ME_PASSWORD@127.0.0.1:5432/rustfs_transfer_center_dev
-RUSTFS_TRANSFER__PATHS__DATA_DIR=.local/dev/data/center
-RUSTFS_TRANSFER__PATHS__LOG_DIR=.local/dev/logs/center
-RUSTFS_TRANSFER__PATHS__TRANSPORT_MOUNT_ROOT=.local/dev/mock-disks
+CENTER_BIND=0.0.0.0:8080
+CENTER_ID=00000000-0000-0000-0000-000000000001
+CENTER_NAME=RustFS Transfer Center
+PROTOCOL_VERSION=1.0
+CONTROL_API_TOKEN=CHANGE_ME_CENTER_CONTROL_API_TOKEN
+DATABASE_URL=postgres://rustfs_transfer_center:CHANGE_ME_PASSWORD@127.0.0.1:5432/rustfs_transfer_center_dev
+RUSTFS_ENDPOINT=http://127.0.0.1:9000
+RUSTFS_ACCESS_KEY=CHANGE_ME_ACCESS_KEY
+RUSTFS_SECRET_KEY=CHANGE_ME_SECRET_KEY
+DATA_DIR=.local/dev/data/center
+LOG_DIR=.local/dev/logs/center
+TRANSPORT_MOUNT_ROOT=.local/dev/mock-disks
+DISK_POLLING_ENABLED=true
+DISK_POLLING_INTERVAL_SECONDS=1
+LOCAL_MASTER_KEY=CHANGE_ME_32_BYTE_BASE64_OR_HEX_KEY
+CENTER_SIGNATURE_KEY=CHANGE_ME_32_BYTE_BASE64_OR_HEX_KEY
 '@ | Set-Content -Encoding UTF8 (Join-Path $localDir "center.env")
 
 @'
-RUSTFS_TRANSFER__SERVER__BIND=0.0.0.0:8081
-RUSTFS_TRANSFER__DATABASE__URL=postgres://rustfs_transfer_edge:CHANGE_ME_PASSWORD@127.0.0.1:5432/rustfs_transfer_edge_dev
-RUSTFS_TRANSFER__EDGE__EDGE_CODE=edge-demo
-RUSTFS_TRANSFER__EDGE__EDGE_KEY=CHANGE_ME_EDGE_KEY_FROM_CENTER
-RUSTFS_TRANSFER__RUSTFS__ENDPOINT=http://127.0.0.1:9000
-RUSTFS_TRANSFER__RUSTFS__ACCESS_KEY_ID=CHANGE_ME_ACCESS_KEY
-RUSTFS_TRANSFER__RUSTFS__SECRET_ACCESS_KEY=CHANGE_ME_SECRET_KEY
-RUSTFS_TRANSFER__PATHS__DATA_DIR=.local/dev/data/edge
-RUSTFS_TRANSFER__PATHS__LOG_DIR=.local/dev/logs/edge
-RUSTFS_TRANSFER__PATHS__TRANSPORT_MOUNT_ROOT=.local/dev/mock-disks
+EDGE_BIND=0.0.0.0:8081
+DATABASE_URL=postgres://rustfs_transfer_edge:CHANGE_ME_PASSWORD@127.0.0.1:5432/rustfs_transfer_edge_dev
+EDGE_CODE=edge-demo
+EDGE_KEY=CHANGE_ME_EDGE_KEY_FROM_CENTER
+RUSTFS_ENDPOINT=http://127.0.0.1:9000
+RUSTFS_ACCESS_KEY=CHANGE_ME_ACCESS_KEY
+RUSTFS_SECRET_KEY=CHANGE_ME_SECRET_KEY
+DATA_DIR=.local/dev/data/edge
+LOG_DIR=.local/dev/logs/edge
+TRANSPORT_MOUNT_ROOT=.local/dev/mock-disks
+DISK_POLLING_ENABLED=true
+DISK_POLLING_INTERVAL_SECONDS=1
 '@ | Set-Content -Encoding UTF8 (Join-Path $localDir "edge.env")
 
 Write-Host "Prepared local RustFS Transfer layout:"

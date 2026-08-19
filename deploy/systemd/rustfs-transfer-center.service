@@ -9,9 +9,6 @@ User=rustfs-transfer
 Group=rustfs-transfer
 UMask=0000
 WorkingDirectory=/opt/rustfs-transfer
-Environment=RUSTFS_TRANSFER__CONFIG_PATH=/etc/rustfs-transfer/center.toml
-Environment=RUSTFS_TRANSFER__PATHS__DATA_DIR=/var/lib/rustfs-transfer/center
-Environment=RUSTFS_TRANSFER__PATHS__LOG_DIR=/var/log/rustfs-transfer/center
 ExecStart=/opt/rustfs-transfer/rustfs-transfer-center
 EnvironmentFile=-/etc/rustfs-transfer/center.env
 Restart=on-failure
@@ -26,4 +23,3 @@ ReadWritePaths=/var/lib/rustfs-transfer /var/log/rustfs-transfer /mnt /media /ru
 
 [Install]
 WantedBy=multi-user.target
-

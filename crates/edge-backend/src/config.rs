@@ -14,7 +14,7 @@ pub struct EdgeConfig {
     #[serde(default)]
     pub paths: PathConfig,
     #[serde(default)]
-    pub rescan: RescanConfig,
+    pub disk_polling: DiskPollingConfig,
     #[serde(default)]
     pub scan: ScanConfig,
     #[serde(default)]
@@ -60,17 +60,18 @@ pub struct PathConfig {
     pub transport_mount_root: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct RescanConfig {
-    pub endpoint_url: Option<String>,
-    pub token: Option<String>,
-    pub token_env: Option<String>,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct ScanConfig {
     #[serde(default = "default_scan_reuse_window_minutes")]
     pub reuse_window_minutes: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DiskPollingConfig {
+    #[serde(default = "default_disk_polling_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_disk_polling_interval_seconds")]
+    pub interval_seconds: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -109,31 +110,22 @@ impl EdgeConfig {
     }
 
     fn apply_env_overrides(&mut self) {
-        override_socket_addr("RUSTFS_TRANSFER__SERVER__BIND", &mut self.server.bind);
-        override_string("RUSTFS_TRANSFER__DATABASE__URL", &mut self.database.url);
-        override_string("RUSTFS_TRANSFER__EDGE__EDGE_CODE", &mut self.edge.edge_code);
-        override_string("RUSTFS_TRANSFER__EDGE__EDGE_KEY", &mut self.edge.edge_key);
-        override_string(
-            "RUSTFS_TRANSFER__RUSTFS__ENDPOINT",
-            &mut self.rustfs.endpoint,
-        );
-        override_string("RUSTFS_TRANSFER__RUSTFS__REGION", &mut self.rustfs.region);
-        override_optional_string(
-            "RUSTFS_TRANSFER__RUSTFS__ACCESS_KEY_ID",
-            &mut self.rustfs.access_key_id,
-        );
-        override_optional_string(
-            "RUSTFS_TRANSFER__RUSTFS__SECRET_ACCESS_KEY",
-            &mut self.rustfs.secret_access_key,
-        );
-        override_string("RUSTFS_TRANSFER__PATHS__DATA_DIR", &mut self.paths.data_dir);
-        override_string("RUSTFS_TRANSFER__PATHS__LOG_DIR", &mut self.paths.log_dir);
-        if let Ok(root) = env::var("RUSTFS_TRANSFER__PATHS__TRANSPORT_MOUNT_ROOT") {
+        override_socket_addr("EDGE_BIND", &mut self.server.bind);
+        override_string("DATABASE_URL", &mut self.database.url);
+        override_string("EDGE_CODE", &mut self.edge.edge_code);
+        override_string("EDGE_KEY", &mut self.edge.edge_key);
+        override_string("RUSTFS_ENDPOINT", &mut self.rustfs.endpoint);
+        override_string("RUSTFS_REGION", &mut self.rustfs.region);
+        override_optional_string("RUSTFS_ACCESS_KEY", &mut self.rustfs.access_key_id);
+        override_optional_string("RUSTFS_SECRET_KEY", &mut self.rustfs.secret_access_key);
+        override_string("DATA_DIR", &mut self.paths.data_dir);
+        override_string("LOG_DIR", &mut self.paths.log_dir);
+        if let Ok(root) = env::var("TRANSPORT_MOUNT_ROOT") {
             if !root.trim().is_empty() {
                 self.paths.disk_mount_roots = vec![root];
             }
         }
-        if let Ok(roots) = env::var("RUSTFS_TRANSFER__PATHS__DISK_MOUNT_ROOTS") {
+        if let Ok(roots) = env::var("DISK_MOUNT_ROOTS") {
             let roots = split_list(&roots);
             if !roots.is_empty() {
                 self.paths.disk_mount_roots = roots;
@@ -149,39 +141,23 @@ impl EdgeConfig {
         if self.paths.disk_mount_roots.is_empty() {
             self.paths.disk_mount_roots = default_disk_mount_roots();
         }
-        if let Ok(endpoint_url) = env::var("RUSTFS_TRANSFER__RESCAN__ENDPOINT_URL") {
-            if !endpoint_url.trim().is_empty() {
-                self.rescan.endpoint_url = Some(endpoint_url);
-            }
-        }
-        if let Ok(token) = env::var("RUSTFS_TRANSFER__RESCAN__TOKEN") {
-            if !token.trim().is_empty() {
-                self.rescan.token = Some(token);
-            }
-        }
-        if self.rescan.token.as_deref().unwrap_or("").trim().is_empty() {
-            if let Some(token) = read_optional_env(self.rescan.token_env.as_deref()) {
-                self.rescan.token = Some(token);
-            }
-        }
+        override_bool("DISK_POLLING_ENABLED", &mut self.disk_polling.enabled);
         override_u64(
-            "RUSTFS_TRANSFER__SCAN__REUSE_WINDOW_MINUTES",
-            &mut self.scan.reuse_window_minutes,
+            "DISK_POLLING_INTERVAL_SECONDS",
+            &mut self.disk_polling.interval_seconds,
         );
+        override_u64("SCAN_REUSE_MINUTES", &mut self.scan.reuse_window_minutes);
+        override_bool("AUTO_EXPORT_ENABLED", &mut self.auto_export.enabled);
         override_bool(
-            "RUSTFS_TRANSFER__AUTO_EXPORT__ENABLED",
-            &mut self.auto_export.enabled,
-        );
-        override_bool(
-            "RUSTFS_TRANSFER__AUTO_EXPORT__START_ON_READY",
+            "AUTO_EXPORT_START_ON_READY",
             &mut self.auto_export.start_on_ready,
         );
         override_usize(
-            "RUSTFS_TRANSFER__AUTO_EXPORT__MIN_READY_DISK_COUNT",
+            "AUTO_EXPORT_MIN_READY_DISK_COUNT",
             &mut self.auto_export.min_ready_disk_count,
         );
         override_u64(
-            "RUSTFS_TRANSFER__AUTO_EXPORT__COOLDOWN_SECONDS",
+            "AUTO_EXPORT_COOLDOWN_SECONDS",
             &mut self.auto_export.cooldown_seconds,
         );
     }
@@ -195,28 +171,6 @@ impl EdgeConfig {
         ensure_optional_non_empty("rustfs.secret_access_key", &self.rustfs.secret_access_key)?;
         Ok(())
     }
-
-    pub fn rescan_endpoint_url(&self) -> String {
-        self.rescan
-            .endpoint_url
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .map(str::to_owned)
-            .unwrap_or_else(|| {
-                format!(
-                    "http://127.0.0.1:{}/internal/disk/rescan",
-                    self.server.bind.port()
-                )
-            })
-    }
-
-    pub fn rescan_token(&self) -> Option<&str> {
-        self.rescan
-            .token
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-    }
 }
 
 impl Default for EdgeConfig {
@@ -227,7 +181,7 @@ impl Default for EdgeConfig {
             edge: EdgeIdentityConfig::default(),
             rustfs: RustfsConfig::default(),
             paths: PathConfig::default(),
-            rescan: RescanConfig::default(),
+            disk_polling: DiskPollingConfig::default(),
             scan: ScanConfig::default(),
             auto_export: AutoExportConfig::default(),
         }
@@ -301,11 +255,21 @@ impl Default for AutoExportConfig {
     }
 }
 
+impl Default for DiskPollingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_disk_polling_enabled(),
+            interval_seconds: default_disk_polling_interval_seconds(),
+        }
+    }
+}
+
 fn override_string(name: &str, value: &mut String) {
     if let Ok(env_value) = env::var(name) {
-        if !env_value.trim().is_empty() {
-            *value = env_value;
+        if env_value.trim().is_empty() {
+            return;
         }
+        *value = env_value;
     }
 }
 
@@ -319,9 +283,10 @@ fn override_socket_addr(name: &str, value: &mut SocketAddr) {
 
 fn override_optional_string(name: &str, value: &mut Option<String>) {
     if let Ok(env_value) = env::var(name) {
-        if !env_value.trim().is_empty() {
-            *value = Some(env_value);
+        if env_value.trim().is_empty() {
+            return;
         }
+        *value = Some(env_value);
     }
 }
 
@@ -349,14 +314,6 @@ fn override_u64(name: &str, value: &mut u64) {
             *value = parsed;
         }
     }
-}
-
-fn read_optional_env(name: Option<&str>) -> Option<String> {
-    let name = name?.trim();
-    if name.is_empty() {
-        return None;
-    }
-    env::var(name).ok().filter(|value| !value.trim().is_empty())
 }
 
 fn split_list(value: &str) -> Vec<String> {
@@ -424,6 +381,14 @@ fn default_auto_export_cooldown_seconds() -> u64 {
     60
 }
 
+fn default_disk_polling_enabled() -> bool {
+    true
+}
+
+fn default_disk_polling_interval_seconds() -> u64 {
+    1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -464,18 +429,15 @@ mod tests {
         assert_eq!(config.scan.reuse_window_minutes, 24 * 60);
         assert_eq!(config.auto_export.min_ready_disk_count, 1);
         assert_eq!(config.auto_export.cooldown_seconds, 60);
-        assert_eq!(
-            config.rescan_endpoint_url(),
-            "http://127.0.0.1:8081/internal/disk/rescan"
-        );
+        assert!(config.disk_polling.enabled);
+        assert_eq!(config.disk_polling.interval_seconds, 1);
     }
 
     #[test]
     fn loads_example_style_edge_key_env_and_transport_root() {
         let _guard = ENV_LOCK.lock().expect("env lock poisoned");
         clear_rustfs_credential_env();
-        std::env::set_var("RUSTFS_TRANSFER__EDGE__EDGE_KEY", "key-from-env");
-        std::env::set_var("RUSTFS_TRANSFER__TEST_RESCAN_TOKEN", "rescan-token");
+        std::env::set_var("EDGE_KEY", "key-from-env");
         let raw = r#"
             [database]
             url = "postgres://edge:edge@localhost/edge"
@@ -491,18 +453,13 @@ mod tests {
 
             [paths]
             transport_mount_root = "/mnt/rustfs-transfer"
-
-            [rescan]
-            token_env = "RUSTFS_TRANSFER__TEST_RESCAN_TOKEN"
         "#;
 
         let config = EdgeConfig::from_toml(raw).expect("config loads");
 
         assert_eq!(config.edge.edge_key, "key-from-env");
         assert_eq!(config.paths.disk_mount_roots, vec!["/mnt/rustfs-transfer"]);
-        assert_eq!(config.rescan_token(), Some("rescan-token"));
-        std::env::remove_var("RUSTFS_TRANSFER__EDGE__EDGE_KEY");
-        std::env::remove_var("RUSTFS_TRANSFER__TEST_RESCAN_TOKEN");
+        std::env::remove_var("EDGE_KEY");
     }
 
     #[test]
@@ -533,19 +490,12 @@ mod tests {
     fn loads_complete_config_from_env_without_toml() {
         let _guard = ENV_LOCK.lock().expect("env lock poisoned");
         clear_rustfs_credential_env();
-        std::env::set_var(
-            "RUSTFS_TRANSFER__DATABASE__URL",
-            "postgres://edge:edge@localhost/edge",
-        );
-        std::env::set_var("RUSTFS_TRANSFER__EDGE__EDGE_CODE", "edge-a");
-        std::env::set_var("RUSTFS_TRANSFER__EDGE__EDGE_KEY", "edge-key-from-env");
-        std::env::set_var("RUSTFS_TRANSFER__RUSTFS__ENDPOINT", "http://127.0.0.1:9000");
-        std::env::set_var("RUSTFS_TRANSFER__RUSTFS__ACCESS_KEY_ID", "env-access-key");
-        std::env::set_var(
-            "RUSTFS_TRANSFER__RUSTFS__SECRET_ACCESS_KEY",
-            "env-secret-key",
-        );
-        std::env::set_var("RUSTFS_TRANSFER__RESCAN__TOKEN", "rescan-token");
+        std::env::set_var("DATABASE_URL", "postgres://edge:edge@localhost/edge");
+        std::env::set_var("EDGE_CODE", "edge-a");
+        std::env::set_var("EDGE_KEY", "edge-key-from-env");
+        std::env::set_var("RUSTFS_ENDPOINT", "http://127.0.0.1:9000");
+        std::env::set_var("RUSTFS_ACCESS_KEY", "env-access-key");
+        std::env::set_var("RUSTFS_SECRET_KEY", "env-secret-key");
 
         let config = EdgeConfig::from_env().expect("env-only config loads");
 
@@ -553,7 +503,6 @@ mod tests {
         assert_eq!(config.edge.edge_code, "edge-a");
         assert_eq!(config.edge.edge_key, "edge-key-from-env");
         assert_eq!(config.rustfs.endpoint, "http://127.0.0.1:9000");
-        assert_eq!(config.rescan_token(), Some("rescan-token"));
         clear_rustfs_credential_env();
     }
 
@@ -561,11 +510,13 @@ mod tests {
     fn auto_export_env_overrides_support_gray_enable_and_rollback() {
         let _guard = ENV_LOCK.lock().expect("env lock poisoned");
         clear_rustfs_credential_env();
-        std::env::set_var("RUSTFS_TRANSFER__AUTO_EXPORT__ENABLED", "true");
-        std::env::set_var("RUSTFS_TRANSFER__AUTO_EXPORT__START_ON_READY", "1");
-        std::env::set_var("RUSTFS_TRANSFER__AUTO_EXPORT__MIN_READY_DISK_COUNT", "2");
-        std::env::set_var("RUSTFS_TRANSFER__AUTO_EXPORT__COOLDOWN_SECONDS", "300");
-        std::env::set_var("RUSTFS_TRANSFER__SCAN__REUSE_WINDOW_MINUTES", "15");
+        std::env::set_var("AUTO_EXPORT_ENABLED", "true");
+        std::env::set_var("AUTO_EXPORT_START_ON_READY", "1");
+        std::env::set_var("AUTO_EXPORT_MIN_READY_DISK_COUNT", "2");
+        std::env::set_var("AUTO_EXPORT_COOLDOWN_SECONDS", "300");
+        std::env::set_var("SCAN_REUSE_MINUTES", "15");
+        std::env::set_var("DISK_POLLING_ENABLED", "false");
+        std::env::set_var("DISK_POLLING_INTERVAL_SECONDS", "3");
         let raw = r#"
             [database]
             url = "postgres://edge:edge@localhost/edge"
@@ -587,30 +538,25 @@ mod tests {
         assert_eq!(config.auto_export.min_ready_disk_count, 2);
         assert_eq!(config.auto_export.cooldown_seconds, 300);
         assert_eq!(config.scan.reuse_window_minutes, 15);
+        assert!(!config.disk_polling.enabled);
+        assert_eq!(config.disk_polling.interval_seconds, 3);
 
-        std::env::set_var("RUSTFS_TRANSFER__AUTO_EXPORT__ENABLED", "false");
-        std::env::set_var("RUSTFS_TRANSFER__AUTO_EXPORT__START_ON_READY", "off");
+        std::env::set_var("AUTO_EXPORT_ENABLED", "false");
+        std::env::set_var("AUTO_EXPORT_START_ON_READY", "off");
         let config = EdgeConfig::from_toml(raw).expect("config reloads");
 
         assert!(!config.auto_export.enabled);
         assert!(!config.auto_export.start_on_ready);
 
-        std::env::remove_var("RUSTFS_TRANSFER__AUTO_EXPORT__ENABLED");
-        std::env::remove_var("RUSTFS_TRANSFER__AUTO_EXPORT__START_ON_READY");
-        std::env::remove_var("RUSTFS_TRANSFER__AUTO_EXPORT__MIN_READY_DISK_COUNT");
-        std::env::remove_var("RUSTFS_TRANSFER__AUTO_EXPORT__COOLDOWN_SECONDS");
-        std::env::remove_var("RUSTFS_TRANSFER__SCAN__REUSE_WINDOW_MINUTES");
+        clear_short_env();
     }
 
     #[test]
     fn rustfs_credentials_can_be_supplied_by_transfer_env() {
         let _guard = ENV_LOCK.lock().expect("env lock poisoned");
         clear_rustfs_credential_env();
-        std::env::set_var("RUSTFS_TRANSFER__RUSTFS__ACCESS_KEY_ID", "env-access-key");
-        std::env::set_var(
-            "RUSTFS_TRANSFER__RUSTFS__SECRET_ACCESS_KEY",
-            "env-secret-key",
-        );
+        std::env::set_var("RUSTFS_ACCESS_KEY", "env-access-key");
+        std::env::set_var("RUSTFS_SECRET_KEY", "env-secret-key");
         let raw = r#"
             [database]
             url = "postgres://edge:edge@localhost/edge"
@@ -633,8 +579,8 @@ mod tests {
             config.rustfs.secret_access_key.as_deref(),
             Some("env-secret-key")
         );
-        std::env::remove_var("RUSTFS_TRANSFER__RUSTFS__ACCESS_KEY_ID");
-        std::env::remove_var("RUSTFS_TRANSFER__RUSTFS__SECRET_ACCESS_KEY");
+        std::env::remove_var("RUSTFS_ACCESS_KEY");
+        std::env::remove_var("RUSTFS_SECRET_KEY");
     }
 
     #[test]
@@ -660,24 +606,28 @@ mod tests {
     }
 
     fn clear_rustfs_credential_env() {
-        std::env::remove_var("RUSTFS_TRANSFER__DATABASE__URL");
-        std::env::remove_var("RUSTFS_TRANSFER__SERVER__BIND");
-        std::env::remove_var("RUSTFS_TRANSFER__EDGE__EDGE_CODE");
-        std::env::remove_var("RUSTFS_TRANSFER__EDGE__EDGE_KEY");
-        std::env::remove_var("RUSTFS_TRANSFER__RUSTFS__ENDPOINT");
-        std::env::remove_var("RUSTFS_TRANSFER__RUSTFS__REGION");
-        std::env::remove_var("RUSTFS_TRANSFER__RUSTFS__ACCESS_KEY_ID");
-        std::env::remove_var("RUSTFS_TRANSFER__RUSTFS__SECRET_ACCESS_KEY");
-        std::env::remove_var("RUSTFS_TRANSFER__PATHS__DATA_DIR");
-        std::env::remove_var("RUSTFS_TRANSFER__PATHS__LOG_DIR");
-        std::env::remove_var("RUSTFS_TRANSFER__PATHS__TRANSPORT_MOUNT_ROOT");
-        std::env::remove_var("RUSTFS_TRANSFER__PATHS__DISK_MOUNT_ROOTS");
-        std::env::remove_var("RUSTFS_TRANSFER__RESCAN__ENDPOINT_URL");
-        std::env::remove_var("RUSTFS_TRANSFER__RESCAN__TOKEN");
-        std::env::remove_var("RUSTFS_TRANSFER__SCAN__REUSE_WINDOW_MINUTES");
-        std::env::remove_var("RUSTFS_TRANSFER__AUTO_EXPORT__ENABLED");
-        std::env::remove_var("RUSTFS_TRANSFER__AUTO_EXPORT__START_ON_READY");
-        std::env::remove_var("RUSTFS_TRANSFER__AUTO_EXPORT__MIN_READY_DISK_COUNT");
-        std::env::remove_var("RUSTFS_TRANSFER__AUTO_EXPORT__COOLDOWN_SECONDS");
+        clear_short_env();
+    }
+
+    fn clear_short_env() {
+        std::env::remove_var("DATABASE_URL");
+        std::env::remove_var("EDGE_BIND");
+        std::env::remove_var("EDGE_CODE");
+        std::env::remove_var("EDGE_KEY");
+        std::env::remove_var("RUSTFS_ENDPOINT");
+        std::env::remove_var("RUSTFS_REGION");
+        std::env::remove_var("RUSTFS_ACCESS_KEY");
+        std::env::remove_var("RUSTFS_SECRET_KEY");
+        std::env::remove_var("DATA_DIR");
+        std::env::remove_var("LOG_DIR");
+        std::env::remove_var("TRANSPORT_MOUNT_ROOT");
+        std::env::remove_var("DISK_MOUNT_ROOTS");
+        std::env::remove_var("DISK_POLLING_ENABLED");
+        std::env::remove_var("DISK_POLLING_INTERVAL_SECONDS");
+        std::env::remove_var("SCAN_REUSE_MINUTES");
+        std::env::remove_var("AUTO_EXPORT_ENABLED");
+        std::env::remove_var("AUTO_EXPORT_START_ON_READY");
+        std::env::remove_var("AUTO_EXPORT_MIN_READY_DISK_COUNT");
+        std::env::remove_var("AUTO_EXPORT_COOLDOWN_SECONDS");
     }
 }
