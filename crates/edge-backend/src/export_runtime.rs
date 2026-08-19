@@ -220,11 +220,9 @@ fn run_single_disk_sequential_export(
     source: &S3ObjectSource,
     repo: &PgExportObjectRepository,
 ) -> Result<SequentialExportReport, DiskWorkerError> {
-    worker.begin_copying()?;
-    worker.register_single_disk_progress(0, 0);
-
     let mut copied_count = 0_u64;
     let mut copied_bytes = 0_u64;
+    let mut copying_started = false;
     let mut remaining_budget = worker_budget_bytes(worker.config_free_bytes());
 
     for bucket in source.list_buckets()? {
@@ -249,6 +247,11 @@ fn run_single_disk_sequential_export(
                         copied_count,
                         copied_bytes,
                     });
+                }
+                if !copying_started {
+                    worker.begin_copying()?;
+                    worker.register_single_disk_progress(0, 0);
+                    copying_started = true;
                 }
                 let task = repo.insert_assigned_object(
                     worker.config_export_job_id(),
@@ -432,12 +435,9 @@ impl S3ObjectSource {
 
     fn list_buckets(&self) -> Result<Vec<String>, DiskWorkerError> {
         self.handle.block_on(async {
-            let output = self
-                .client
-                .list_buckets()
-                .send()
-                .await
-                .map_err(|err| DiskWorkerError::Io(std::io::Error::other(err.to_string())))?;
+            let output = self.client.list_buckets().send().await.map_err(|err| {
+                DiskWorkerError::S3OperationFailed(format!("list_buckets failed: {err}"))
+            })?;
             Ok(output
                 .buckets()
                 .iter()
@@ -460,7 +460,11 @@ impl S3ObjectSource {
                 .set_continuation_token(continuation_token)
                 .send()
                 .await
-                .map_err(|err| DiskWorkerError::Io(std::io::Error::other(err.to_string())))?;
+                .map_err(|err| {
+                    DiskWorkerError::S3OperationFailed(format!(
+                        "list_objects_v2 bucket={bucket} failed: {err}"
+                    ))
+                })?;
 
             let mut objects = Vec::new();
             for object in output.contents() {
@@ -514,7 +518,11 @@ impl ObjectSource for S3ObjectSource {
                 .key(key)
                 .send()
                 .await
-                .map_err(|err| DiskWorkerError::Io(std::io::Error::other(err.to_string())))?;
+                .map_err(|err| {
+                    DiskWorkerError::S3OperationFailed(format!(
+                        "head_object bucket={bucket} key={key} failed: {err}"
+                    ))
+                })?;
             let last_modified = output
                 .last_modified()
                 .ok_or_else(|| {
@@ -556,12 +564,20 @@ impl ObjectSource for S3ObjectSource {
                 .range(format!("bytes={offset}-{end}"))
                 .send()
                 .await
-                .map_err(|err| DiskWorkerError::Io(std::io::Error::other(err.to_string())))?;
+                .map_err(|err| {
+                    DiskWorkerError::S3OperationFailed(format!(
+                        "get_object bucket={bucket} key={key} range={offset}-{end} failed: {err}"
+                    ))
+                })?;
             let bytes = output
                 .body
                 .collect()
                 .await
-                .map_err(|err| DiskWorkerError::Io(std::io::Error::other(err.to_string())))?
+                .map_err(|err| {
+                    DiskWorkerError::S3OperationFailed(format!(
+                        "read_object_body bucket={bucket} key={key} range={offset}-{end} failed: {err}"
+                    ))
+                })?
                 .into_bytes()
                 .to_vec();
             Ok(Box::new(Cursor::new(bytes)) as Box<dyn Read>)
@@ -968,6 +984,7 @@ fn export_failure_stage(err: &DiskWorkerError) -> &'static str {
         | DiskWorkerError::SourceChanged(_)
         | DiskWorkerError::ChecksumMismatch(_)
         | DiskWorkerError::Crypto(_) => "OBJECT_WRITE",
+        DiskWorkerError::S3OperationFailed(_) => "SOURCE_LIST",
         DiskWorkerError::ManifestInvalid(_) | DiskWorkerError::Io(_) | DiskWorkerError::Json(_) => {
             if is_permission_denied_error(err) {
                 "WRITE_BEFORE"

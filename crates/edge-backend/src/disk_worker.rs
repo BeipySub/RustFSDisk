@@ -40,6 +40,8 @@ pub enum DiskWorkerError {
     PartialCleanFailed(String),
     #[error("source object changed: {0}")]
     SourceChanged(String),
+    #[error("S3 operation failed: {0}")]
+    S3OperationFailed(String),
     #[error("crypto error: {0}")]
     Crypto(String),
     #[error("io error: {0}")]
@@ -57,6 +59,7 @@ impl DiskWorkerError {
             Self::DiskRemoved(_) => "DISK_REMOVED",
             Self::PartialCleanFailed(_) => "PARTIAL_CLEAN_FAILED",
             Self::SourceChanged(_) => "SOURCE_CHANGED",
+            Self::S3OperationFailed(_) => "S3_OPERATION_FAILED",
             Self::Crypto(_) => "DECRYPT_FAILED",
             Self::Io(_) | Self::Json(_) => "MANIFEST_INVALID",
         }
