@@ -2,7 +2,7 @@ use crate::{
     config::AutoExportConfig,
     control::{
         ControlError, CreateExportJobRequest, EdgeControlService, EdgeControlSummary,
-        ExportJobRecordsRequest, ScanTriggerRequest, StartExportJobRequest,
+        ExportJobRecordsRequest, StartExportJobRequest,
     },
     disk_detection::{BoxFuture, DiskDetectionError},
     rescan::{DiskRescanRunner, DiskRescanSource, DiskRescanTrigger},
@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tokio::{sync::Mutex, time::Duration};
 use uuid::Uuid;
 
-const ACTIVE_EXPORT_JOB_STATUSES: [&str; 4] = ["PENDING", "SCANNING", "COPYING", "SEALING"];
+const ACTIVE_EXPORT_JOB_STATUSES: [&str; 3] = ["PENDING", "COPYING", "SEALING"];
 const READY_RECHECK_ATTEMPTS: u8 = 5;
 const READY_RECHECK_DELAY: Duration = Duration::from_secs(1);
 
@@ -172,35 +172,14 @@ impl AutoExportOrchestrator {
             Err(error) => return failed("check active export jobs", error),
         }
 
-        let scan = match self.control.scan_once(ScanTriggerRequest::default()).await {
-            Ok(scan) => scan,
-            Err(error) => return failed("scan RustFS before auto export", error),
-        };
-        if scan.stable_object_count == 0 {
-            return AutoExportDecision::new(
-                AutoExportOutcome::NoExportableObject,
-                "scan completed but no stable completed RustFS object is exportable",
-            );
-        }
-
         let export_job = match self
             .control
-            .create_export_job(CreateExportJobRequest {
-                run_scan: false,
-                ..CreateExportJobRequest::default()
-            })
+            .create_export_job(CreateExportJobRequest::default())
             .await
         {
             Ok(export_job) => export_job,
-            Err(error) => return failed("create export job after scan", error),
+            Err(error) => return failed("create single-disk export job", error),
         };
-        if export_job.object_count == 0 {
-            return AutoExportDecision::new(
-                AutoExportOutcome::NoExportableObject,
-                "export plan has no object after latest successful scan",
-            )
-            .with_export_job_id(export_job.export_job_id);
-        }
 
         match self
             .control
@@ -384,11 +363,10 @@ mod tests {
             ControlFuture, DashboardCurrentObject, EdgeDiskProgressSummary, EdgeGlobalSummary,
             ExportJobDiskSummary, ExportJobEvent, ExportJobRecord, ExportJobRecordsResponse,
             ExportJobResponse, RecoverExportJobRequest, RecoverExportJobResponse,
-            ScanTriggerResponse, StartExportJobResponse,
+            StartExportJobResponse,
         },
         disk_detection::DiskDetectionError,
         progress::CopyProgressEvent,
-        scanner::ScanProgressSnapshot,
     };
     use axum::http::StatusCode;
     use std::{
@@ -413,7 +391,6 @@ mod tests {
         runtime_status: &'static str,
         ready_after_summary_calls: Option<usize>,
         active_status: Option<&'static str>,
-        stable_object_count: u64,
         export_object_count: u64,
         export_job_id: Uuid,
         calls: Arc<Mutex<Vec<&'static str>>>,
@@ -426,7 +403,6 @@ mod tests {
                 runtime_status: "READY",
                 ready_after_summary_calls: None,
                 active_status: None,
-                stable_object_count: 1,
                 export_object_count: 1,
                 export_job_id: Uuid::new_v4(),
                 calls: Arc::new(Mutex::new(Vec::new())),
@@ -435,32 +411,13 @@ mod tests {
     }
 
     impl EdgeControlService for FakeControl {
-        fn scan_once<'a>(
-            &'a self,
-            _request: ScanTriggerRequest,
-        ) -> ControlFuture<'a, ScanTriggerResponse> {
-            Box::pin(async move {
-                self.calls.lock().unwrap().push("scan_once");
-                Ok(ScanTriggerResponse {
-                    scan_event_type: "SCAN_DONE".to_owned(),
-                    scan_status: "DONE".to_owned(),
-                    bucket_count: 1,
-                    object_seen: self.stable_object_count,
-                    stable_object_count: self.stable_object_count,
-                    source_changed_count: 0,
-                    total_bytes: self.stable_object_count * 10,
-                    message: "scan done".to_owned(),
-                })
-            })
-        }
-
         fn create_export_job<'a>(
             &'a self,
             request: CreateExportJobRequest,
         ) -> ControlFuture<'a, ExportJobResponse> {
             Box::pin(async move {
                 self.calls.lock().unwrap().push("create_export_job");
-                assert!(!request.run_scan);
+                assert!(request.export_job_id.is_none());
                 Ok(export_job_response(
                     self.export_job_id,
                     "PENDING",
@@ -588,10 +545,6 @@ mod tests {
         fn copy_progress_snapshot<'a>(&'a self) -> ControlFuture<'a, Option<CopyProgressEvent>> {
             Box::pin(async { Ok(None) })
         }
-
-        fn scan_progress_snapshot<'a>(&'a self) -> ControlFuture<'a, ScanProgressSnapshot> {
-            Box::pin(async { Ok(ScanProgressSnapshot::default()) })
-        }
     }
 
     #[tokio::test]
@@ -634,7 +587,7 @@ mod tests {
         assert_eq!(decision.outcome, AutoExportOutcome::ActiveExportJob);
         assert_eq!(
             control.calls.lock().unwrap().as_slice(),
-            &["summary", "export_jobs", "export_jobs", "export_jobs"]
+            &["summary", "export_jobs", "export_jobs"]
         );
     }
 
@@ -660,8 +613,6 @@ mod tests {
                 "export_jobs",
                 "export_jobs",
                 "export_jobs",
-                "export_jobs",
-                "scan_once",
                 "create_export_job",
                 "start_export_job"
             ]
@@ -681,18 +632,12 @@ mod tests {
         assert_eq!(decision.outcome, AutoExportOutcome::ActiveExportJob);
         assert_eq!(
             control.calls.lock().unwrap().as_slice(),
-            &[
-                "summary",
-                "export_jobs",
-                "export_jobs",
-                "export_jobs",
-                "export_jobs"
-            ]
+            &["summary", "export_jobs", "export_jobs", "export_jobs"]
         );
     }
 
     #[tokio::test]
-    async fn cooldown_blocks_repeated_polling_events_before_scan_or_export() {
+    async fn cooldown_blocks_repeated_polling_events_before_export() {
         let control = Arc::new(FakeControl::default());
         let orchestrator = AutoExportOrchestrator::new(
             AutoExportConfig {
@@ -714,8 +659,6 @@ mod tests {
                 "export_jobs",
                 "export_jobs",
                 "export_jobs",
-                "export_jobs",
-                "scan_once",
                 "create_export_job",
                 "start_export_job"
             ]
@@ -739,34 +682,8 @@ mod tests {
                 "export_jobs",
                 "export_jobs",
                 "export_jobs",
-                "export_jobs",
-                "scan_once",
                 "create_export_job",
                 "start_export_job"
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn no_stable_objects_do_not_create_export_job() {
-        let control = Arc::new(FakeControl {
-            stable_object_count: 0,
-            ..FakeControl::default()
-        });
-        let orchestrator = AutoExportOrchestrator::new(enabled_config(), control.clone());
-
-        let decision = orchestrator.on_transport_disks_refreshed(trigger()).await;
-
-        assert_eq!(decision.outcome, AutoExportOutcome::NoExportableObject);
-        assert_eq!(
-            control.calls.lock().unwrap().as_slice(),
-            &[
-                "summary",
-                "export_jobs",
-                "export_jobs",
-                "export_jobs",
-                "export_jobs",
-                "scan_once"
             ]
         );
     }

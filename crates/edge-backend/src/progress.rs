@@ -4,7 +4,6 @@ use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CurrentObjectProgress {
@@ -144,8 +143,6 @@ pub struct CopyProgressEvent {
     pub stage: Option<String>,
     #[serde(default)]
     pub edge_name: String,
-    #[serde(default)]
-    pub scan: Option<Value>,
     #[serde(default)]
     pub object_inventory: ObjectInventorySnapshot,
     #[serde(default)]
@@ -524,7 +521,6 @@ impl ProgressAggregator {
             edge_code: state.edge_code.clone(),
             stage: Some(copy_stage(&state.event_type).to_string()),
             edge_name: state.edge_code.clone(),
-            scan: None,
             object_inventory: state.object_inventory.clone(),
             export_job: Some(export_job),
             global: global_progress.clone(),

@@ -89,7 +89,7 @@ sqlx migrate run --source sql/edge
 注意：
 
 - 这一步只是连接外部 PostgreSQL 执行迁移，不是在 Linux 开发机本地安装 PostgreSQL。
-- 如果外部 Edge 数据库没有跑迁移，Edge 程序可能能启动，但扫描、任务、磁盘记录等接口会因为缺表或缺字段报错。
+- 如果外部 Edge 数据库没有跑迁移，Edge 程序可能能启动，但导出任务、磁盘记录等接口会因为缺表或缺字段报错。
 
 ## 4. 推荐的开发目录方式
 
@@ -110,15 +110,12 @@ nano .runtime/edge.env
 # Edge 服务监听地址
 EDGE_BIND=0.0.0.0:8081
 
-# Edge 本地 PostgreSQL，保存扫描结果、导出任务和运输盘运行态
+# Edge 本地 PostgreSQL，保存导出账本、导出任务和运输盘运行态
 DATABASE_URL=postgres://用户名:密码@PostgreSQL地址:5432/edge库名
 
 # Edge 站点编码和 Center 生成的 Edge KEY
 EDGE_CODE=Center里创建的edge_code
 EDGE_KEY=Center里创建站点后生成的KEY
-
-# RustFS 扫描结果复用窗口，单位分钟
-SCAN_REUSE_MINUTES=5
 
 # 插拔盘识别轮询开关和间隔
 DISK_POLLING_ENABLED=true
@@ -136,7 +133,7 @@ LOG_DIR=./.runtime/edge-log
 TRANSPORT_MOUNT_ROOT=./.runtime/mnt
 DISK_MOUNT_ROOTS=./.runtime/mnt,/media/$USER
 
-# 是否允许插盘后自动扫描 RustFS、创建导出任务并开始写盘
+# 是否允许插盘后自动创建导出任务并按 S3 分页顺序写盘
 AUTO_EXPORT_ENABLED=false
 
 # 服务启动或轮询发现 READY 盘后，是否自动启动导出

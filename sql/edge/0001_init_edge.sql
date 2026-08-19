@@ -2,33 +2,6 @@
 -- 适用端：边缘端。
 -- 约束来源：docs/v1.0冻结/数据库设计.md。
 
-CREATE TABLE IF NOT EXISTS local_object_snapshot (
-  id BIGSERIAL PRIMARY KEY,
-  bucket VARCHAR(255) NOT NULL,
-  object_key TEXT NOT NULL,
-  etag VARCHAR(255) NOT NULL,
-  size_bytes BIGINT NOT NULL,
-  last_modified TIMESTAMP NOT NULL,
-  metadata_json JSONB,
-  scanned_at TIMESTAMP NOT NULL DEFAULT (NOW() AT TIME ZONE 'UTC'),
-  stable_status VARCHAR(32) NOT NULL DEFAULT 'UNKNOWN',
-  CONSTRAINT ck_local_object_snapshot_stable_status CHECK (stable_status IN ('UNKNOWN', 'STABLE', 'UNSTABLE', 'SOURCE_CHANGED'))
-);
-
-COMMENT ON TABLE local_object_snapshot IS '边缘端 RustFS 对象扫描快照表；用于统计、稳定性判断和导出编排。';
-COMMENT ON COLUMN local_object_snapshot.id IS '数据库自增主键。';
-COMMENT ON COLUMN local_object_snapshot.bucket IS '源 RustFS bucket 名称。';
-COMMENT ON COLUMN local_object_snapshot.object_key IS '源 RustFS object key；数据库用 object_key 避免和通用 key 概念混淆。';
-COMMENT ON COLUMN local_object_snapshot.etag IS '源对象 ETag，用于对象身份和稳定性判断。';
-COMMENT ON COLUMN local_object_snapshot.size_bytes IS '源对象字节数。';
-COMMENT ON COLUMN local_object_snapshot.last_modified IS '源对象 last_modified，从 RustFS/S3 获取后归一化为 UTC。';
-COMMENT ON COLUMN local_object_snapshot.metadata_json IS '扫描到的源对象 metadata JSON；写 manifest 时输出为 metadata。';
-COMMENT ON COLUMN local_object_snapshot.scanned_at IS '本次快照扫描入库的 UTC 时间。';
-COMMENT ON COLUMN local_object_snapshot.stable_status IS '稳定性判断状态；UNKNOWN 表示未知，STABLE 表示稳定可进入导出队列，UNSTABLE 表示不稳定暂不导出，SOURCE_CHANGED 表示源对象发生变化且本轮不导出。';
-
-CREATE INDEX IF NOT EXISTS idx_local_object_snapshot_scanned_at ON local_object_snapshot(scanned_at);
-CREATE INDEX IF NOT EXISTS idx_local_object_snapshot_source ON local_object_snapshot(bucket, object_key);
-
 CREATE TABLE IF NOT EXISTS export_job (
   id BIGSERIAL PRIMARY KEY,
   export_job_id UUID NOT NULL,
@@ -42,7 +15,7 @@ CREATE TABLE IF NOT EXISTS export_job (
   start_time TIMESTAMP,
   finish_time TIMESTAMP,
   error_message TEXT,
-  CONSTRAINT ck_export_job_status CHECK (status IN ('PENDING', 'SCANNING', 'COPYING', 'SEALED', 'FAILED', 'CANCELLED'))
+  CONSTRAINT ck_export_job_status CHECK (status IN ('PENDING', 'COPYING', 'SEALED', 'FAILED', 'CANCELLED'))
 );
 
 COMMENT ON TABLE export_job IS '边缘端导出任务表；记录导出阶段状态、低频 checkpoint、统计进度和结果。';
@@ -50,7 +23,7 @@ COMMENT ON COLUMN export_job.id IS '数据库自增主键。';
 COMMENT ON COLUMN export_job.export_job_id IS '导出任务业务 ID；用于 API、日志、manifest 和审计追踪。';
 COMMENT ON COLUMN export_job.disk_id IS '运输盘逻辑 ID；单盘任务可填，多盘任务通过 export_object.disk_id 关联。';
 COMMENT ON COLUMN export_job.edge_code IS '执行该导出任务的边缘站点编码。';
-COMMENT ON COLUMN export_job.status IS '导出任务状态；PENDING 表示待处理，SCANNING 表示扫描中，COPYING 表示拷贝中，SEALED 表示已封盘，FAILED 表示导出失败，CANCELLED 表示已取消；API/WS 序列化为 export_job_status。';
+COMMENT ON COLUMN export_job.status IS '导出任务状态；PENDING 表示待处理，COPYING 表示拷贝中，SEALED 表示已封盘，FAILED 表示导出失败，CANCELLED 表示已取消；API/WS 序列化为 export_job_status。';
 COMMENT ON COLUMN export_job.object_count IS '本次导出计划对象或分块总数。';
 COMMENT ON COLUMN export_job.copied_count IS '已完成写盘并校验的对象或分块数量。';
 COMMENT ON COLUMN export_job.total_bytes IS '本次导出计划写入的明文总字节数。';

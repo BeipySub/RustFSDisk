@@ -233,28 +233,7 @@ test("marks sealed historical export disks as removable when runtime was cleared
   assert.equal(detail.disks[0]?.message, "已封盘，可拔盘");
 });
 
-test("accepts scan and copy start websocket events from Edge realtime stream", () => {
-  const scan = parseCopyProgressEvent(
-    JSON.stringify({
-      protocol_version: "edge-ws-v2",
-      event_id: "event-scan",
-      event_type: "COPY_PROGRESS",
-      source: "edge",
-      edge_code: "edge-demo",
-      stage: "SCANNING_RUSTFS",
-      export_job: exportJob("", "SCANNING"),
-      global_progress: {
-        total_bytes: 0,
-        done_bytes: 0,
-        remaining_bytes: 0,
-        speed_bytes_per_sec: 0,
-        object_total: 0,
-        object_done: 0,
-        object_remaining: 0,
-      },
-      disks: [],
-    }),
-  );
+test("accepts copy start websocket events from Edge realtime stream", () => {
   const copyStarted = parseCopyProgressEvent(
     JSON.stringify({
       protocol_version: "edge-ws-v2",
@@ -285,8 +264,6 @@ test("accepts scan and copy start websocket events from Edge realtime stream", (
     }),
   );
 
-  assert.equal(scan?.event_type, "COPY_PROGRESS");
-  assert.equal(scan?.stage, "SCANNING_RUSTFS");
   assert.equal(copyStarted?.event_type, "COPY_PROGRESS");
   assert.equal(copyStarted?.stage, "COPYING");
 });
@@ -313,7 +290,6 @@ test("keeps production export statuses from the shared contract", () => {
 
 test("separates active export statuses from historical terminal jobs", () => {
   assert.equal(isActiveExportJobStatus("PENDING"), false);
-  assert.equal(isActiveExportJobStatus("SCANNING"), true);
   assert.equal(isActiveExportJobStatus("COPYING"), true);
   assert.equal(isActiveExportJobStatus("SEALING"), true);
   assert.equal(isActiveExportJobStatus("SEALED"), false);

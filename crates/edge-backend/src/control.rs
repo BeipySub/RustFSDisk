@@ -1,20 +1,13 @@
 use crate::{
     config::EdgeConfig,
-    export_planner::{
-        assign_export_objects, create_export_plan_from_stable_snapshots, AssignedExportObject,
-    },
     export_runtime::{ExportWorkerLauncher, ProductionExportWorkerLauncher},
     progress::{
         CopyProgressEvent, DashboardExportJobSnapshot, ObjectInventorySnapshot,
         ProgressAggregator as CopyProgressAggregator,
     },
-    scanner::{
-        AwsS3RustFsReadClient, ObjectScanner, PgObjectSnapshotRepository, ProgressAggregator,
-        ScanOptions, ScanProgressSnapshot, ScanReport,
-    },
 };
 use anyhow::{anyhow, Context};
-use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 use std::{
@@ -24,10 +17,8 @@ use uuid::Uuid;
 
 pub type ControlFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ControlError>> + Send + 'a>>;
 
-const DEFAULT_MAX_BUDGET_SQL: &str =
-    "SELECT MAX(object_budget_bytes) FROM disk_runtime WHERE status = 'READY'";
 const READY_DISKS_SQL: &str = r#"
-    SELECT disk_presence_id, disk_id, sn, mount_path, capacity_bytes, free_bytes, object_budget_bytes
+    SELECT disk_id
     FROM disk_runtime
     WHERE status = 'READY'
       AND disk_id IS NOT NULL
@@ -36,10 +27,13 @@ const READY_DISKS_SQL: &str = r#"
     ORDER BY id ASC
     "#;
 const LOCAL_OBJECT_INVENTORY_SQL: &str = r#"
-        SELECT COUNT(*)::bigint AS total_count,
-               COALESCE(SUM(size_bytes), 0)::bigint AS total_bytes
-        FROM local_object_snapshot
-        WHERE stable_status = 'STABLE'
+        SELECT COUNT(*)::bigint AS exported_count,
+               COALESCE(SUM(exported.size_bytes), 0)::bigint AS exported_bytes
+        FROM export_object AS exported
+        JOIN export_job AS exported_job
+          ON exported_job.export_job_id = exported.export_job_id
+        WHERE exported.status = 'EXPORTED'
+          AND exported_job.status = 'SEALED'
         "#;
 const LOAD_DISK_RUNTIME_SQL: &str = r#"
     WITH latest AS (
@@ -70,11 +64,6 @@ const LOAD_DISK_RUNTIME_SQL: &str = r#"
     ORDER BY id ASC
     "#;
 pub trait EdgeControlService: Send + Sync {
-    fn scan_once<'a>(
-        &'a self,
-        request: ScanTriggerRequest,
-    ) -> ControlFuture<'a, ScanTriggerResponse>;
-
     fn create_export_job<'a>(
         &'a self,
         request: CreateExportJobRequest,
@@ -83,7 +72,7 @@ pub trait EdgeControlService: Send + Sync {
     fn start_export_job<'a>(
         &'a self,
         export_job_id: Uuid,
-        request: StartExportJobRequest,
+        _request: StartExportJobRequest,
     ) -> ControlFuture<'a, StartExportJobResponse>;
 
     fn recover_export_job<'a>(
@@ -101,43 +90,13 @@ pub trait EdgeControlService: Send + Sync {
 
     fn summary<'a>(&'a self) -> ControlFuture<'a, EdgeControlSummary>;
 
-    fn scan_progress_snapshot<'a>(&'a self) -> ControlFuture<'a, ScanProgressSnapshot>;
-
     fn copy_progress_snapshot<'a>(&'a self) -> ControlFuture<'a, Option<CopyProgressEvent>>;
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ScanTriggerRequest {
-    #[serde(default)]
-    pub export_job_id: Option<Uuid>,
-    #[serde(default)]
-    pub enqueue_stable_objects: bool,
-    #[serde(default)]
-    pub force_rescan: bool,
-    #[serde(default = "default_record_source_changed_objects")]
-    pub record_source_changed_objects: bool,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct ScanTriggerResponse {
-    pub scan_event_type: String,
-    pub scan_status: String,
-    pub bucket_count: u64,
-    pub object_seen: u64,
-    pub stable_object_count: u64,
-    pub source_changed_count: u64,
-    pub total_bytes: u64,
-    pub message: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreateExportJobRequest {
     #[serde(default)]
     pub export_job_id: Option<Uuid>,
-    #[serde(default = "default_true")]
-    pub run_scan: bool,
-    #[serde(default)]
-    pub max_single_disk_object_budget_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -148,23 +107,10 @@ pub struct StartExportJobRequest {
     pub batch_size: i64,
 }
 
-impl Default for ScanTriggerRequest {
-    fn default() -> Self {
-        Self {
-            export_job_id: None,
-            enqueue_stable_objects: false,
-            force_rescan: false,
-            record_source_changed_objects: default_record_source_changed_objects(),
-        }
-    }
-}
-
 impl Default for CreateExportJobRequest {
     fn default() -> Self {
         Self {
             export_job_id: None,
-            run_scan: true,
-            max_single_disk_object_budget_bytes: None,
         }
     }
 }
@@ -446,8 +392,6 @@ impl From<anyhow::Error> for ControlError {
 pub struct ProductionEdgeControlService {
     config: Arc<EdgeConfig>,
     pool: PgPool,
-    s3_client: aws_sdk_s3::Client,
-    scan_progress: ProgressAggregator,
     copy_progress: Arc<tokio::sync::RwLock<Option<CopyProgressAggregator>>>,
     worker_launcher: Arc<dyn ExportWorkerLauncher>,
 }
@@ -464,8 +408,6 @@ impl ProductionEdgeControlService {
         Self {
             config,
             pool,
-            s3_client,
-            scan_progress: ProgressAggregator::default(),
             copy_progress,
             worker_launcher,
         }
@@ -474,80 +416,15 @@ impl ProductionEdgeControlService {
     pub fn new_with_worker_launcher(
         config: Arc<EdgeConfig>,
         pool: PgPool,
-        s3_client: aws_sdk_s3::Client,
+        _s3_client: aws_sdk_s3::Client,
         worker_launcher: Arc<dyn ExportWorkerLauncher>,
     ) -> Self {
         Self {
             config,
             pool,
-            s3_client,
-            scan_progress: ProgressAggregator::default(),
             copy_progress: Arc::new(tokio::sync::RwLock::new(None)),
             worker_launcher,
         }
-    }
-
-    async fn run_scan(&self, request: ScanTriggerRequest) -> Result<ScanReport, ControlError> {
-        if request.enqueue_stable_objects && request.export_job_id.is_none() {
-            return Err(ControlError::bad_request(
-                "INVALID_REQUEST",
-                "export_job_id is required when enqueue_stable_objects=true",
-            ));
-        }
-
-        let reuse_window_minutes = self.config.scan.reuse_window_minutes;
-        if !request.force_rescan && reuse_window_minutes > 0 {
-            if let Some(report) =
-                load_recent_successful_scan(&self.pool, reuse_window_minutes).await?
-            {
-                self.scan_progress.reuse_recent_scan(&report);
-                return Ok(report);
-            }
-        }
-
-        let scan_run_id = Uuid::new_v4();
-        begin_scan_run(&self.pool, scan_run_id).await?;
-
-        let scanner = ObjectScanner::new(
-            AwsS3RustFsReadClient::new(self.s3_client.clone()),
-            PgObjectSnapshotRepository::new(self.pool.clone(), scan_run_id),
-            self.scan_progress.clone(),
-        );
-
-        let scan_result = scanner
-            .scan_all_buckets(ScanOptions {
-                export_job_id: request.export_job_id,
-                enqueue_stable_objects: request.enqueue_stable_objects,
-                record_source_changed_objects: request.record_source_changed_objects,
-            })
-            .await;
-
-        match scan_result {
-            Ok(report) => {
-                finish_scan_run(&self.pool, scan_run_id, &report).await?;
-                Ok(report)
-            }
-            Err(err) => {
-                self.scan_progress.fail_scan("SCAN_FAILED", err.to_string());
-                fail_scan_run(&self.pool, scan_run_id, "SCAN_FAILED", &err.to_string()).await?;
-                Err(ControlError::internal(err.to_string()))
-            }
-        }
-    }
-
-    async fn default_max_budget(&self) -> Result<u64, ControlError> {
-        let value: Option<i64> = sqlx::query_scalar(DEFAULT_MAX_BUDGET_SQL)
-            .fetch_one(&self.pool)
-            .await
-            .context("query READY disk capacity budget")?;
-        let budget = value.unwrap_or_default().max(0) as u64;
-        if budget == 0 {
-            return Err(ControlError::conflict(
-                "INSUFFICIENT_SPACE",
-                "no READY ext4 transport disk with object_budget_bytes is available",
-            ));
-        }
-        Ok(budget)
     }
 
     async fn ready_disks(&self) -> Result<Vec<ReadyDisk>, ControlError> {
@@ -559,16 +436,7 @@ impl ProductionEdgeControlService {
         let disks = rows
             .into_iter()
             .map(|row| ReadyDisk {
-                disk_presence_id: row
-                    .get::<Option<Uuid>, _>("disk_presence_id")
-                    .map(|value| value.to_string())
-                    .unwrap_or_default(),
                 disk_id: row.get("disk_id"),
-                disk_sn: row.get("sn"),
-                mount_path: row.get("mount_path"),
-                capacity_bytes: row.get::<i64, _>("capacity_bytes").max(0) as u64,
-                free_bytes: row.get::<i64, _>("free_bytes").max(0) as u64,
-                object_budget_bytes: row.get::<i64, _>("object_budget_bytes").max(0) as u64,
             })
             .collect::<Vec<_>>();
         if disks.is_empty() {
@@ -582,60 +450,24 @@ impl ProductionEdgeControlService {
 }
 
 impl EdgeControlService for ProductionEdgeControlService {
-    fn scan_once<'a>(
-        &'a self,
-        request: ScanTriggerRequest,
-    ) -> ControlFuture<'a, ScanTriggerResponse> {
-        Box::pin(async move {
-            let report = self.run_scan(request).await?;
-            Ok(ScanTriggerResponse {
-                scan_event_type: "SCAN_DONE".to_string(),
-                scan_status: "DONE".to_string(),
-                bucket_count: report.bucket_count,
-                object_seen: report.object_seen,
-                stable_object_count: report.stable_object_count,
-                source_changed_count: report.source_changed_count,
-                total_bytes: report.total_bytes,
-                message: if report.reused_recent_scan {
-                    format!(
-                        "RustFS scan reused: last successful scan is within {} minutes",
-                        self.config.scan.reuse_window_minutes
-                    )
-                } else {
-                    "RustFS scan completed".to_string()
-                },
-            })
-        })
-    }
-
     fn create_export_job<'a>(
         &'a self,
         request: CreateExportJobRequest,
     ) -> ControlFuture<'a, ExportJobResponse> {
         Box::pin(async move {
             let export_job_id = request.export_job_id.unwrap_or_else(Uuid::new_v4);
-            if request.run_scan {
-                self.run_scan(ScanTriggerRequest {
-                    export_job_id: Some(export_job_id),
-                    enqueue_stable_objects: false,
-                    force_rescan: false,
-                    record_source_changed_objects: true,
-                })
-                .await?;
-            }
-            let max_budget = match request.max_single_disk_object_budget_bytes {
-                Some(value) if value > 0 => value,
-                _ => self.default_max_budget().await?,
-            };
-
-            create_export_plan_from_stable_snapshots(
-                &self.pool,
-                export_job_id,
-                &self.config.edge.edge_code,
-                max_budget,
+            sqlx::query(
+                r#"
+                INSERT INTO export_job(export_job_id, edge_code, status, start_time)
+                VALUES ($1, $2, 'PENDING', NOW() AT TIME ZONE 'UTC')
+                ON CONFLICT (export_job_id) DO NOTHING
+                "#,
             )
+            .bind(export_job_id)
+            .bind(&self.config.edge.edge_code)
+            .execute(&self.pool)
             .await
-            .context("create export plan from stable snapshots")?;
+            .context("create single-disk export job")?;
 
             self.export_job(export_job_id).await
         })
@@ -644,66 +476,48 @@ impl EdgeControlService for ProductionEdgeControlService {
     fn start_export_job<'a>(
         &'a self,
         export_job_id: Uuid,
-        request: StartExportJobRequest,
+        _request: StartExportJobRequest,
     ) -> ControlFuture<'a, StartExportJobResponse> {
         Box::pin(async move {
-            if request.candidate_limit <= 0 || request.batch_size <= 0 {
-                return Err(ControlError::bad_request(
-                    "INVALID_REQUEST",
-                    "candidate_limit and batch_size must be positive",
-                ));
-            }
-
             sqlx::query(
-                "UPDATE export_job SET status = 'COPYING' WHERE export_job_id = $1 AND status IN ('PENDING', 'SCANNING', 'COPYING')",
+                "UPDATE export_job SET status = 'COPYING' WHERE export_job_id = $1 AND status IN ('PENDING', 'COPYING')",
             )
             .bind(export_job_id)
             .execute(&self.pool)
             .await
             .context("mark export job COPYING")?;
 
-            let mut assigned = Vec::new();
-            let mut assigned_disk_ids = Vec::new();
-            for disk in self.ready_disks().await? {
-                let batch = assign_export_objects(
-                    &self.pool,
-                    export_job_id,
-                    disk.disk_id,
-                    disk.object_budget_bytes,
-                    request.candidate_limit,
-                    request.batch_size,
-                )
-                .await
-                .with_context(|| format!("assign export objects to disk {}", disk.disk_id))?;
-                if !batch.is_empty() {
-                    assigned_disk_ids.push(disk.disk_id);
-                }
-                assigned_copy_progress_disk(
-                    &mut assigned,
-                    &disk,
-                    &batch,
-                    &self.config.edge.edge_code,
-                    export_job_id,
-                    self.copy_progress.clone(),
-                )
-                .await;
-                assigned.extend(batch);
-            }
+            let disk = self
+                .ready_disks()
+                .await?
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    ControlError::conflict(
+                        "NO_READY_DISK",
+                        "no READY initialized transport disk is available for single-disk export",
+                    )
+                })?;
             let worker_report = self
                 .worker_launcher
-                .launch_workers(export_job_id, assigned_disk_ids)
+                .launch_workers(export_job_id, vec![disk.disk_id])
                 .await
-                .context("launch DiskWorker instances for assigned READY disks")?;
+                .context("launch single-disk sequential export worker")?;
 
             Ok(StartExportJobResponse {
                 export_job_id,
-                export_job_status: "COPYING".to_string(),
-                assigned_object_count: assigned.len() as u64,
-                assigned_bytes: assigned_bytes(&assigned),
+                export_job_status: if worker_report.copied_count == 0 {
+                    "CANCELLED".to_string()
+                } else {
+                    "COPYING".to_string()
+                },
+                assigned_object_count: worker_report.copied_count,
+                assigned_bytes: worker_report.copied_bytes,
                 disk_count: worker_report.disk_count,
                 worker_started_count: worker_report.worker_started_count,
                 worker_failed_count: worker_report.worker_failed_count,
-                message: "export objects assigned and DiskWorker instances launched through the controlled start API".to_string(),
+                message: "single-disk sequential export worker finished its current disk pass"
+                    .to_string(),
             })
         })
     }
@@ -779,7 +593,7 @@ impl EdgeControlService for ProductionEdgeControlService {
         Box::pin(async move {
             let active_export_job_id: Option<Uuid> = sqlx::query_scalar(
                 "SELECT export_job_id FROM export_job \
-                     WHERE status IN ('PENDING', 'SCANNING', 'COPYING', 'SEALING') \
+                     WHERE status IN ('PENDING', 'COPYING', 'SEALING') \
                      ORDER BY id DESC LIMIT 1",
             )
             .fetch_optional(&self.pool)
@@ -865,7 +679,7 @@ impl EdgeControlService for ProductionEdgeControlService {
             let is_active: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM export_job \
                  WHERE export_job_id = $1 \
-                   AND status IN ('PENDING', 'SCANNING', 'COPYING', 'SEALING'))",
+                   AND status IN ('PENDING', 'COPYING', 'SEALING'))",
             )
             .bind(export_job_id)
             .fetch_one(&self.pool)
@@ -881,21 +695,11 @@ impl EdgeControlService for ProductionEdgeControlService {
             Ok(Some(snapshot))
         })
     }
-
-    fn scan_progress_snapshot<'a>(&'a self) -> ControlFuture<'a, ScanProgressSnapshot> {
-        Box::pin(async move { Ok(self.scan_progress.snapshot()) })
-    }
 }
 
 #[derive(Debug)]
 struct ReadyDisk {
-    disk_presence_id: String,
     disk_id: Uuid,
-    disk_sn: String,
-    mount_path: Option<String>,
-    capacity_bytes: u64,
-    free_bytes: u64,
-    object_budget_bytes: u64,
 }
 
 async fn load_export_job(
@@ -959,154 +763,6 @@ async fn load_export_job(
         disks,
         events,
     })
-}
-
-async fn load_recent_successful_scan(
-    pool: &PgPool,
-    reuse_window_minutes: u64,
-) -> Result<Option<ScanReport>, ControlError> {
-    let cutoff =
-        Utc::now() - ChronoDuration::minutes(reuse_window_minutes.min(i64::MAX as u64) as i64);
-    let row = sqlx::query(
-        r#"
-        SELECT bucket_count, object_seen, stable_object_count, source_changed_count, total_bytes
-        FROM edge_scan_run
-        WHERE scan_status = 'DONE'
-          AND scan_finished_at IS NOT NULL
-          AND scan_finished_at >= $1
-        ORDER BY scan_finished_at DESC
-        LIMIT 1
-        "#,
-    )
-    .bind(cutoff.naive_utc())
-    .fetch_optional(pool)
-    .await
-    .context("query recent successful RustFS scan")?;
-
-    Ok(row.map(|row| ScanReport {
-        bucket_count: row.get::<i64, _>("bucket_count").max(0) as u64,
-        object_seen: row.get::<i64, _>("object_seen").max(0) as u64,
-        stable_object_count: row.get::<i64, _>("stable_object_count").max(0) as u64,
-        source_changed_count: row.get::<i64, _>("source_changed_count").max(0) as u64,
-        total_bytes: row.get::<i64, _>("total_bytes").max(0) as u64,
-        reused_recent_scan: true,
-    }))
-}
-
-async fn begin_scan_run(pool: &PgPool, scan_run_id: Uuid) -> Result<(), ControlError> {
-    sqlx::query(
-        r#"
-        INSERT INTO edge_scan_run(scan_run_id, scan_status, scan_started_at)
-        VALUES ($1, 'SCANNING', NOW() AT TIME ZONE 'UTC')
-        "#,
-    )
-    .bind(scan_run_id)
-    .execute(pool)
-    .await
-    .context("insert RustFS scan run")?;
-
-    Ok(())
-}
-
-async fn finish_scan_run(
-    pool: &PgPool,
-    scan_run_id: Uuid,
-    report: &ScanReport,
-) -> Result<(), ControlError> {
-    let mut tx = pool
-        .begin()
-        .await
-        .context("begin successful scan promotion")?;
-    sqlx::query(
-        r#"
-        UPDATE edge_scan_run
-        SET scan_status = 'DONE',
-            scan_finished_at = NOW() AT TIME ZONE 'UTC',
-            bucket_count = $2,
-            object_seen = $3,
-            stable_object_count = $4,
-            source_changed_count = $5,
-            total_bytes = $6
-        WHERE scan_run_id = $1
-        "#,
-    )
-    .bind(scan_run_id)
-    .bind(saturating_i64(report.bucket_count))
-    .bind(saturating_i64(report.object_seen))
-    .bind(saturating_i64(report.stable_object_count))
-    .bind(saturating_i64(report.source_changed_count))
-    .bind(saturating_i64(report.total_bytes))
-    .execute(&mut *tx)
-    .await
-    .context("mark RustFS scan run DONE")?;
-
-    sqlx::query("DELETE FROM local_object_snapshot")
-        .execute(&mut *tx)
-        .await
-        .context("clear previous current RustFS object snapshot")?;
-    sqlx::query(
-        r#"
-        INSERT INTO local_object_snapshot (
-            bucket, object_key, etag, size_bytes, last_modified,
-            metadata_json, scanned_at, stable_status
-        )
-        SELECT bucket, object_key, etag, size_bytes, last_modified,
-               metadata_json, scanned_at, stable_status
-        FROM local_object_scan_stage
-        WHERE scan_run_id = $1
-        "#,
-    )
-    .bind(scan_run_id)
-    .execute(&mut *tx)
-    .await
-    .context("promote successful RustFS object scan snapshot")?;
-    sqlx::query("DELETE FROM local_object_scan_stage WHERE scan_run_id = $1")
-        .bind(scan_run_id)
-        .execute(&mut *tx)
-        .await
-        .context("clear promoted RustFS object scan stage")?;
-    tx.commit()
-        .await
-        .context("commit successful scan promotion")?;
-
-    Ok(())
-}
-
-async fn fail_scan_run(
-    pool: &PgPool,
-    scan_run_id: Uuid,
-    error_code: &str,
-    error_message: &str,
-) -> Result<(), ControlError> {
-    let mut tx = pool.begin().await.context("begin failed scan cleanup")?;
-    sqlx::query(
-        r#"
-        UPDATE edge_scan_run
-        SET scan_status = 'FAILED',
-            scan_finished_at = NOW() AT TIME ZONE 'UTC',
-            error_code = $2,
-            error_message = $3
-        WHERE scan_run_id = $1
-        "#,
-    )
-    .bind(scan_run_id)
-    .bind(error_code)
-    .bind(error_message)
-    .execute(&mut *tx)
-    .await
-    .context("mark RustFS scan run FAILED")?;
-    sqlx::query("DELETE FROM local_object_scan_stage WHERE scan_run_id = $1")
-        .bind(scan_run_id)
-        .execute(&mut *tx)
-        .await
-        .context("clear failed RustFS object scan stage")?;
-    tx.commit().await.context("commit failed scan cleanup")?;
-
-    Ok(())
-}
-
-fn saturating_i64(value: u64) -> i64 {
-    value.min(i64::MAX as u64) as i64
 }
 
 async fn load_export_jobs(
@@ -1430,48 +1086,6 @@ async fn load_disk_runtime(pool: &PgPool) -> Result<Vec<DiskRuntimeSummary>, Con
         .collect())
 }
 
-async fn assigned_copy_progress_disk(
-    assigned: &mut [AssignedExportObject],
-    disk: &ReadyDisk,
-    batch: &[AssignedExportObject],
-    edge_code: &str,
-    export_job_id: Uuid,
-    hub: Arc<tokio::sync::RwLock<Option<CopyProgressAggregator>>>,
-) {
-    if batch.is_empty() && assigned.is_empty() {
-        return;
-    }
-
-    let mut guard = hub.write().await;
-    if guard.is_none() {
-        *guard = Some(CopyProgressAggregator::new(
-            edge_code.to_string(),
-            export_job_id.to_string(),
-        ));
-    }
-    if let Some(progress) = guard.as_ref() {
-        progress.register_disk(
-            disk.disk_id.to_string(),
-            disk.disk_presence_id.clone(),
-            disk.disk_sn.clone(),
-            disk.mount_path.clone().unwrap_or_default(),
-            disk.capacity_bytes,
-            batch
-                .iter()
-                .map(|object| object.size_bytes.max(0) as u64)
-                .sum(),
-            batch.len() as u64,
-            disk.free_bytes,
-        );
-        progress.set_disk_filesystem_type(
-            &disk.disk_id.to_string(),
-            disk.mount_path
-                .as_deref()
-                .and_then(filesystem_type_from_mount),
-        );
-    }
-}
-
 fn global_from_latest_job(job: Option<&ExportJobResponse>) -> EdgeGlobalSummary {
     let Some(job) = job else {
         return EdgeGlobalSummary {
@@ -1519,38 +1133,15 @@ fn copy_progress_matches_export_job(
 }
 
 async fn load_object_inventory(pool: &PgPool) -> Result<ObjectInventorySnapshot, ControlError> {
-    let local = sqlx::query(LOCAL_OBJECT_INVENTORY_SQL)
+    let exported = sqlx::query(LOCAL_OBJECT_INVENTORY_SQL)
         .fetch_one(pool)
         .await
-        .context("load local object inventory")?;
-    let exported = sqlx::query(
-        r#"
-        SELECT COUNT(*)::bigint AS exported_count,
-               COALESCE(SUM(size_bytes), 0)::bigint AS exported_bytes
-        FROM local_object_snapshot AS current_snapshot
-        WHERE current_snapshot.stable_status = 'STABLE'
-          AND EXISTS (
-              SELECT 1
-              FROM export_object AS exported
-              JOIN export_job AS exported_job
-                ON exported_job.export_job_id = exported.export_job_id
-              WHERE exported.bucket = current_snapshot.bucket
-                AND exported.object_key = current_snapshot.object_key
-                AND exported.etag = current_snapshot.etag
-                AND exported.size_bytes = current_snapshot.size_bytes
-                AND exported.status = 'EXPORTED'
-                AND exported_job.status = 'SEALED'
-          )
-        "#,
-    )
-    .fetch_one(pool)
-    .await
-    .context("load exported object inventory")?;
+        .context("load exported object inventory")?;
 
     Ok(ObjectInventorySnapshot {
-        total_bytes: local.get::<i64, _>("total_bytes").max(0) as u64,
+        total_bytes: 0,
         exported_bytes: exported.get::<i64, _>("exported_bytes").max(0) as u64,
-        total_count: local.get::<i64, _>("total_count").max(0) as u64,
+        total_count: 0,
         exported_count: exported.get::<i64, _>("exported_count").max(0) as u64,
     })
 }
@@ -1729,13 +1320,6 @@ fn disk_runtime_message(
         (None, Some(message)) => message.to_string(),
         (None, None) => format!("disk runtime_status={runtime_status}"),
     }
-}
-
-fn assigned_bytes(objects: &[AssignedExportObject]) -> u64 {
-    objects
-        .iter()
-        .map(|object| object.size_bytes.max(0) as u64)
-        .sum()
 }
 
 fn percent(done_bytes: u64, total_bytes: u64) -> f64 {
@@ -2213,13 +1797,13 @@ fn naive_utc(value: Option<NaiveDateTime>) -> Option<DateTime<Utc>> {
 fn is_valid_export_job_status(value: &str) -> bool {
     matches!(
         value,
-        "PENDING" | "SCANNING" | "COPYING" | "SEALING" | "SEALED" | "FAILED" | "CANCELLED"
+        "PENDING" | "COPYING" | "SEALING" | "SEALED" | "FAILED" | "CANCELLED"
     )
 }
 
 #[cfg(test)]
 fn is_active_export_job_status(value: &str) -> bool {
-    matches!(value, "PENDING" | "SCANNING" | "COPYING" | "SEALING")
+    matches!(value, "PENDING" | "COPYING" | "SEALING")
 }
 
 fn default_page() -> u32 {
@@ -2228,14 +1812,6 @@ fn default_page() -> u32 {
 
 fn default_page_size() -> u32 {
     20
-}
-
-fn default_record_source_changed_objects() -> bool {
-    true
-}
-
-fn default_true() -> bool {
-    true
 }
 
 fn default_candidate_limit() -> i64 {
@@ -2250,13 +1826,6 @@ impl<T> EdgeControlService for Arc<T>
 where
     T: EdgeControlService + ?Sized,
 {
-    fn scan_once<'a>(
-        &'a self,
-        request: ScanTriggerRequest,
-    ) -> ControlFuture<'a, ScanTriggerResponse> {
-        (**self).scan_once(request)
-    }
-
     fn create_export_job<'a>(
         &'a self,
         request: CreateExportJobRequest,
@@ -2295,10 +1864,6 @@ where
         (**self).summary()
     }
 
-    fn scan_progress_snapshot<'a>(&'a self) -> ControlFuture<'a, ScanProgressSnapshot> {
-        (**self).scan_progress_snapshot()
-    }
-
     fn copy_progress_snapshot<'a>(&'a self) -> ControlFuture<'a, Option<CopyProgressEvent>> {
         (**self).copy_progress_snapshot()
     }
@@ -2325,16 +1890,6 @@ mod tests {
     use std::{fs, path::Path};
 
     #[test]
-    fn scan_request_force_rescan_defaults_to_false_and_can_be_enabled() {
-        let default_request: ScanTriggerRequest = serde_json::from_str("{}").unwrap();
-        assert!(!default_request.force_rescan);
-
-        let forced_request: ScanTriggerRequest =
-            serde_json::from_str(r#"{"force_rescan":true}"#).unwrap();
-        assert!(forced_request.force_rescan);
-    }
-
-    #[test]
     fn recovery_job_guard_rejects_non_failed_job() {
         let err = ensure_recovery_job_guard(&RecoveryJobGuard {
             export_job_status: "COPYING".to_string(),
@@ -2354,7 +1909,7 @@ mod tests {
 
     #[test]
     fn only_non_terminal_export_jobs_are_active() {
-        for status in ["PENDING", "SCANNING", "COPYING", "SEALING"] {
+        for status in ["PENDING", "COPYING", "SEALING"] {
             assert!(is_active_export_job_status(status));
         }
         for status in ["SEALED", "FAILED", "CANCELLED"] {
@@ -2519,11 +2074,9 @@ mod tests {
 
     #[test]
     fn ready_queries_use_current_rebuildable_runtime_only() {
-        for sql in [DEFAULT_MAX_BUDGET_SQL, READY_DISKS_SQL] {
-            assert!(!sql.contains("DISTINCT ON"));
-            assert!(!sql.contains("DELETE FROM export_job"));
-            assert!(!sql.contains("DELETE FROM export_object"));
-        }
+        assert!(!READY_DISKS_SQL.contains("DISTINCT ON"));
+        assert!(!READY_DISKS_SQL.contains("DELETE FROM export_job"));
+        assert!(!READY_DISKS_SQL.contains("DELETE FROM export_object"));
         assert!(READY_DISKS_SQL.contains("WHERE status = 'READY'"));
         assert!(READY_DISKS_SQL.contains("ORDER BY id ASC"));
         assert!(LOAD_DISK_RUNTIME_SQL.contains("DISTINCT ON"));
@@ -2534,10 +2087,10 @@ mod tests {
     }
 
     #[test]
-    fn local_object_inventory_counts_current_stable_snapshot_only() {
-        assert!(LOCAL_OBJECT_INVENTORY_SQL.contains("stable_status = 'STABLE'"));
-        assert!(LOCAL_OBJECT_INVENTORY_SQL.contains("FROM local_object_snapshot"));
-        assert!(!LOCAL_OBJECT_INVENTORY_SQL.contains("latest_scan"));
+    fn object_inventory_counts_sealed_export_ledger_only() {
+        assert!(LOCAL_OBJECT_INVENTORY_SQL.contains("FROM export_object AS exported"));
+        assert!(LOCAL_OBJECT_INVENTORY_SQL.contains("exported.status = 'EXPORTED'"));
+        assert!(LOCAL_OBJECT_INVENTORY_SQL.contains("exported_job.status = 'SEALED'"));
         assert!(!LOCAL_OBJECT_INVENTORY_SQL.contains("DISTINCT ON"));
     }
 

@@ -104,7 +104,6 @@ fn disk_runtime_event(
         edge_code: edge_code.to_string(),
         stage: None,
         edge_name: edge_code.to_string(),
-        scan: None,
         object_inventory: ObjectInventorySnapshot::default(),
         export_job: None,
         global: global_progress.clone(),

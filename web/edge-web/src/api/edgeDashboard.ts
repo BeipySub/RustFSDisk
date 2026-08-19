@@ -24,7 +24,6 @@ export type RuntimeStatus =
 
 export type ExportJobStatus =
   | "PENDING"
-  | "SCANNING"
   | "COPYING"
   | "SEALING"
   | "SEALED"
@@ -276,7 +275,6 @@ interface EdgeControlSummary {
 
 const exportJobStatuses: readonly ExportJobStatus[] = [
   "PENDING",
-  "SCANNING",
   "COPYING",
   "SEALING",
   "SEALED",
@@ -516,7 +514,7 @@ export function isEdgeUnsupportedDiskIssue(value: string): boolean {
 }
 
 export function isActiveExportJobStatus(value: ExportJobStatus | undefined): boolean {
-  return value === "SCANNING" || value === "COPYING" || value === "SEALING";
+  return value === "COPYING" || value === "SEALING";
 }
 
 export function normalizeExportJobsResponse(

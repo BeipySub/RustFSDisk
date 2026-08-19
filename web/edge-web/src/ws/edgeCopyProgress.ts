@@ -11,24 +11,11 @@ import {
 export type EdgeWsV2EventType = "DISK_PLUGGED" | "DISK_UNPLUGGED" | "COPY_PROGRESS";
 
 export type EdgeCopyStage =
-  | "SCANNING_RUSTFS"
   | "PLANNING"
   | "COPYING"
   | "SEALING"
   | "SEALED"
   | "FAILED";
-
-export interface EdgeScanProgress {
-  scan_status?: string;
-  bucket_count?: number;
-  object_seen?: number;
-  stable_object_count?: number;
-  source_changed_count?: number;
-  total_bytes?: number;
-  current_bucket?: string | null;
-  current_object_key?: string | null;
-  last_error_code?: string | null;
-}
 
 export interface CopyProgressEvent {
   protocol_version: "edge-ws-v2";
@@ -39,7 +26,6 @@ export interface CopyProgressEvent {
   edge_code: string;
   edge_name?: string;
   stage?: EdgeCopyStage | null;
-  scan?: EdgeScanProgress | null;
   object_inventory?: EdgeObjectInventory;
   export_job?: EdgeExportJobSnapshot | null;
   global_progress: EdgeGlobalProgress;
@@ -65,7 +51,6 @@ const eventTypes: readonly EdgeWsV2EventType[] = [
 ];
 
 const copyStages: readonly EdgeCopyStage[] = [
-  "SCANNING_RUSTFS",
   "PLANNING",
   "COPYING",
   "SEALING",
@@ -279,7 +264,6 @@ export function parseCopyProgressEvent(data: unknown): CopyProgressEvent | null 
       edge_code: event.edge_code || "",
       edge_name: event.edge_name,
       stage: event.stage ?? null,
-      scan: event.scan ?? null,
       object_inventory: event.object_inventory,
       export_job: event.export_job ?? null,
       global_progress: event.global_progress ?? {

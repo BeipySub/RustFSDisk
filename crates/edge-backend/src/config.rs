@@ -16,8 +16,6 @@ pub struct EdgeConfig {
     #[serde(default)]
     pub disk_polling: DiskPollingConfig,
     #[serde(default)]
-    pub scan: ScanConfig,
-    #[serde(default)]
     pub auto_export: AutoExportConfig,
 }
 
@@ -58,12 +56,6 @@ pub struct PathConfig {
     #[serde(default)]
     pub disk_mount_roots: Vec<String>,
     pub transport_mount_root: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ScanConfig {
-    #[serde(default = "default_scan_reuse_window_minutes")]
-    pub reuse_window_minutes: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -146,7 +138,6 @@ impl EdgeConfig {
             "DISK_POLLING_INTERVAL_SECONDS",
             &mut self.disk_polling.interval_seconds,
         );
-        override_u64("SCAN_REUSE_MINUTES", &mut self.scan.reuse_window_minutes);
         override_bool("AUTO_EXPORT_ENABLED", &mut self.auto_export.enabled);
         override_bool(
             "AUTO_EXPORT_START_ON_READY",
@@ -182,7 +173,6 @@ impl Default for EdgeConfig {
             rustfs: RustfsConfig::default(),
             paths: PathConfig::default(),
             disk_polling: DiskPollingConfig::default(),
-            scan: ScanConfig::default(),
             auto_export: AutoExportConfig::default(),
         }
     }
@@ -232,14 +222,6 @@ impl Default for PathConfig {
             log_dir: default_log_dir(),
             disk_mount_roots: default_disk_mount_roots(),
             transport_mount_root: None,
-        }
-    }
-}
-
-impl Default for ScanConfig {
-    fn default() -> Self {
-        Self {
-            reuse_window_minutes: default_scan_reuse_window_minutes(),
         }
     }
 }
@@ -373,10 +355,6 @@ fn default_auto_export_min_ready_disk_count() -> usize {
     1
 }
 
-fn default_scan_reuse_window_minutes() -> u64 {
-    24 * 60
-}
-
 fn default_auto_export_cooldown_seconds() -> u64 {
     60
 }
@@ -426,7 +404,6 @@ mod tests {
         );
         assert!(!config.auto_export.enabled);
         assert!(!config.auto_export.start_on_ready);
-        assert_eq!(config.scan.reuse_window_minutes, 24 * 60);
         assert_eq!(config.auto_export.min_ready_disk_count, 1);
         assert_eq!(config.auto_export.cooldown_seconds, 60);
         assert!(config.disk_polling.enabled);
@@ -514,7 +491,6 @@ mod tests {
         std::env::set_var("AUTO_EXPORT_START_ON_READY", "1");
         std::env::set_var("AUTO_EXPORT_MIN_READY_DISK_COUNT", "2");
         std::env::set_var("AUTO_EXPORT_COOLDOWN_SECONDS", "300");
-        std::env::set_var("SCAN_REUSE_MINUTES", "15");
         std::env::set_var("DISK_POLLING_ENABLED", "false");
         std::env::set_var("DISK_POLLING_INTERVAL_SECONDS", "3");
         let raw = r#"
@@ -537,7 +513,6 @@ mod tests {
         assert!(config.auto_export.start_on_ready);
         assert_eq!(config.auto_export.min_ready_disk_count, 2);
         assert_eq!(config.auto_export.cooldown_seconds, 300);
-        assert_eq!(config.scan.reuse_window_minutes, 15);
         assert!(!config.disk_polling.enabled);
         assert_eq!(config.disk_polling.interval_seconds, 3);
 
@@ -624,7 +599,6 @@ mod tests {
         std::env::remove_var("DISK_MOUNT_ROOTS");
         std::env::remove_var("DISK_POLLING_ENABLED");
         std::env::remove_var("DISK_POLLING_INTERVAL_SECONDS");
-        std::env::remove_var("SCAN_REUSE_MINUTES");
         std::env::remove_var("AUTO_EXPORT_ENABLED");
         std::env::remove_var("AUTO_EXPORT_START_ON_READY");
         std::env::remove_var("AUTO_EXPORT_MIN_READY_DISK_COUNT");

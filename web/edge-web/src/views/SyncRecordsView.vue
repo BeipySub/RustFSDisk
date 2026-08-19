@@ -103,10 +103,9 @@ async function loadStats() {
     started_to: "",
     q: query.value,
   };
-  const [all, copying, scanning, sealing, sealed, failed] = await Promise.allSettled([
+  const [all, copying, sealing, sealed, failed] = await Promise.allSettled([
     fetchEdgeExportJobs({ ...baseQuery, export_job_status: "" }),
     fetchEdgeExportJobs({ ...baseQuery, export_job_status: "COPYING" }),
-    fetchEdgeExportJobs({ ...baseQuery, export_job_status: "SCANNING" }),
     fetchEdgeExportJobs({ ...baseQuery, export_job_status: "SEALING" }),
     fetchEdgeExportJobs({ ...baseQuery, export_job_status: "SEALED" }),
     fetchEdgeExportJobs({ ...baseQuery, export_job_status: "FAILED" }),
@@ -114,8 +113,8 @@ async function loadStats() {
   const current = recordStats.value;
   const pageStats = fullPageStats();
   const runningFromApi =
-    totalFrom(copying) !== undefined || totalFrom(scanning) !== undefined || totalFrom(sealing) !== undefined
-      ? (totalFrom(copying) ?? 0) + (totalFrom(scanning) ?? 0) + (totalFrom(sealing) ?? 0)
+    totalFrom(copying) !== undefined || totalFrom(sealing) !== undefined
+      ? (totalFrom(copying) ?? 0) + (totalFrom(sealing) ?? 0)
       : undefined;
   recordStats.value = {
     total: totalFrom(all) ?? pageStats?.total ?? current.total,
@@ -182,12 +181,12 @@ function formatTime(value?: string): string {
 function statusTone(value: ExportJobStatus): string {
   if (value === "SEALED") return "success";
   if (value === "FAILED") return "danger";
-  if (value === "COPYING" || value === "SCANNING" || value === "SEALING") return "running";
+  if (value === "COPYING" || value === "SEALING") return "running";
   return "muted";
 }
 
 function resultText(record: EdgeExportJobRecord): string {
-  if (record.export_job_status === "COPYING") return "多盘并行写入中";
+  if (record.export_job_status === "COPYING") return "单盘顺序写入中";
   if (record.export_job_status === "SEALED") return "已封盘";
   if (record.export_job_status === "FAILED") return record.error_message ?? "失败";
   return "待处理";
@@ -198,7 +197,6 @@ function countRecordStats(items: EdgeExportJobRecord[], totalCount = items.lengt
     total: totalCount,
     running: items.filter((record) =>
       record.export_job_status === "COPYING" ||
-      record.export_job_status === "SCANNING" ||
       record.export_job_status === "SEALING"
     ).length,
     sealed: items.filter((record) => record.export_job_status === "SEALED").length,

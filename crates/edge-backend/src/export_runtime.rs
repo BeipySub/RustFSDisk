@@ -36,10 +36,13 @@ const MARK_DISK_RUNTIME_DONE_AFTER_SEAL_SQL: &str = r#"
     "#;
 
 const LOCAL_OBJECT_INVENTORY_SQL: &str = r#"
-    SELECT COUNT(*)::bigint AS total_count,
-           COALESCE(SUM(size_bytes), 0)::bigint AS total_bytes
-    FROM local_object_snapshot
-    WHERE stable_status = 'STABLE'
+    SELECT COUNT(*)::bigint AS exported_count,
+           COALESCE(SUM(exported.size_bytes), 0)::bigint AS exported_bytes
+    FROM export_object AS exported
+    JOIN export_job AS exported_job
+      ON exported_job.export_job_id = exported.export_job_id
+    WHERE exported.status = 'EXPORTED'
+      AND exported_job.status = 'SEALED'
     "#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +50,8 @@ pub struct ExportWorkerReport {
     pub disk_count: u64,
     pub worker_started_count: u64,
     pub worker_failed_count: u64,
+    pub copied_count: u64,
+    pub copied_bytes: u64,
 }
 
 pub trait ExportWorkerLauncher: Send + Sync {
@@ -99,7 +104,7 @@ impl ExportWorkerLauncher for ProductionExportWorkerLauncher {
             let handle = Handle::current();
             let mut tasks = Vec::new();
 
-            for disk in disks {
+            if let Some(disk) = disks.into_iter().next() {
                 let disk_info = DiskInfoForExport::read_from_mount(&disk.mount_path)
                     .with_context(|| format!("read disk_info for disk {}", disk.disk_id))?;
                 if disk_info.status_code != "INITIALIZED" {
@@ -138,16 +143,21 @@ impl ExportWorkerLauncher for ProductionExportWorkerLauncher {
                 let progress = progress.clone();
                 tasks.push(task::spawn_blocking(move || {
                     let worker = DiskWorker::new(config, &source, &repo, progress);
-                    worker.run().map(|_| ())
+                    run_single_disk_sequential_export(&worker, &source, &repo)
                 }));
             }
 
             let disk_count = tasks.len() as u64;
             let mut worker_failed_count = 0_u64;
             let mut failure_audit_lines = Vec::new();
+            let mut copied_count = 0_u64;
+            let mut copied_bytes = 0_u64;
             for task in tasks {
                 match task.await.context("join export disk worker")? {
-                    Ok(()) => {}
+                    Ok(report) => {
+                        copied_count = copied_count.saturating_add(report.copied_count);
+                        copied_bytes = copied_bytes.saturating_add(report.copied_bytes);
+                    }
                     Err(err) => {
                         worker_failed_count += 1;
                         failure_audit_lines.push(export_failure_audit_line(&err));
@@ -156,8 +166,22 @@ impl ExportWorkerLauncher for ProductionExportWorkerLauncher {
                 }
             }
 
-            if worker_failed_count == 0 && disk_count > 0 {
+            if worker_failed_count == 0 && disk_count > 0 && copied_count > 0 {
                 seal_export_job_if_complete(&self.pool, export_job_id).await?;
+            } else if worker_failed_count == 0 && disk_count > 0 {
+                sqlx::query(
+                    r#"
+                    UPDATE export_job
+                    SET status = 'CANCELLED',
+                        finish_time = NOW() AT TIME ZONE 'UTC',
+                        error_message = 'no new exportable object was found during single-disk S3 listing'
+                    WHERE export_job_id = $1
+                      AND status = 'COPYING'
+                    "#,
+                )
+                .bind(export_job_id)
+                .execute(&self.pool)
+                .await?;
             } else if worker_failed_count > 0 {
                 sqlx::query(
                     r#"
@@ -178,9 +202,105 @@ impl ExportWorkerLauncher for ProductionExportWorkerLauncher {
                 disk_count,
                 worker_started_count: disk_count,
                 worker_failed_count,
+                copied_count,
+                copied_bytes,
             })
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SequentialExportReport {
+    copied_count: u64,
+    copied_bytes: u64,
+}
+
+fn run_single_disk_sequential_export(
+    worker: &DiskWorker<'_, S3ObjectSource, PgExportObjectRepository>,
+    source: &S3ObjectSource,
+    repo: &PgExportObjectRepository,
+) -> Result<SequentialExportReport, DiskWorkerError> {
+    worker.begin_copying()?;
+    worker.register_single_disk_progress(0, 0);
+
+    let mut copied_count = 0_u64;
+    let mut copied_bytes = 0_u64;
+    let mut remaining_budget = worker_budget_bytes(worker.config_free_bytes());
+
+    for bucket in source.list_buckets()? {
+        let mut continuation_token = None;
+        loop {
+            let page = source.list_object_page(&bucket, continuation_token)?;
+            for listed in page.objects {
+                if repo.is_exported_source_version(
+                    &listed.bucket,
+                    &listed.object_key,
+                    &listed.etag,
+                    listed.size_bytes,
+                )? {
+                    continue;
+                }
+                let estimated_landing_bytes = listed.size_bytes.saturating_add(4096);
+                if estimated_landing_bytes > remaining_budget {
+                    if copied_count > 0 {
+                        worker.seal()?;
+                    }
+                    return Ok(SequentialExportReport {
+                        copied_count,
+                        copied_bytes,
+                    });
+                }
+                let task = repo.insert_assigned_object(
+                    worker.config_export_job_id(),
+                    worker.config_disk_id(),
+                    &listed,
+                )?;
+                match worker.export_one_object(&task) {
+                    Ok(()) => {
+                        copied_count += 1;
+                        copied_bytes = copied_bytes.saturating_add(task.size_bytes);
+                        remaining_budget = remaining_budget.saturating_sub(estimated_landing_bytes);
+                    }
+                    Err(err) => {
+                        repo.mark_failed(task.id, err.error_code(), &err.to_string())?;
+                        match err {
+                            DiskWorkerError::DiskFull(_)
+                            | DiskWorkerError::DiskRemoved(_)
+                            | DiskWorkerError::PartialCleanFailed(_) => {
+                                if copied_count > 0 {
+                                    worker.seal()?;
+                                    return Ok(SequentialExportReport {
+                                        copied_count,
+                                        copied_bytes,
+                                    });
+                                }
+                                return Err(err);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
+            if page.is_truncated {
+                continuation_token = page.next_continuation_token;
+            } else {
+                break;
+            }
+        }
+    }
+
+    if copied_count > 0 {
+        worker.seal()?;
+    }
+    Ok(SequentialExportReport {
+        copied_count,
+        copied_bytes,
+    })
+}
+
+fn worker_budget_bytes(free_bytes: u64) -> u64 {
+    free_bytes.saturating_sub(1_073_741_824)
 }
 
 async fn install_copy_progress(
@@ -201,36 +321,14 @@ async fn install_copy_progress(
 }
 
 async fn load_object_inventory(pool: &PgPool) -> anyhow::Result<ObjectInventorySnapshot> {
-    let local = sqlx::query(LOCAL_OBJECT_INVENTORY_SQL)
+    let exported = sqlx::query(LOCAL_OBJECT_INVENTORY_SQL)
         .fetch_one(pool)
         .await?;
-    let exported = sqlx::query(
-        r#"
-        SELECT COUNT(*)::bigint AS exported_count,
-               COALESCE(SUM(size_bytes), 0)::bigint AS exported_bytes
-        FROM local_object_snapshot AS current_snapshot
-        WHERE current_snapshot.stable_status = 'STABLE'
-          AND EXISTS (
-              SELECT 1
-              FROM export_object AS exported
-              JOIN export_job AS exported_job
-                ON exported_job.export_job_id = exported.export_job_id
-              WHERE exported.bucket = current_snapshot.bucket
-                AND exported.object_key = current_snapshot.object_key
-                AND exported.etag = current_snapshot.etag
-                AND exported.size_bytes = current_snapshot.size_bytes
-                AND exported.status = 'EXPORTED'
-                AND exported_job.status = 'SEALED'
-          )
-        "#,
-    )
-    .fetch_one(pool)
-    .await?;
 
     Ok(ObjectInventorySnapshot {
-        total_bytes: local.get::<i64, _>("total_bytes").max(0) as u64,
+        total_bytes: 0,
         exported_bytes: exported.get::<i64, _>("exported_bytes").max(0) as u64,
-        total_count: local.get::<i64, _>("total_count").max(0) as u64,
+        total_count: 0,
         exported_count: exported.get::<i64, _>("exported_count").max(0) as u64,
     })
 }
@@ -331,6 +429,79 @@ impl S3ObjectSource {
     fn new(client: Client, handle: Handle) -> Self {
         Self { client, handle }
     }
+
+    fn list_buckets(&self) -> Result<Vec<String>, DiskWorkerError> {
+        self.handle.block_on(async {
+            let output = self
+                .client
+                .list_buckets()
+                .send()
+                .await
+                .map_err(|err| DiskWorkerError::Io(std::io::Error::other(err.to_string())))?;
+            Ok(output
+                .buckets()
+                .iter()
+                .filter_map(|bucket| bucket.name().map(str::to_owned))
+                .collect())
+        })
+    }
+
+    fn list_object_page(
+        &self,
+        bucket: &str,
+        continuation_token: Option<String>,
+    ) -> Result<ListedObjectPage, DiskWorkerError> {
+        self.handle.block_on(async {
+            let output = self
+                .client
+                .list_objects_v2()
+                .bucket(bucket)
+                .max_keys(1000)
+                .set_continuation_token(continuation_token)
+                .send()
+                .await
+                .map_err(|err| DiskWorkerError::Io(std::io::Error::other(err.to_string())))?;
+
+            let mut objects = Vec::new();
+            for object in output.contents() {
+                let Some(object_key) = object.key() else {
+                    continue;
+                };
+                let Some(last_modified) = object.last_modified() else {
+                    continue;
+                };
+                objects.push(ListedObject {
+                    bucket: bucket.to_string(),
+                    object_key: object_key.to_string(),
+                    etag: object.e_tag().unwrap_or_default().to_string(),
+                    size_bytes: object.size().unwrap_or_default().max(0) as u64,
+                    last_modified: smithy_time_to_utc(last_modified)?,
+                });
+            }
+
+            Ok(ListedObjectPage {
+                objects,
+                is_truncated: output.is_truncated().unwrap_or(false),
+                next_continuation_token: output.next_continuation_token().map(str::to_owned),
+            })
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ListedObject {
+    bucket: String,
+    object_key: String,
+    etag: String,
+    size_bytes: u64,
+    last_modified: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+struct ListedObjectPage {
+    objects: Vec<ListedObject>,
+    is_truncated: bool,
+    next_continuation_token: Option<String>,
 }
 
 impl ObjectSource for S3ObjectSource {
@@ -413,6 +584,87 @@ struct PgExportObjectRepository {
 impl PgExportObjectRepository {
     fn new(pool: PgPool, handle: Handle) -> Self {
         Self { pool, handle }
+    }
+
+    fn is_exported_source_version(
+        &self,
+        bucket: &str,
+        object_key: &str,
+        etag: &str,
+        size_bytes: u64,
+    ) -> Result<bool, DiskWorkerError> {
+        self.handle.block_on(async {
+            sqlx::query_scalar(
+                r#"
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM export_object AS exported
+                    JOIN export_job AS exported_job
+                      ON exported_job.export_job_id = exported.export_job_id
+                    WHERE exported.bucket = $1
+                      AND exported.object_key = $2
+                      AND exported.etag = $3
+                      AND exported.size_bytes = $4
+                      AND exported.status = 'EXPORTED'
+                      AND exported_job.status = 'SEALED'
+                )
+                "#,
+            )
+            .bind(bucket)
+            .bind(object_key)
+            .bind(etag)
+            .bind(size_bytes.min(i64::MAX as u64) as i64)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(sqlx_err)
+        })
+    }
+
+    fn insert_assigned_object(
+        &self,
+        export_job_id: Uuid,
+        disk_id: Uuid,
+        object: &ListedObject,
+    ) -> Result<ExportObjectTask, DiskWorkerError> {
+        self.handle.block_on(async {
+            let row = sqlx::query(
+                r#"
+                INSERT INTO export_object (
+                    object_id, export_job_id, disk_id, bucket, object_key, storage_mode,
+                    etag, size_bytes, estimated_landing_bytes, last_modified, frame_total, status
+                )
+                VALUES ($1, $2, $3, $4, $5, 'PACK', $6, $7, $8, $9, 0, 'ASSIGNED')
+                ON CONFLICT (export_job_id, bucket, object_key, etag, size_bytes, last_modified)
+                DO UPDATE SET disk_id = EXCLUDED.disk_id,
+                              status = 'ASSIGNED',
+                              error_code = NULL,
+                              error_message = NULL
+                RETURNING id, object_id, bucket, object_key, etag, size_bytes, last_modified
+                "#,
+            )
+            .bind(Uuid::new_v4())
+            .bind(export_job_id)
+            .bind(disk_id)
+            .bind(&object.bucket)
+            .bind(&object.object_key)
+            .bind(&object.etag)
+            .bind(object.size_bytes.min(i64::MAX as u64) as i64)
+            .bind(object.size_bytes.saturating_add(4096).min(i64::MAX as u64) as i64)
+            .bind(object.last_modified.naive_utc())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(sqlx_err)?;
+
+            Ok(ExportObjectTask {
+                id: row.get("id"),
+                object_id: row.get("object_id"),
+                bucket: row.get("bucket"),
+                object_key: row.get("object_key"),
+                etag: row.get("etag"),
+                size_bytes: row.get::<i64, _>("size_bytes").max(0) as u64,
+                last_modified: naive_utc(row.get("last_modified")),
+            })
+        })
     }
 }
 
@@ -886,9 +1138,9 @@ mod tests {
     }
 
     #[test]
-    fn copy_progress_inventory_uses_current_stable_snapshot() {
-        assert!(LOCAL_OBJECT_INVENTORY_SQL.contains("FROM local_object_snapshot"));
-        assert!(LOCAL_OBJECT_INVENTORY_SQL.contains("stable_status = 'STABLE'"));
-        assert!(!LOCAL_OBJECT_INVENTORY_SQL.contains("latest_scan"));
+    fn copy_progress_inventory_uses_sealed_export_ledger() {
+        assert!(LOCAL_OBJECT_INVENTORY_SQL.contains("FROM export_object AS exported"));
+        assert!(LOCAL_OBJECT_INVENTORY_SQL.contains("exported.status = 'EXPORTED'"));
+        assert!(LOCAL_OBJECT_INVENTORY_SQL.contains("exported_job.status = 'SEALED'"));
     }
 }

@@ -251,11 +251,7 @@ where
     }
 
     pub fn run(&self) -> Result<ExportManifest> {
-        self.ensure_protocol_dirs()?;
-        self.cleanup_or_quarantine_partials()?;
-        self.repository
-            .mark_disk_runtime(self.config.disk_id, "COPYING", None)?;
-        self.mark_disk_info_edge_copying()?;
+        self.begin_copying()?;
 
         let objects = self
             .repository
@@ -297,7 +293,40 @@ where
         self.seal()
     }
 
-    fn export_one_object(&self, object: &ExportObjectTask) -> Result<()> {
+    pub fn begin_copying(&self) -> Result<()> {
+        self.ensure_protocol_dirs()?;
+        self.cleanup_or_quarantine_partials()?;
+        self.repository
+            .mark_disk_runtime(self.config.disk_id, "COPYING", None)?;
+        self.mark_disk_info_edge_copying()
+    }
+
+    pub fn register_single_disk_progress(&self, total_bytes: u64, object_total: u64) {
+        self.progress.register_disk(
+            self.config.disk_id.to_string(),
+            "",
+            self.config.disk_sn.clone(),
+            self.config.mount_path.display().to_string(),
+            0,
+            total_bytes,
+            object_total,
+            self.config.free_bytes,
+        );
+    }
+
+    pub fn config_export_job_id(&self) -> Uuid {
+        self.config.export_job_id
+    }
+
+    pub fn config_disk_id(&self) -> Uuid {
+        self.config.disk_id
+    }
+
+    pub fn config_free_bytes(&self) -> u64 {
+        self.config.free_bytes
+    }
+
+    pub fn export_one_object(&self, object: &ExportObjectTask) -> Result<()> {
         let object_id = object.object_id;
         let pack_path = data_path(&self.config.export_job_id, object.id);
         let pack_index_path = pack_index_path(&self.config.export_job_id, object.id);
@@ -442,7 +471,7 @@ where
         Ok(())
     }
 
-    fn seal(&self) -> Result<ExportManifest> {
+    pub fn seal(&self) -> Result<ExportManifest> {
         self.cleanup_or_quarantine_partials()?;
         let exported = self
             .repository

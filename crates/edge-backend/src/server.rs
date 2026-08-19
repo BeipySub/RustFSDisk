@@ -5,15 +5,14 @@ use crate::{
     control::{
         missing_control_service, validate_export_job_id, ControlError, CreateExportJobRequest,
         EdgeControlService, ExportJobRecordsRequest, ProductionEdgeControlService,
-        RecoverExportJobRequest, ScanTriggerRequest, StartExportJobRequest,
+        RecoverExportJobRequest, StartExportJobRequest,
     },
     disk_detection::{
         ConfiguredMountProbe, EdgeDiskDetector, EdgeDiskDetectorConfig, PgDiskRuntimeLedger,
     },
-    progress::{CopyProgressEvent, GlobalProgressSnapshot},
+    progress::CopyProgressEvent,
     realtime::EdgeRealtimeHub,
     rescan::{DiskRescanCoordinator, DiskRescanTrigger},
-    scanner::ScanProgressSnapshot,
 };
 use axum::response::IntoResponse;
 use axum::{
@@ -132,7 +131,6 @@ pub fn app(state: AppState) -> Router {
         .route("/api/edge/summary", get(edge_summary))
         .route("/ws/edge/copy-progress", get(edge_copy_progress_ws))
         .route("/ws/edge/progress", get(edge_copy_progress_ws))
-        .route("/api/edge/scan", post(trigger_scan))
         .route("/api/edge/export-jobs", post(create_export_job))
         .route("/api/edge/export-jobs/{export_job_id}", get(get_export_job))
         .route(
@@ -300,7 +298,7 @@ async fn publish_edge_copy_progress(
     mut socket: WebSocket,
     control: Arc<dyn EdgeControlService>,
     realtime: EdgeRealtimeHub,
-    edge_code: String,
+    _edge_code: String,
 ) {
     let mut interval = time::interval(Duration::from_secs(1));
     let mut receiver = realtime.subscribe();
@@ -329,21 +327,7 @@ async fn publish_edge_copy_progress(
                         None
                     }
                 };
-                let scan_event = match control.scan_progress_snapshot().await {
-                    Ok(snapshot) if should_publish_scan_progress_snapshot(&snapshot) => {
-                        Some(scan_progress_event(&edge_code, snapshot))
-                    }
-                    Ok(_) => None,
-                    Err(error) => {
-                        tracing::warn!(
-                            error_code = error.error_code,
-                            message = error.message,
-                            "failed to load edge scan progress snapshot"
-                        );
-                        None
-                    }
-                };
-                let Some(event) = copy_event.or(scan_event) else {
+                let Some(event) = copy_event else {
                     continue;
                 };
                 event
@@ -355,57 +339,6 @@ async fn publish_edge_copy_progress(
         if socket.send(Message::Text(payload.into())).await.is_err() {
             break;
         }
-    }
-}
-
-fn should_publish_scan_progress_snapshot(snapshot: &ScanProgressSnapshot) -> bool {
-    matches!(snapshot.scan_phase, "SCANNING" | "ERROR")
-}
-
-fn scan_progress_event(edge_code: &str, snapshot: ScanProgressSnapshot) -> CopyProgressEvent {
-    let global_progress = GlobalProgressSnapshot {
-        total_bytes: snapshot.total_bytes,
-        done_bytes: 0,
-        remaining_bytes: snapshot.total_bytes,
-        speed_bytes_per_sec: 0,
-        object_total: snapshot.object_seen,
-        object_done: snapshot.stable_object_count,
-        object_remaining: snapshot
-            .object_seen
-            .saturating_sub(snapshot.stable_object_count),
-        percent: 0.0,
-    };
-    CopyProgressEvent {
-        protocol_version: "edge-ws-v2".to_string(),
-        event_id: Uuid::new_v4().to_string(),
-        event_type: "COPY_PROGRESS".to_string(),
-        event_time: snapshot.event_time,
-        source: snapshot.source.to_string(),
-        edge_code: edge_code.to_string(),
-        stage: Some("SCANNING_RUSTFS".to_string()),
-        edge_name: edge_code.to_string(),
-        scan: Some(serde_json::json!({
-            "scan_status": snapshot.scan_phase,
-            "bucket_count": snapshot.bucket_total,
-            "object_seen": snapshot.object_seen,
-            "stable_object_count": snapshot.stable_object_count,
-            "source_changed_count": snapshot.source_changed_count,
-            "total_bytes": snapshot.total_bytes,
-            "current_bucket": snapshot.current_bucket,
-            "current_object_key": snapshot.current_object_key,
-            "last_error_code": snapshot.last_error_code,
-        })),
-        object_inventory: Default::default(),
-        export_job: None,
-        global: global_progress.clone(),
-        global_progress,
-        disk_runtime: Vec::new(),
-        disks: Vec::new(),
-        ws_connected: true,
-        last_http_refresh_at: chrono::Utc::now(),
-        message: snapshot
-            .message
-            .unwrap_or_else(|| format!("scan_phase={}", snapshot.scan_phase)),
     }
 }
 
@@ -424,7 +357,7 @@ fn edge_ws_v2_copy_progress_event(mut event: CopyProgressEvent) -> CopyProgressE
             Some("SEALED") => "SEALED",
             Some("FAILED") => "FAILED",
             Some("SEALING") => "SEALING",
-            Some("PENDING") | Some("SCANNING") => "PLANNING",
+            Some("PENDING") => "PLANNING",
             _ if event.disks.iter().any(|disk| disk.runtime_status == "DONE")
                 && event.global_progress.remaining_bytes == 0 =>
             {
@@ -434,23 +367,7 @@ fn edge_ws_v2_copy_progress_event(mut event: CopyProgressEvent) -> CopyProgressE
         }
         .to_string(),
     );
-    event.scan = None;
     event
-}
-
-async fn trigger_scan(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(request): Json<ScanTriggerRequest>,
-) -> Result<Json<crate::control::ScanTriggerResponse>, ApiError> {
-    authorize_control_api(&state, &headers)?;
-    refresh_transport_runtime_before_control(&state).await?;
-    state
-        .control
-        .scan_once(request)
-        .await
-        .map(Json)
-        .map_err(Into::into)
 }
 
 async fn create_export_job(
@@ -594,12 +511,11 @@ mod tests {
         control::{
             ControlFuture, DashboardCurrentObject, DiskRuntimeSummary, EdgeControlSummary,
             EdgeDiskProgressSummary, EdgeGlobalSummary, ExportJobDiskSummary, ExportJobEvent,
-            ExportJobResponse, ScanTriggerResponse, StartExportJobResponse,
+            ExportJobResponse, StartExportJobResponse,
         },
         disk_detection::DiskDetectionError,
         progress::ObjectInventorySnapshot,
         rescan::{DiskRescanRunner, DiskRescanTrigger},
-        scanner::ScanProgressSnapshot,
     };
     use axum::{
         body::{to_bytes, Body},
@@ -684,25 +600,6 @@ mod tests {
     }
 
     impl EdgeControlService for FakeControl {
-        fn scan_once<'a>(
-            &'a self,
-            _request: ScanTriggerRequest,
-        ) -> ControlFuture<'a, ScanTriggerResponse> {
-            Box::pin(async move {
-                self.calls.lock().unwrap().push("scan_once");
-                Ok(ScanTriggerResponse {
-                    scan_event_type: "SCAN_DONE".to_string(),
-                    scan_status: "DONE".to_string(),
-                    bucket_count: 1,
-                    object_seen: 2,
-                    stable_object_count: 2,
-                    source_changed_count: 0,
-                    total_bytes: 99,
-                    message: "ok".to_string(),
-                })
-            })
-        }
-
         fn create_export_job<'a>(
             &'a self,
             _request: CreateExportJobRequest,
@@ -915,10 +812,6 @@ mod tests {
                 Ok(Some(progress.snapshot("COPY_PROGRESS", "test snapshot")))
             })
         }
-
-        fn scan_progress_snapshot<'a>(&'a self) -> ControlFuture<'a, ScanProgressSnapshot> {
-            Box::pin(async move { Ok(ScanProgressSnapshot::default()) })
-        }
     }
 
     #[tokio::test]
@@ -937,9 +830,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::GONE);
-        let body = json_body(response).await;
-        assert_eq!(body["error_code"], "CONTROL_API_REMOVED");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -1086,9 +977,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::GONE);
-        let body = json_body(response).await;
-        assert_eq!(body["error_code"], "CONTROL_API_REMOVED");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert!(control.calls.lock().unwrap().is_empty());
     }
 
@@ -1116,7 +1005,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(scan.status(), StatusCode::GONE);
+        assert_eq!(scan.status(), StatusCode::NOT_FOUND);
 
         let create = router
             .clone()
@@ -1318,58 +1207,6 @@ mod tests {
             control.calls.lock().unwrap().as_slice(),
             &["copy_progress_snapshot"]
         );
-    }
-
-    #[test]
-    fn scan_progress_event_has_protocol_shape_without_naked_status() {
-        let event = scan_progress_event(
-            "edge-a",
-            ScanProgressSnapshot {
-                event_type: "SCAN_STARTED",
-                event_time: Utc::now(),
-                source: "edge",
-                scan_phase: "SCANNING",
-                bucket_total: 2,
-                bucket_done: 0,
-                object_seen: 0,
-                stable_object_count: 0,
-                source_changed_count: 0,
-                total_bytes: 0,
-                current_bucket: None,
-                current_object_key: None,
-                last_error_code: None,
-                message: Some("scan started".to_string()),
-            },
-        );
-        let value = serde_json::to_value(event).unwrap();
-
-        assert_eq!(value["protocol_version"], "edge-ws-v2");
-        assert!(value["event_id"].is_string());
-        assert_eq!(value["event_type"], "COPY_PROGRESS");
-        assert_eq!(value["stage"], "SCANNING_RUSTFS");
-        assert_eq!(value["source"], "edge");
-        assert_eq!(value["edge_code"], "edge-a");
-        assert_eq!(value["scan"]["scan_status"], "SCANNING");
-        assert!(value.get("export_job_id").is_none());
-        assert!(value.get("export_job_status").is_none());
-        assert!(value.get("disk_status_code").is_none());
-        assert!(value["disks"].as_array().unwrap().is_empty());
-        assert!(value.get("status").is_none());
-    }
-
-    #[test]
-    fn websocket_scan_ticker_does_not_repeat_terminal_done_snapshots() {
-        let mut snapshot = ScanProgressSnapshot {
-            scan_phase: "SCANNING",
-            ..ScanProgressSnapshot::default()
-        };
-        assert!(should_publish_scan_progress_snapshot(&snapshot));
-
-        snapshot.scan_phase = "DONE";
-        assert!(!should_publish_scan_progress_snapshot(&snapshot));
-
-        snapshot.scan_phase = "IDLE";
-        assert!(!should_publish_scan_progress_snapshot(&snapshot));
     }
 
     #[test]

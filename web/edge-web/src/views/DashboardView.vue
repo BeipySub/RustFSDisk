@@ -18,9 +18,7 @@ import {
 import {
   applyCopyProgressEvent,
   connectEdgeProgressSocket,
-  type CopyProgressEvent,
   type EdgeProgressSocket,
-  type EdgeScanProgress,
 } from "../ws/edgeCopyProgress";
 import EdgeTelemetry from "../components/EdgeTelemetry.vue";
 import ParticleAetherField from "../components/ParticleAetherField.vue";
@@ -71,7 +69,6 @@ const isRefreshing = ref(false);
 const httpError = ref<DashboardHttpError | null>(null);
 const wsConnected = ref(false);
 const wsMessage = ref("WebSocket 尚未连接");
-const currentScan = ref<EdgeScanProgress | null>(null);
 const runtimeStageRef = ref<HTMLElement | null>(null);
 const sourceRackRef = ref<HTMLElement | null>(null);
 const nasShellRef = ref<HTMLElement | null>(null);
@@ -179,16 +176,8 @@ const estimatedDone = computed(() => {
 const isEmpty = computed(() => !isRefreshing.value && !httpError.value && disks.value.length === 0);
 const hasCurrentExport = computed(() => {
   if (!isActiveExportJobStatus(currentExportStatus.value)) return false;
-  if (currentExportStatus.value === "PENDING" || currentExportStatus.value === "SCANNING") return true;
+  if (currentExportStatus.value === "PENDING") return true;
   return hasCurrentExportDisk.value;
-});
-const isScanningRustfs = computed(() => currentScan.value?.scan_status === "SCANNING");
-const scanObjectSeen = computed(() => currentScan.value?.object_seen ?? 0);
-const scanStableObjectCount = computed(() => currentScan.value?.stable_object_count ?? 0);
-const scanCurrentPath = computed(() => {
-  const scan = currentScan.value;
-  if (!scan?.current_bucket && !scan?.current_object_key) return "等待对象";
-  return [scan.current_bucket, scan.current_object_key].filter(Boolean).join("/");
 });
 const exportedInventoryObjectCount = computed(() =>
   objectInventory.value.exported_count,
@@ -198,13 +187,11 @@ const exportedInventoryBytesLabel = computed(() =>
 );
 const exportStatusTitle = computed(() => {
   if (httpError.value) return "只读接口不可用";
-  if (isScanningRustfs.value) return "正在扫描 RustFS 对象";
   if (hasCurrentExport.value) return "当前导出进度";
   return "当前无导出任务";
 });
 const exportStatusNotice = computed(() => {
   if (httpError.value) return `Edge Dashboard 只读接口不可用：${httpError.value.error_code}。当前不展示模拟数据。`;
-  if (isScanningRustfs.value) return `已发现 ${scanObjectSeen.value.toLocaleString()} 个对象，稳定对象 ${scanStableObjectCount.value.toLocaleString()} 个。`;
   if (hasCurrentExport.value) return `WS：${wsMessage.value}`;
   if (isEmpty.value) return "未检测到运输盘；插入未注册盘或异常盘后会显示在盘位区。";
   return "运输盘已被探测，但当前没有运行中的导出任务。";
@@ -299,16 +286,6 @@ function publishEdgeIdentity(nextSummary: EdgeDashboardSummary) {
       },
     }),
   );
-}
-
-function updateScanProgress(event: CopyProgressEvent) {
-  if (event.stage === "SCANNING_RUSTFS" && event.scan?.scan_status === "SCANNING") {
-    currentScan.value = event.scan;
-    return;
-  }
-  if (event.stage === "COPYING" || event.stage === "SEALING" || event.stage === "SEALED" || event.stage === "FAILED") {
-    currentScan.value = null;
-  }
 }
 
 function diskTone(disk: EdgeDiskProgress): string {
@@ -474,7 +451,6 @@ onMounted(() => {
   }
   progressSocket = connectEdgeProgressSocket({
     onEvent(event) {
-      updateScanProgress(event);
       summary.value = applyCopyProgressEvent(summary.value ?? emptySummary(), event);
       wsMessage.value = event.message || "";
       wsConnected.value = true;
@@ -539,9 +515,8 @@ onBeforeUnmount(() => {
       <div>
         <span>{{ exportStatusTitle }}</span>
         <strong v-if="hasCurrentExport">{{ globalProgressPercent.toFixed(0) }}<small>%</small></strong>
-        <strong v-else-if="isScanningRustfs">{{ scanObjectSeen.toLocaleString() }}<small>个</small></strong>
         <strong v-else>--<small></small></strong>
-        <em>{{ isScanningRustfs ? "SCANNING" : hasCurrentExport ? currentExportStatus : "IDLE" }}</em>
+        <em>{{ hasCurrentExport ? currentExportStatus : "IDLE" }}</em>
       </div>
       <div v-if="hasCurrentExport" class="progress-main">
         <p>
@@ -567,27 +542,6 @@ onBeforeUnmount(() => {
           <div>
             <dt>预计完成</dt>
             <dd>{{ estimatedDone }}</dd>
-          </div>
-        </dl>
-      </div>
-      <div v-else-if="isScanningRustfs" class="progress-main idle-copy">
-        <p>{{ exportStatusNotice }}</p>
-        <dl>
-          <div>
-            <dt>已发现</dt>
-            <dd>{{ scanObjectSeen.toLocaleString() }}</dd>
-          </div>
-          <div>
-            <dt>稳定对象</dt>
-            <dd>{{ scanStableObjectCount.toLocaleString() }}</dd>
-          </div>
-          <div>
-            <dt>当前对象</dt>
-            <dd :title="scanCurrentPath">{{ scanCurrentPath }}</dd>
-          </div>
-          <div>
-            <dt>下一步</dt>
-            <dd>自动导出</dd>
           </div>
         </dl>
       </div>
@@ -666,7 +620,7 @@ onBeforeUnmount(() => {
 
     <section v-if="!httpError" :class="['dashboard-lower-grid', { compact: !hasCurrentExport }]">
       <article class="overview-panel glass-panel">
-        <h2>扫描与导出概览</h2>
+        <h2>导出概览</h2>
         <dl class="overview-metrics">
           <div>
             <dt>对象总数</dt>

@@ -4,12 +4,10 @@ pub mod config;
 pub mod control;
 pub mod disk_detection;
 pub mod disk_worker;
-pub mod export_planner;
 pub mod export_runtime;
 pub mod progress;
 pub mod realtime;
 pub mod rescan;
-pub mod scanner;
 pub mod server;
 
 pub use adapters::{
