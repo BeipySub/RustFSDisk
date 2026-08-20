@@ -35,6 +35,15 @@ const MARK_DISK_RUNTIME_DONE_AFTER_SEAL_SQL: &str = r#"
     WHERE disk_id = $1
     "#;
 
+const MARK_DISK_RUNTIME_SQL: &str = r#"
+    UPDATE disk_runtime
+    SET status = $2,
+        last_error_code = $3,
+        error_message = CASE WHEN $3::text IS NULL THEN NULL ELSE $3 END,
+        last_seen_at = NOW() AT TIME ZONE 'UTC'
+    WHERE disk_id = $1
+    "#;
+
 const LOCAL_OBJECT_INVENTORY_SQL: &str = r#"
     SELECT COUNT(*)::bigint AS exported_count,
            COALESCE(SUM(exported.size_bytes), 0)::bigint AS exported_bytes
@@ -880,15 +889,13 @@ impl ExportObjectRepository for PgExportObjectRepository {
         error_code: Option<&str>,
     ) -> Result<(), DiskWorkerError> {
         self.handle.block_on(async {
-            sqlx::query(
-                "UPDATE disk_runtime SET status = $2, last_error_code = $3, last_seen_at = NOW() AT TIME ZONE 'UTC' WHERE disk_id = $1",
-            )
-            .bind(disk_id)
-            .bind(runtime_status)
-            .bind(error_code)
-            .execute(&self.pool)
-            .await
-            .map_err(sqlx_err)?;
+            sqlx::query(MARK_DISK_RUNTIME_SQL)
+                .bind(disk_id)
+                .bind(runtime_status)
+                .bind(error_code)
+                .execute(&self.pool)
+                .await
+                .map_err(sqlx_err)?;
             Ok(())
         })
     }
@@ -1153,6 +1160,16 @@ mod tests {
         assert!(!MARK_DISK_RUNTIME_DONE_AFTER_SEAL_SQL.contains("export_job"));
         assert!(!MARK_DISK_RUNTIME_DONE_AFTER_SEAL_SQL.contains("export_object"));
         assert!(!MARK_DISK_RUNTIME_DONE_AFTER_SEAL_SQL.contains("manifest"));
+    }
+
+    #[test]
+    fn disk_runtime_copying_clears_stale_error_message_when_error_code_is_none() {
+        assert!(MARK_DISK_RUNTIME_SQL.contains("UPDATE disk_runtime"));
+        assert!(MARK_DISK_RUNTIME_SQL.contains("status = $2"));
+        assert!(MARK_DISK_RUNTIME_SQL.contains("last_error_code = $3"));
+        assert!(MARK_DISK_RUNTIME_SQL
+            .contains("error_message = CASE WHEN $3::text IS NULL THEN NULL ELSE $3 END"));
+        assert!(!MARK_DISK_RUNTIME_SQL.contains("CONCAT_WS"));
     }
 
     #[test]

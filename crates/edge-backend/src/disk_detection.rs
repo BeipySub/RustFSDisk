@@ -29,6 +29,17 @@ const REPLACE_CURRENT_RUNTIME_SQL: &str = r#"
                     OR (device_path = $2 AND mount_path IS NOT DISTINCT FROM $3)
                   )
                 "#;
+const MARK_MISSING_RUNTIME_REMOVED_SQL: &str = r#"
+                UPDATE disk_runtime
+                SET status = 'REMOVED',
+                    free_bytes = 0,
+                    reserve_bytes = 0,
+                    object_budget_bytes = 0,
+                    last_error_code = 'DISK_REMOVED',
+                    error_message = 'transport disk is no longer detected by edge rescan',
+                    last_seen_at = NOW() AT TIME ZONE 'UTC'
+                WHERE id = $1
+                "#;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -516,6 +527,7 @@ impl DiskRuntimeLedger for PgDiskRuntimeLedger {
                 SELECT DISTINCT ON (
                     COALESCE(disk_id::text, device_path || '|' || COALESCE(mount_path, ''))
                 )
+                    id,
                     sn,
                     disk_presence_id,
                     disk_id,
@@ -559,6 +571,7 @@ impl DiskRuntimeLedger for PgDiskRuntimeLedger {
                     continue;
                 }
 
+                let row_id: i64 = row.get("id");
                 let record = DiskRuntimeRecord {
                     disk_presence_id: row
                         .get::<Option<Uuid>, _>("disk_presence_id")
@@ -588,7 +601,7 @@ impl DiskRuntimeLedger for PgDiskRuntimeLedger {
                     status_code: None,
                     disk_enabled: None,
                 };
-                insert_disk_runtime_record(&self.pool, &record).await?;
+                mark_missing_disk_runtime_removed(&self.pool, row_id).await?;
                 tracing::info!(
                     disk_sn = record.sn.as_str(),
                     disk_id = record.disk_id.as_deref(),
@@ -606,54 +619,15 @@ impl DiskRuntimeLedger for PgDiskRuntimeLedger {
     }
 }
 
-async fn insert_disk_runtime_record(
+async fn mark_missing_disk_runtime_removed(
     pool: &PgPool,
-    record: &DiskRuntimeRecord,
+    row_id: i64,
 ) -> Result<(), DiskDetectionError> {
-    let disk_id = record
-        .disk_id
-        .as_deref()
-        .and_then(|value| Uuid::parse_str(value).ok());
-    sqlx::query(
-        r#"
-        INSERT INTO disk_runtime (
-            disk_presence_id,
-            sn,
-            disk_id,
-            device_path,
-            mount_path,
-            capacity_bytes,
-            free_bytes,
-            reserve_bytes,
-            object_budget_bytes,
-            status,
-            last_error_code,
-            error_message,
-            partial_residue_count,
-            partial_residue_bytes,
-            last_seen_at
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-        "#,
-    )
-    .bind(Uuid::parse_str(&record.disk_presence_id).ok())
-    .bind(&record.sn)
-    .bind(disk_id)
-    .bind(&record.device_path)
-    .bind(&record.mount_path)
-    .bind(record.capacity_bytes as i64)
-    .bind(record.free_bytes as i64)
-    .bind(record.reserve_bytes as i64)
-    .bind(record.object_budget_bytes as i64)
-    .bind(&record.runtime_status)
-    .bind(&record.last_error_code)
-    .bind(&record.error_message)
-    .bind(record.partial_residue_count as i32)
-    .bind(record.partial_residue_bytes as i64)
-    .bind(record.last_seen_at.naive_utc())
-    .execute(pool)
-    .await
-    .map_err(|err| DiskDetectionError::Ledger(err.to_string()))?;
+    sqlx::query(MARK_MISSING_RUNTIME_REMOVED_SQL)
+        .bind(row_id)
+        .execute(pool)
+        .await
+        .map_err(|err| DiskDetectionError::Ledger(err.to_string()))?;
     Ok(())
 }
 
@@ -1978,6 +1952,14 @@ mod tests {
         assert!(!REPLACE_CURRENT_RUNTIME_SQL.contains("export_job"));
         assert!(!REPLACE_CURRENT_RUNTIME_SQL.contains("export_object"));
         assert!(!REPLACE_CURRENT_RUNTIME_SQL.contains("manifest"));
+    }
+
+    #[test]
+    fn missing_disk_removal_updates_existing_runtime_row_instead_of_inserting_duplicate() {
+        assert!(MARK_MISSING_RUNTIME_REMOVED_SQL.contains("UPDATE disk_runtime"));
+        assert!(MARK_MISSING_RUNTIME_REMOVED_SQL.contains("status = 'REMOVED'"));
+        assert!(MARK_MISSING_RUNTIME_REMOVED_SQL.contains("WHERE id = $1"));
+        assert!(!MARK_MISSING_RUNTIME_REMOVED_SQL.contains("INSERT INTO disk_runtime"));
     }
 
     fn detector(
